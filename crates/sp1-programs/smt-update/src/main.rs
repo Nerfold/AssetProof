@@ -2,8 +2,6 @@
 
 extern crate alloc;
 
-use alloc::collections::BTreeMap;
-use alloc::string::String;
 use alloc::vec::Vec;
 use slop_algebra::{AbstractField, PrimeField32};
 use sp1_primitives::{poseidon2_hash, SP1Field};
@@ -18,7 +16,10 @@ entrypoint!(main);
 const LEAF_TAG: u32 = 1;
 const NODE_TAG: u32 = 2;
 const EMPTY_TAG: u32 = 3;
-const KEY_TAG: u32 = 4;
+
+type HashPair = (Hash, Hash);
+type IndexedNodePair = (u128, HashPair);
+type IndexedHash = (u128, Hash);
 
 fn main() {
     let input: Sp1UpdateStdin = sp1_zkvm::io::read();
@@ -30,26 +31,19 @@ fn verify_and_apply_update(input: Sp1UpdateStdin) -> Sp1UpdatePublicValues {
     let defaults = default_hashes(input.depth);
     let mut aggregate_delta = 0i128;
     let mut membership_flags = Vec::with_capacity(input.entries.len());
-    let mut leaf_updates = Vec::with_capacity(input.entries.len());
-    let mut witness_siblings = BTreeMap::<(usize, u128), Hash>::new();
-    let mut last_address: Option<&str> = None;
+    let mut leaf_updates = Vec::<IndexedNodePair>::with_capacity(input.entries.len());
+    let mut witness_siblings = vec![Vec::<IndexedHash>::new(); input.depth];
 
     for entry in &input.entries {
-        if let Some(prev) = last_address {
-            assert!(entry.address.as_str() > prev, "update entries must be sorted");
-        }
-        last_address = Some(&entry.address);
-
-        let key = key_for_address(&entry.address);
         match &entry.proof {
             Sp1AddressProof::Membership(Sp1MembershipProof { siblings }) => {
-                let old_leaf = entry.old_leaf.as_ref().expect("member update requires old leaf");
-                assert_eq!(old_leaf.address, entry.address, "old leaf address mismatch");
-                let resolved = resolve_membership_siblings(
-                    siblings,
-                    &input.frontier_hashes,
-                    &defaults,
-                );
+                let old_leaf = entry
+                    .old_leaf
+                    .as_ref()
+                    .expect("member update requires old leaf");
+                assert_eq!(old_leaf.key, entry.key, "old leaf key mismatch");
+                let resolved =
+                    resolve_membership_siblings(siblings, &input.frontier_hashes, &defaults);
                 let old_root = compute_membership_root(old_leaf, &resolved, input.depth);
                 assert_eq!(old_root, input.old_smt_root, "membership root mismatch");
 
@@ -59,26 +53,21 @@ fn verify_and_apply_update(input: Sp1UpdateStdin) -> Sp1UpdatePublicValues {
                     .expect("balance overflow");
                 assert!(new_balance >= 0, "negative updated balance");
                 let new_leaf = Sp1Leaf {
-                    address: old_leaf.address.clone(),
+                    key: old_leaf.key,
                     balance: new_balance,
                     salt: old_leaf.salt,
                 };
 
-                let leaf_index = prefix_index(&key, input.depth);
-                let old_hash = leaf_hash(&key, old_leaf.balance, &old_leaf.salt);
-                let new_hash = leaf_hash(&key, new_leaf.balance, &new_leaf.salt);
+                let leaf_index = prefix_index(&entry.key, input.depth);
+                let old_hash = leaf_hash(&entry.key, old_leaf.balance, &old_leaf.salt);
+                let new_hash = leaf_hash(&entry.key, new_leaf.balance, &new_leaf.salt);
                 for (level_from_leaf, sibling_hash) in resolved.iter().enumerate() {
                     let node_index = leaf_index >> level_from_leaf;
                     let sibling_index = sibling_index(node_index);
-                    let witness_key = (level_from_leaf, sibling_index);
-                    if let Some(existing) = witness_siblings.get(&witness_key) {
-                        assert_eq!(existing, sibling_hash, "inconsistent frontier witness");
-                    } else {
-                        witness_siblings.insert(witness_key, *sibling_hash);
-                    }
+                    witness_siblings[level_from_leaf].push((sibling_index, *sibling_hash));
                 }
 
-                leaf_updates.push((leaf_index, old_hash, new_hash));
+                leaf_updates.push((leaf_index, (old_hash, new_hash)));
                 aggregate_delta = aggregate_delta
                     .checked_add(entry.delta)
                     .expect("aggregate delta overflow");
@@ -92,7 +81,7 @@ fn verify_and_apply_update(input: Sp1UpdateStdin) -> Sp1UpdatePublicValues {
                     &defaults,
                 );
                 verify_default_non_membership_root(
-                    &key,
+                    &entry.key,
                     input.old_smt_root,
                     input.depth,
                     &defaults,
@@ -102,13 +91,10 @@ fn verify_and_apply_update(input: Sp1UpdateStdin) -> Sp1UpdatePublicValues {
                 membership_flags.push(0);
             }
             Sp1AddressProof::NonMembership(Sp1NonMembershipProof::Collision(proof)) => {
-                let resolved = resolve_membership_siblings(
-                    &proof.siblings,
-                    &input.frontier_hashes,
-                    &defaults,
-                );
+                let resolved =
+                    resolve_membership_siblings(&proof.siblings, &input.frontier_hashes, &defaults);
                 verify_collision_non_membership_root(
-                    &key,
+                    &entry.key,
                     input.old_smt_root,
                     input.depth,
                     proof,
@@ -119,14 +105,16 @@ fn verify_and_apply_update(input: Sp1UpdateStdin) -> Sp1UpdatePublicValues {
         }
     }
 
+    sort_and_validate_leaf_updates(&mut leaf_updates);
+    canonicalize_witness_siblings(&mut witness_siblings);
+
     let (recomputed_old_root, new_root) = if leaf_updates.is_empty() {
         (input.old_smt_root, input.old_smt_root)
     } else {
         compute_updated_roots(input.depth, &defaults, &leaf_updates, &witness_siblings)
     };
     assert_eq!(
-        recomputed_old_root,
-        input.old_smt_root,
+        recomputed_old_root, input.old_smt_root,
         "old root recomputation mismatch"
     );
 
@@ -150,51 +138,126 @@ fn verify_and_apply_update(input: Sp1UpdateStdin) -> Sp1UpdatePublicValues {
 fn compute_updated_roots(
     depth: usize,
     defaults: &[Hash],
-    leaf_updates: &[(u128, Hash, Hash)],
-    witness_siblings: &BTreeMap<(usize, u128), Hash>,
+    leaf_updates: &[IndexedNodePair],
+    witness_siblings: &[Vec<IndexedHash>],
 ) -> (Hash, Hash) {
-    let mut current = BTreeMap::<u128, (Hash, Hash)>::new();
-    for (index, old_hash, new_hash) in leaf_updates {
-        current.insert(*index, (*old_hash, *new_hash));
-    }
+    let mut current = leaf_updates.to_vec();
 
     for level_from_leaf in 0..depth {
-        for ((level, index), hash) in witness_siblings {
-            if *level == level_from_leaf {
-                current.entry(*index).or_insert((*hash, *hash));
-            }
-        }
+        let merged = merge_level_nodes(&current, &witness_siblings[level_from_leaf]);
+        let default_pair = (defaults[level_from_leaf], defaults[level_from_leaf]);
+        let mut next = Vec::<IndexedNodePair>::with_capacity((merged.len() + 1) / 2);
+        let mut cursor = 0usize;
 
-        let mut parent_indices = current.keys().map(|index| index / 2).collect::<Vec<_>>();
-        parent_indices.sort_unstable();
-        parent_indices.dedup();
-
-        let mut next = BTreeMap::<u128, (Hash, Hash)>::new();
-        for parent_index in parent_indices {
+        while cursor < merged.len() {
+            let (index, pair) = merged[cursor];
+            let parent_index = index / 2;
             let left_index = parent_index * 2;
             let right_index = left_index + 1;
-            let (left_old, left_new) = current
-                .get(&left_index)
-                .copied()
-                .unwrap_or((defaults[level_from_leaf], defaults[level_from_leaf]));
-            let (right_old, right_new) = current
-                .get(&right_index)
-                .copied()
-                .unwrap_or((defaults[level_from_leaf], defaults[level_from_leaf]));
+            let mut left = default_pair;
+            let mut right = default_pair;
+
+            if index == left_index {
+                left = pair;
+                cursor += 1;
+                if cursor < merged.len() && merged[cursor].0 == right_index {
+                    right = merged[cursor].1;
+                    cursor += 1;
+                }
+            } else {
+                assert_eq!(index, right_index, "non-canonical merged level order");
+                right = pair;
+                cursor += 1;
+            }
+
             let node_depth = depth - level_from_leaf - 1;
-            next.insert(
+            next.push((
                 parent_index,
                 (
-                    internal_hash(node_depth, &left_old, &right_old),
-                    internal_hash(node_depth, &left_new, &right_new),
+                    internal_hash(node_depth, &left.0, &right.0),
+                    internal_hash(node_depth, &left.1, &right.1),
                 ),
-            );
+            ));
         }
         current = next;
     }
 
-    let (_, roots) = current.into_iter().next().expect("missing root after update");
+    assert_eq!(current.len(), 1, "missing root after update");
+    let (_, roots) = current.pop().expect("missing root after update");
     roots
+}
+
+fn sort_and_validate_leaf_updates(leaf_updates: &mut Vec<IndexedNodePair>) {
+    leaf_updates.sort_unstable_by_key(|(index, _)| *index);
+    for pair in leaf_updates.windows(2) {
+        assert_ne!(pair[0].0, pair[1].0, "duplicate leaf update index");
+    }
+}
+
+fn canonicalize_witness_siblings(witness_siblings: &mut [Vec<IndexedHash>]) {
+    for siblings in witness_siblings {
+        if siblings.len() < 2 {
+            continue;
+        }
+
+        siblings.sort_unstable_by_key(|(index, _)| *index);
+        let mut deduped = Vec::<IndexedHash>::with_capacity(siblings.len());
+        for (index, hash) in siblings.iter().copied() {
+            if let Some((prev_index, prev_hash)) = deduped.last() {
+                if *prev_index == index {
+                    assert_eq!(*prev_hash, hash, "inconsistent frontier witness");
+                    continue;
+                }
+            }
+            deduped.push((index, hash));
+        }
+        *siblings = deduped;
+    }
+}
+
+fn merge_level_nodes(
+    current: &[IndexedNodePair],
+    siblings: &[IndexedHash],
+) -> Vec<IndexedNodePair> {
+    let mut merged = Vec::<IndexedNodePair>::with_capacity(current.len() + siblings.len());
+    let mut current_index = 0usize;
+    let mut sibling_index = 0usize;
+
+    while current_index < current.len() && sibling_index < siblings.len() {
+        let (current_node_index, current_pair) = current[current_index];
+        let (sibling_node_index, sibling_hash) = siblings[sibling_index];
+        match current_node_index.cmp(&sibling_node_index) {
+            core::cmp::Ordering::Less => {
+                merged.push((current_node_index, current_pair));
+                current_index += 1;
+            }
+            core::cmp::Ordering::Equal => {
+                assert_eq!(
+                    current_pair.0, sibling_hash,
+                    "frontier witness does not match updated old hash"
+                );
+                merged.push((current_node_index, current_pair));
+                current_index += 1;
+                sibling_index += 1;
+            }
+            core::cmp::Ordering::Greater => {
+                merged.push((sibling_node_index, (sibling_hash, sibling_hash)));
+                sibling_index += 1;
+            }
+        }
+    }
+
+    while current_index < current.len() {
+        merged.push(current[current_index]);
+        current_index += 1;
+    }
+    while sibling_index < siblings.len() {
+        let (index, hash) = siblings[sibling_index];
+        merged.push((index, (hash, hash)));
+        sibling_index += 1;
+    }
+
+    merged
 }
 
 fn verify_default_non_membership_root(
@@ -231,23 +294,27 @@ fn verify_collision_non_membership_root(
     proof: &Sp1CollisionNonMembershipProof,
     siblings: &[Hash],
 ) {
-    let collision_key = key_for_address(&proof.collision_leaf.address);
-    assert!(collision_key != *key, "collision proof uses identical key");
     assert!(
-        common_prefix_len(key, &collision_key, depth) == depth,
+        proof.collision_leaf.key != *key,
+        "collision proof uses identical key"
+    );
+    assert!(
+        common_prefix_len(key, &proof.collision_leaf.key, depth) == depth,
         "collision proof key must share the configured path prefix"
     );
     let collision_root = compute_membership_root(&proof.collision_leaf, siblings, depth);
-    assert_eq!(collision_root, root, "collision non-membership root mismatch");
+    assert_eq!(
+        collision_root, root,
+        "collision non-membership root mismatch"
+    );
 }
 
 fn compute_membership_root(leaf: &Sp1Leaf, siblings: &[Hash], depth: usize) -> Hash {
     assert_eq!(siblings.len(), depth, "membership proof length mismatch");
-    let key = key_for_address(&leaf.address);
-    let mut hash = leaf_hash(&key, leaf.balance, &leaf.salt);
+    let mut hash = leaf_hash(&leaf.key, leaf.balance, &leaf.salt);
     for (level_from_leaf, sibling) in siblings.iter().enumerate() {
         let node_depth = depth - level_from_leaf - 1;
-        hash = if key_bit(&key, node_depth) {
+        hash = if key_bit(&leaf.key, node_depth) {
             internal_hash(node_depth, sibling, &hash)
         } else {
             internal_hash(node_depth, &hash, sibling)
@@ -307,30 +374,12 @@ fn sibling_index(index: u128) -> u128 {
     }
 }
 
-fn key_for_address(address: &str) -> Hash {
-    let normalized = normalize_address(address);
-    let raw = normalized.strip_prefix("0x").unwrap_or(&normalized);
-    let mut bytes = [0u8; 20];
-    for (index, chunk) in raw.as_bytes().chunks(2).enumerate() {
-        bytes[index] = (from_hex_nibble(chunk[0]) << 4) | from_hex_nibble(chunk[1]);
-    }
-
-    let mut words = Vec::with_capacity(6);
-    words.push(SP1Field::from_wrapped_u32(KEY_TAG));
-    for chunk in bytes.chunks(4) {
-        let mut word = [0u8; 4];
-        word[..chunk.len()].copy_from_slice(chunk);
-        words.push(SP1Field::from_wrapped_u32(u32::from_be_bytes(word)));
-    }
-    poseidon_digest(words)
-}
-
 fn leaf_hash(key: &Hash, balance: i128, salt: &Hash) -> Hash {
     let mut inputs = Vec::with_capacity(21);
     inputs.push(SP1Field::from_wrapped_u32(LEAF_TAG));
-    inputs.extend(bytes_to_fields(key));
-    inputs.extend(i128_to_fields(balance));
-    inputs.extend(bytes_to_fields(salt));
+    push_bytes_fields(&mut inputs, key);
+    push_i128_fields(&mut inputs, balance);
+    push_bytes_fields(&mut inputs, salt);
     poseidon_digest(inputs)
 }
 
@@ -338,8 +387,8 @@ fn internal_hash(depth: usize, left: &Hash, right: &Hash) -> Hash {
     let mut inputs = Vec::with_capacity(18);
     inputs.push(SP1Field::from_wrapped_u32(NODE_TAG));
     inputs.push(SP1Field::from_wrapped_u32(depth as u32));
-    inputs.extend(bytes_to_fields(left));
-    inputs.extend(bytes_to_fields(right));
+    push_bytes_fields(&mut inputs, left);
+    push_bytes_fields(&mut inputs, right);
     poseidon_digest(inputs)
 }
 
@@ -358,26 +407,20 @@ fn poseidon_digest(inputs: Vec<SP1Field>) -> Hash {
     fields_to_bytes(&digest)
 }
 
-fn bytes_to_fields(bytes: &[u8; 32]) -> Vec<SP1Field> {
-    bytes.chunks(4)
-        .map(|chunk| {
-            let mut word = [0u8; 4];
-            word.copy_from_slice(chunk);
-            SP1Field::from_wrapped_u32(u32::from_be_bytes(word))
-        })
-        .collect()
+fn push_bytes_fields(out: &mut Vec<SP1Field>, bytes: &[u8; 32]) {
+    for chunk in bytes.chunks(4) {
+        let mut word = [0u8; 4];
+        word.copy_from_slice(chunk);
+        out.push(SP1Field::from_wrapped_u32(u32::from_be_bytes(word)));
+    }
 }
 
-fn i128_to_fields(value: i128) -> Vec<SP1Field> {
-    value
-        .to_be_bytes()
-        .chunks(4)
-        .map(|chunk| {
-            let mut word = [0u8; 4];
-            word.copy_from_slice(chunk);
-            SP1Field::from_wrapped_u32(u32::from_be_bytes(word))
-        })
-        .collect()
+fn push_i128_fields(out: &mut Vec<SP1Field>, value: i128) {
+    for chunk in value.to_be_bytes().chunks(4) {
+        let mut word = [0u8; 4];
+        word.copy_from_slice(chunk);
+        out.push(SP1Field::from_wrapped_u32(u32::from_be_bytes(word)));
+    }
 }
 
 fn fields_to_bytes(fields: &[SP1Field; 8]) -> Hash {
@@ -386,21 +429,6 @@ fn fields_to_bytes(fields: &[SP1Field; 8]) -> Hash {
         out[index * 4..(index + 1) * 4].copy_from_slice(&field.as_canonical_u32().to_be_bytes());
     }
     out
-}
-
-fn normalize_address(address: &str) -> String {
-    let trimmed = address.trim();
-    let raw = trimmed.strip_prefix("0x").unwrap_or(trimmed);
-    assert_eq!(raw.len(), 40, "address must have 40 hex chars");
-    for ch in raw.bytes() {
-        assert!(ch.is_ascii_hexdigit(), "invalid address hex");
-    }
-    let mut normalized = String::with_capacity(42);
-    normalized.push_str("0x");
-    for ch in raw.bytes() {
-        normalized.push((ch as char).to_ascii_lowercase());
-    }
-    normalized
 }
 
 fn key_bit(key: &Hash, depth: usize) -> bool {
@@ -427,13 +455,4 @@ fn common_prefix_len(a: &Hash, b: &Hash, max_depth: usize) -> usize {
         }
     }
     max_depth
-}
-
-fn from_hex_nibble(byte: u8) -> u8 {
-    match byte {
-        b'0'..=b'9' => byte - b'0',
-        b'a'..=b'f' => byte - b'a' + 10,
-        b'A'..=b'F' => byte - b'A' + 10,
-        _ => panic!("invalid hex nibble"),
-    }
 }

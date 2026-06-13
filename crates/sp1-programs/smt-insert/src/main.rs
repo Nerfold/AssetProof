@@ -2,7 +2,6 @@
 
 extern crate alloc;
 
-use alloc::string::String;
 use alloc::vec::Vec;
 use slop_algebra::{AbstractField, PrimeField32};
 use sp1_primitives::{poseidon2_hash, SP1Field};
@@ -17,8 +16,6 @@ entrypoint!(main);
 const LEAF_TAG: u32 = 1;
 const NODE_TAG: u32 = 2;
 const EMPTY_TAG: u32 = 3;
-const KEY_TAG: u32 = 4;
-
 fn main() {
     let input: Sp1InsertStdin = sp1_zkvm::io::read();
     let pv = verify_and_apply_insert(input);
@@ -27,10 +24,9 @@ fn main() {
 
 fn verify_and_apply_insert(input: Sp1InsertStdin) -> Sp1InsertPublicValues {
     assert!(input.balance >= 0, "negative inserted balance");
-    let key = key_for_address(&input.address);
     let defaults = default_hashes(input.depth);
 
-    match &input.non_membership_proof {
+    let membership_siblings = match &input.non_membership_proof {
         Sp1NonMembershipProof::Default(proof) => {
             let resolved = resolve_default_siblings(
                 proof.default_depth,
@@ -39,52 +35,33 @@ fn verify_and_apply_insert(input: Sp1InsertStdin) -> Sp1InsertPublicValues {
                 &defaults,
             );
             verify_default_non_membership_root(
-                &key,
+                &input.key,
                 input.old_smt_root,
                 input.depth,
                 &defaults,
                 proof.default_depth,
                 &resolved,
-            )
+            );
+            expand_default_to_membership(input.depth, &defaults, &resolved, proof.default_depth)
         }
         Sp1NonMembershipProof::Collision(proof) => {
-            let resolved = resolve_membership_siblings(
-                &proof.siblings,
-                &input.frontier_hashes,
-                &defaults,
-            );
+            let resolved =
+                resolve_membership_siblings(&proof.siblings, &input.frontier_hashes, &defaults);
             verify_collision_non_membership_root(
-                &key,
+                &input.key,
                 input.old_smt_root,
                 input.depth,
                 proof,
                 &resolved,
-            )
+            );
+            resolved
         }
-    }
+    };
 
     let new_leaf = Sp1Leaf {
-        address: input.address.clone(),
+        key: input.key,
         balance: input.balance,
         salt: input.salt,
-    };
-    let membership_siblings = match &input.non_membership_proof {
-        Sp1NonMembershipProof::Default(proof) => expand_default_to_membership(
-            input.depth,
-            &defaults,
-            &resolve_default_siblings(
-                proof.default_depth,
-                &proof.siblings,
-                &input.frontier_hashes,
-                &defaults,
-            ),
-            proof.default_depth,
-        ),
-        Sp1NonMembershipProof::Collision(proof) => resolve_membership_siblings(
-            &proof.siblings,
-            &input.frontier_hashes,
-            &defaults,
-        ),
     };
     let new_root = compute_membership_root(&new_leaf, &membership_siblings, input.depth);
     let new_balance_total = input
@@ -117,7 +94,11 @@ fn expand_default_to_membership(
     for sibling in resolved_default_siblings.iter().rev() {
         siblings.push(*sibling);
     }
-    assert_eq!(siblings.len(), depth, "expanded default path length mismatch");
+    assert_eq!(
+        siblings.len(),
+        depth,
+        "expanded default path length mismatch"
+    );
     siblings
 }
 
@@ -155,10 +136,15 @@ fn verify_collision_non_membership_root(
     proof: &Sp1CollisionNonMembershipProof,
     siblings: &[Hash],
 ) {
-    let collision_key = key_for_address(&proof.collision_leaf.address);
-    assert!(collision_key != *key, "collision proof uses identical key");
+    assert!(
+        proof.collision_leaf.key != *key,
+        "collision proof uses identical key"
+    );
     let collision_root = compute_membership_root(&proof.collision_leaf, siblings, depth);
-    assert_eq!(collision_root, root, "collision non-membership root mismatch");
+    assert_eq!(
+        collision_root, root,
+        "collision non-membership root mismatch"
+    );
 }
 
 fn resolve_membership_siblings(
@@ -206,11 +192,10 @@ fn resolve_sibling_ref(
 
 fn compute_membership_root(leaf: &Sp1Leaf, siblings: &[Hash], depth: usize) -> Hash {
     assert_eq!(siblings.len(), depth, "membership proof length mismatch");
-    let key = key_for_address(&leaf.address);
-    let mut hash = leaf_hash(&key, leaf.balance, &leaf.salt);
+    let mut hash = leaf_hash(&leaf.key, leaf.balance, &leaf.salt);
     for (level_from_leaf, sibling) in siblings.iter().enumerate() {
         let depth_tag = depth - level_from_leaf - 1;
-        hash = if key_bit(&key, depth_tag) {
+        hash = if key_bit(&leaf.key, depth_tag) {
             internal_hash(depth_tag, sibling, &hash)
         } else {
             internal_hash(depth_tag, &hash, sibling)
@@ -219,30 +204,12 @@ fn compute_membership_root(leaf: &Sp1Leaf, siblings: &[Hash], depth: usize) -> H
     hash
 }
 
-fn key_for_address(address: &str) -> Hash {
-    let normalized = normalize_address(address);
-    let raw = normalized.strip_prefix("0x").unwrap_or(&normalized);
-    let mut bytes = [0u8; 20];
-    for (index, chunk) in raw.as_bytes().chunks(2).enumerate() {
-        bytes[index] = (from_hex_nibble(chunk[0]) << 4) | from_hex_nibble(chunk[1]);
-    }
-
-    let mut words = Vec::with_capacity(6);
-    words.push(SP1Field::from_wrapped_u32(KEY_TAG));
-    for chunk in bytes.chunks(4) {
-        let mut word = [0u8; 4];
-        word[..chunk.len()].copy_from_slice(chunk);
-        words.push(SP1Field::from_wrapped_u32(u32::from_be_bytes(word)));
-    }
-    poseidon_digest(words)
-}
-
 fn leaf_hash(key: &Hash, balance: i128, salt: &Hash) -> Hash {
     let mut inputs = Vec::with_capacity(21);
     inputs.push(SP1Field::from_wrapped_u32(LEAF_TAG));
-    inputs.extend(bytes_to_fields(key));
-    inputs.extend(i128_to_fields(balance));
-    inputs.extend(bytes_to_fields(salt));
+    push_bytes_fields(&mut inputs, key);
+    push_i128_fields(&mut inputs, balance);
+    push_bytes_fields(&mut inputs, salt);
     poseidon_digest(inputs)
 }
 
@@ -250,8 +217,8 @@ fn internal_hash(depth: usize, left: &Hash, right: &Hash) -> Hash {
     let mut inputs = Vec::with_capacity(18);
     inputs.push(SP1Field::from_wrapped_u32(NODE_TAG));
     inputs.push(SP1Field::from_wrapped_u32(depth as u32));
-    inputs.extend(bytes_to_fields(left));
-    inputs.extend(bytes_to_fields(right));
+    push_bytes_fields(&mut inputs, left);
+    push_bytes_fields(&mut inputs, right);
     poseidon_digest(inputs)
 }
 
@@ -270,26 +237,20 @@ fn poseidon_digest(inputs: Vec<SP1Field>) -> Hash {
     fields_to_bytes(&digest)
 }
 
-fn bytes_to_fields(bytes: &[u8; 32]) -> Vec<SP1Field> {
-    bytes.chunks(4)
-        .map(|chunk| {
-            let mut word = [0u8; 4];
-            word.copy_from_slice(chunk);
-            SP1Field::from_wrapped_u32(u32::from_be_bytes(word))
-        })
-        .collect()
+fn push_bytes_fields(out: &mut Vec<SP1Field>, bytes: &[u8; 32]) {
+    for chunk in bytes.chunks(4) {
+        let mut word = [0u8; 4];
+        word.copy_from_slice(chunk);
+        out.push(SP1Field::from_wrapped_u32(u32::from_be_bytes(word)));
+    }
 }
 
-fn i128_to_fields(value: i128) -> Vec<SP1Field> {
-    value
-        .to_be_bytes()
-        .chunks(4)
-        .map(|chunk| {
-            let mut word = [0u8; 4];
-            word.copy_from_slice(chunk);
-            SP1Field::from_wrapped_u32(u32::from_be_bytes(word))
-        })
-        .collect()
+fn push_i128_fields(out: &mut Vec<SP1Field>, value: i128) {
+    for chunk in value.to_be_bytes().chunks(4) {
+        let mut word = [0u8; 4];
+        word.copy_from_slice(chunk);
+        out.push(SP1Field::from_wrapped_u32(u32::from_be_bytes(word)));
+    }
 }
 
 fn fields_to_bytes(fields: &[SP1Field; 8]) -> Hash {
@@ -300,32 +261,8 @@ fn fields_to_bytes(fields: &[SP1Field; 8]) -> Hash {
     out
 }
 
-fn normalize_address(address: &str) -> String {
-    let trimmed = address.trim();
-    let raw = trimmed.strip_prefix("0x").unwrap_or(trimmed);
-    assert_eq!(raw.len(), 40, "address must have 40 hex chars");
-    for ch in raw.bytes() {
-        assert!(ch.is_ascii_hexdigit(), "invalid address hex");
-    }
-    let mut normalized = String::with_capacity(42);
-    normalized.push_str("0x");
-    for ch in raw.bytes() {
-        normalized.push((ch as char).to_ascii_lowercase());
-    }
-    normalized
-}
-
 fn key_bit(key: &Hash, depth: usize) -> bool {
     let byte = key[depth / 8];
     let offset = 7 - (depth % 8);
     ((byte >> offset) & 1) == 1
-}
-
-fn from_hex_nibble(byte: u8) -> u8 {
-    match byte {
-        b'0'..=b'9' => byte - b'0',
-        b'a'..=b'f' => byte - b'a' + 10,
-        b'A'..=b'F' => byte - b'A' + 10,
-        _ => panic!("invalid hex nibble"),
-    }
 }

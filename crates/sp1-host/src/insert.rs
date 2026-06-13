@@ -1,8 +1,12 @@
+use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use common::crypto::{hex_decode, hex_encode};
 use common::types::StoredSmtProof;
-use smt::insert::{apply_insert_with_witness, build_insert_witness, verify_insert, InsertResult, InsertWitness};
+use smt::insert::{
+    apply_insert_with_witness, build_insert_witness, verify_insert, InsertResult, InsertWitness,
+};
+use smt::key::key_for_address;
 use smt::proof::{CompactNonMembershipProof, SiblingRef};
 use smt::state::SmtState;
 use sp1_programs_common::io::{
@@ -12,6 +16,8 @@ use sp1_programs_common::io::{
 use sp1_sdk::blocking::{ProveRequest, Prover as BlockingProver, ProverClient};
 use sp1_sdk::include_elf;
 use sp1_sdk::{ProvingKey, SP1ProofWithPublicValues, SP1Stdin};
+
+use crate::setup::{default_setup_dir, load_insert_vk};
 
 const SMT_INSERT_ELF: sp1_sdk::Elf = include_elf!("sp1-smt-insert");
 
@@ -31,16 +37,21 @@ pub struct InsertExecutionResult {
 }
 
 fn sp1_insert_context() -> Result<Sp1InsertContext, String> {
+    sp1_insert_context_with_setup_dir(&default_setup_dir())
+}
+
+fn sp1_insert_context_with_setup_dir(setup_dir: &Path) -> Result<Sp1InsertContext, String> {
     let slot = SP1_INSERT_CONTEXT.get_or_init(|| Mutex::new(None));
-    let mut guard = slot.lock().map_err(|_| "sp1 insert context poisoned".to_string())?;
+    let mut guard = slot
+        .lock()
+        .map_err(|_| "sp1 insert context poisoned".to_string())?;
     if let Some(ctx) = guard.as_ref() {
         return Ok(ctx.clone());
     }
 
     let prover = ProverClient::builder().cpu().build();
-    let pk = prover
-        .setup(SMT_INSERT_ELF)
-        .map_err(|err| format!("sp1 insert setup failed: {err}"))?;
+    let vk = load_insert_vk(setup_dir, SMT_INSERT_ELF)?;
+    let pk = sp1_sdk::SP1ProvingKey::new(vk, SMT_INSERT_ELF);
     let ctx = Sp1InsertContext {
         prover,
         pk: Arc::new(pk),
@@ -186,7 +197,9 @@ fn build_sp1_insert_stdin(
     new_state_root: &str,
     witness: &InsertWitness,
 ) -> Result<Sp1InsertStdin, String> {
-    let multiproof = old_state.tree().compact_multiproof(&[witness.address.clone()])?;
+    let multiproof = old_state
+        .tree()
+        .compact_multiproof(&[witness.address.clone()])?;
     let compact_entry = multiproof
         .entries
         .first()
@@ -195,22 +208,22 @@ fn build_sp1_insert_stdin(
         smt::proof::CompactAddressProof::Membership(_) => {
             return Err("insert address unexpectedly has membership compact proof".to_string())
         }
-        smt::proof::CompactAddressProof::NonMembership(CompactNonMembershipProof::Default(proof)) => {
-            Sp1NonMembershipProof::Default(Sp1DefaultNonMembershipProof {
-                default_depth: proof.default_depth,
-                siblings: proof.siblings.iter().map(convert_sibling_ref).collect(),
-            })
-        }
-        smt::proof::CompactAddressProof::NonMembership(CompactNonMembershipProof::Collision(proof)) => {
-            Sp1NonMembershipProof::Collision(Sp1CollisionNonMembershipProof {
-                collision_leaf: Sp1Leaf {
-                    address: proof.collision_address.clone(),
-                    balance: proof.collision_balance,
-                    salt: proof.collision_salt,
-                },
-                siblings: proof.siblings.iter().map(convert_sibling_ref).collect(),
-            })
-        }
+        smt::proof::CompactAddressProof::NonMembership(CompactNonMembershipProof::Default(
+            proof,
+        )) => Sp1NonMembershipProof::Default(Sp1DefaultNonMembershipProof {
+            default_depth: proof.default_depth,
+            siblings: proof.siblings.iter().map(convert_sibling_ref).collect(),
+        }),
+        smt::proof::CompactAddressProof::NonMembership(CompactNonMembershipProof::Collision(
+            proof,
+        )) => Sp1NonMembershipProof::Collision(Sp1CollisionNonMembershipProof {
+            collision_leaf: Sp1Leaf {
+                key: key_for_address(&proof.collision_address)?,
+                balance: proof.collision_balance,
+                salt: proof.collision_salt,
+            },
+            siblings: proof.siblings.iter().map(convert_sibling_ref).collect(),
+        }),
     };
 
     Ok(Sp1InsertStdin {
@@ -220,7 +233,7 @@ fn build_sp1_insert_stdin(
         old_smt_root: old_state.smt_root(),
         old_balance_total: old_state.balance_total,
         frontier_hashes: multiproof.frontier_hashes,
-        address: witness.address.clone(),
+        key: key_for_address(&witness.address)?,
         balance: witness.balance,
         salt: witness.salt,
         non_membership_proof,
@@ -267,13 +280,16 @@ fn run_sp1_insert_execute(
     ))
 }
 
-fn decode_insert_public_values(bundle: &SP1ProofWithPublicValues) -> Result<Sp1InsertPublicValues, String> {
+fn decode_insert_public_values(
+    bundle: &SP1ProofWithPublicValues,
+) -> Result<Sp1InsertPublicValues, String> {
     let mut public_values = bundle.public_values.clone();
     Ok(public_values.read::<Sp1InsertPublicValues>())
 }
 
 fn serialize_sp1_proof(bundle: &SP1ProofWithPublicValues) -> Result<String, String> {
-    let bytes = bincode::serialize(bundle).map_err(|err| format!("serialize sp1 insert proof: {err}"))?;
+    let bytes =
+        bincode::serialize(bundle).map_err(|err| format!("serialize sp1 insert proof: {err}"))?;
     Ok(hex_encode(&bytes))
 }
 

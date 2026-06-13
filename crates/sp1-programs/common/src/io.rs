@@ -30,7 +30,7 @@ pub enum Sp1NonMembershipProof {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Sp1Leaf {
-    pub address: String,
+    pub key: Hash,
     pub balance: i128,
     pub salt: Hash,
 }
@@ -48,7 +48,7 @@ pub enum Sp1AddressProof {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Sp1UpdateEntryWitness {
-    pub address: String,
+    pub key: Hash,
     pub delta: i128,
     pub old_leaf: Option<Sp1Leaf>,
     pub proof: Sp1AddressProof,
@@ -85,7 +85,7 @@ pub struct Sp1InsertStdin {
     pub old_smt_root: Hash,
     pub old_balance_total: i128,
     pub frontier_hashes: Vec<Hash>,
-    pub address: String,
+    pub key: Hash,
     pub balance: i128,
     pub salt: Hash,
     pub non_membership_proof: Sp1NonMembershipProof,

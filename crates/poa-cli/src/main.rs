@@ -22,9 +22,11 @@ use nizk_fixed_set::verifier::verify_update;
 use smt::insert::build_insert_witness;
 use smt::leaf::Leaf;
 use smt::state::SmtState;
+use sp1_host::setup::default_setup_dir;
 use sp1_host::insert::{build_and_execute_insert, prove_insert, verify_insert_proof};
 use sp1_host::update::{
-    build_and_execute_update, build_and_prove_update, verify_update_proof as verify_smt_update_proof,
+    build_and_execute_update, build_and_prove_update, ensure_sp1_setup,
+    verify_update_proof as verify_smt_update_proof,
 };
 
 fn main() {
@@ -42,6 +44,17 @@ fn real_main() -> Result<(), String> {
     }
 
     match args[1].as_str() {
+        "sp1-setup" => {
+            let setup_dir = if args.len() == 3 {
+                Path::new(&args[2]).to_path_buf()
+            } else if args.len() == 2 {
+                default_setup_dir()
+            } else {
+                return Err("usage: poa-cli sp1-setup [setup-dir]".to_string());
+            };
+            ensure_sp1_setup(&setup_dir)?;
+            println!("wrote SP1 setup artifacts to {}", setup_dir.display());
+        }
         "gen-srs" => {
             if args.len() != 4 {
                 return Err("usage: poa-cli gen-srs <max-degree> <srs.bin>".to_string());
@@ -710,6 +723,7 @@ fn load_srs_for_verify(path: &Path, modified: usize) -> Result<Srs, String> {
 
 fn print_usage() {
     println!("usage:");
+    println!("  poa-cli sp1-setup [setup-dir]");
     println!("  poa-cli gen-srs <max-degree> <srs.bin>");
     println!("  poa-cli init <srs.bin> <reserves.csv> <state-root> <state.txt>");
     println!("  poa-cli prepare-run <run-dir> <max-degree> <reserves.csv> <state-root> <state.txt>");

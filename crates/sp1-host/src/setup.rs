@@ -1,0 +1,103 @@
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use common::crypto::hash_bytes;
+use serde::{Deserialize, Serialize};
+use sp1_sdk::blocking::{Prover as BlockingProver, ProverClient};
+use sp1_sdk::Elf;
+use sp1_sdk::ProvingKey;
+use sp1_sdk::SP1VerifyingKey;
+
+const UPDATE_ELF_NAME: &str = "smt-update";
+const INSERT_ELF_NAME: &str = "smt-insert";
+
+#[derive(Clone, Serialize, Deserialize)]
+struct StoredSp1Setup {
+    elf_name: String,
+    elf_digest: [u8; 32],
+    vk: SP1VerifyingKey,
+}
+
+pub fn default_setup_dir() -> PathBuf {
+    PathBuf::from(".sp1-setup")
+}
+
+pub fn ensure_all_setups(setup_dir: &Path, update_elf: Elf, insert_elf: Elf) -> Result<(), String> {
+    ensure_setup_file(setup_dir, UPDATE_ELF_NAME, update_elf)?;
+    ensure_setup_file(setup_dir, INSERT_ELF_NAME, insert_elf)?;
+    Ok(())
+}
+
+pub fn load_update_vk(setup_dir: &Path, update_elf: Elf) -> Result<SP1VerifyingKey, String> {
+    load_setup_file(setup_dir, UPDATE_ELF_NAME, update_elf)
+}
+
+pub fn load_insert_vk(setup_dir: &Path, insert_elf: Elf) -> Result<SP1VerifyingKey, String> {
+    load_setup_file(setup_dir, INSERT_ELF_NAME, insert_elf)
+}
+
+fn ensure_setup_file(setup_dir: &Path, elf_name: &str, elf: Elf) -> Result<(), String> {
+    fs::create_dir_all(setup_dir)
+        .map_err(|err| format!("create setup dir {}: {err}", setup_dir.display()))?;
+    let path = setup_file_path(setup_dir, elf_name);
+    let digest = elf_digest(&elf);
+
+    if path.exists() {
+        let stored = read_setup_file(&path)?;
+        if stored.elf_digest == digest {
+            return Ok(());
+        }
+    }
+
+    let prover = ProverClient::builder().cpu().build();
+    let pk = prover
+        .setup(elf)
+        .map_err(|err| format!("sp1 setup failed for {elf_name}: {err}"))?;
+    let stored = StoredSp1Setup {
+        elf_name: elf_name.to_string(),
+        elf_digest: digest,
+        vk: pk.verifying_key().clone(),
+    };
+    write_setup_file(&path, &stored)
+}
+
+fn load_setup_file(setup_dir: &Path, elf_name: &str, elf: Elf) -> Result<SP1VerifyingKey, String> {
+    let path = setup_file_path(setup_dir, elf_name);
+    if !path.exists() {
+        return Err(format!(
+            "missing SP1 setup artifact {}. Run `poa-cli sp1-setup {}` first.",
+            path.display(),
+            setup_dir.display()
+        ));
+    }
+    let stored = read_setup_file(&path)?;
+    let digest = elf_digest(&elf);
+    if stored.elf_digest != digest {
+        return Err(format!(
+            "stale SP1 setup artifact {} for {}. Re-run `poa-cli sp1-setup {}`.",
+            path.display(),
+            elf_name,
+            setup_dir.display()
+        ));
+    }
+    Ok(stored.vk)
+}
+
+fn setup_file_path(setup_dir: &Path, elf_name: &str) -> PathBuf {
+    setup_dir.join(format!("{elf_name}.bin"))
+}
+
+fn elf_digest(elf: &Elf) -> [u8; 32] {
+    hash_bytes("sp1-elf-digest", &[elf.as_ref()])
+}
+
+fn read_setup_file(path: &Path) -> Result<StoredSp1Setup, String> {
+    let bytes = fs::read(path).map_err(|err| format!("read {}: {err}", path.display()))?;
+    bincode::deserialize(&bytes).map_err(|err| format!("deserialize {}: {err}", path.display()))
+}
+
+fn write_setup_file(path: &Path, stored: &StoredSp1Setup) -> Result<(), String> {
+    let bytes = bincode::serialize(stored)
+        .map_err(|err| format!("serialize {}: {err}", path.display()))?;
+    fs::write(path, bytes).map_err(|err| format!("write {}: {err}", path.display()))
+}

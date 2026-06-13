@@ -1,10 +1,10 @@
+use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use common::crypto::{hex_decode, hex_encode};
 use common::types::{Delta, StoredSmtProof};
-use smt::proof::{
-    CompactAddressProof, CompactNonMembershipProof, CompactProofEntry, SiblingRef,
-};
+use smt::key::key_for_address;
+use smt::proof::{CompactAddressProof, CompactNonMembershipProof, CompactProofEntry, SiblingRef};
 use smt::state::SmtState;
 use smt::update::{
     apply_update_with_witness, build_update_multiproof, build_update_witness, verify_update,
@@ -19,7 +19,10 @@ use sp1_sdk::blocking::{ProveRequest, Prover as BlockingProver, ProverClient};
 use sp1_sdk::include_elf;
 use sp1_sdk::{ProvingKey, SP1ProofWithPublicValues, SP1Stdin};
 
+use crate::setup::{default_setup_dir, ensure_all_setups, load_update_vk};
+
 const SMT_UPDATE_ELF: sp1_sdk::Elf = include_elf!("sp1-smt-update");
+const SMT_INSERT_ELF: sp1_sdk::Elf = include_elf!("sp1-smt-insert");
 
 #[derive(Clone)]
 struct Sp1Context {
@@ -37,22 +40,31 @@ pub struct UpdateExecutionResult {
 }
 
 fn sp1_context() -> Result<Sp1Context, String> {
+    sp1_context_with_setup_dir(&default_setup_dir())
+}
+
+fn sp1_context_with_setup_dir(setup_dir: &Path) -> Result<Sp1Context, String> {
     let slot = SP1_CONTEXT.get_or_init(|| Mutex::new(None));
-    let mut guard = slot.lock().map_err(|_| "sp1 context poisoned".to_string())?;
+    let mut guard = slot
+        .lock()
+        .map_err(|_| "sp1 context poisoned".to_string())?;
     if let Some(ctx) = guard.as_ref() {
         return Ok(ctx.clone());
     }
 
     let prover = ProverClient::builder().cpu().build();
-    let pk = prover
-        .setup(SMT_UPDATE_ELF)
-        .map_err(|err| format!("sp1 setup failed: {err}"))?;
+    let vk = load_update_vk(setup_dir, SMT_UPDATE_ELF)?;
+    let pk = sp1_sdk::SP1ProvingKey::new(vk, SMT_UPDATE_ELF);
     let ctx = Sp1Context {
         prover,
         pk: Arc::new(pk),
     };
     *guard = Some(ctx.clone());
     Ok(ctx)
+}
+
+pub fn ensure_sp1_setup(setup_dir: &Path) -> Result<(), String> {
+    ensure_all_setups(setup_dir, SMT_UPDATE_ELF, SMT_INSERT_ELF)
 }
 
 pub fn prove_update(
@@ -202,15 +214,22 @@ fn build_sp1_stdin(
 ) -> Result<Sp1UpdateStdin, String> {
     let mut entries = Vec::with_capacity(witness.entries.len());
     let tree = old_state.tree();
-    let multiproof = build_update_multiproof(old_state, &witness.entries.iter().map(|entry| Delta {
-        address: entry.address.clone(),
-        delta: entry.delta,
-    }).collect::<Vec<_>>())?;
+    let multiproof = build_update_multiproof(
+        old_state,
+        &witness
+            .entries
+            .iter()
+            .map(|entry| Delta {
+                address: entry.address.clone(),
+                delta: entry.delta,
+            })
+            .collect::<Vec<_>>(),
+    )?;
 
     for (entry, compact_entry) in witness.entries.iter().zip(multiproof.entries.iter()) {
         let (old_leaf, proof) = build_compact_sp1_entry(tree, entry, compact_entry)?;
         entries.push(Sp1UpdateEntryWitness {
-            address: entry.address.clone(),
+            key: key_for_address(&entry.address)?,
             delta: entry.delta,
             old_leaf,
             proof,
@@ -234,7 +253,7 @@ fn build_compact_sp1_entry(
     compact_entry: &CompactProofEntry,
 ) -> Result<(Option<Sp1Leaf>, Sp1AddressProof), String> {
     let old_leaf = tree.get(&witness_entry.address).map(|leaf| Sp1Leaf {
-        address: leaf.address.clone(),
+        key: leaf.key,
         balance: leaf.balance,
         salt: leaf.salt,
     });
@@ -255,7 +274,7 @@ fn build_compact_sp1_entry(
             Sp1AddressProof::NonMembership(Sp1NonMembershipProof::Collision(
                 Sp1CollisionNonMembershipProof {
                     collision_leaf: Sp1Leaf {
-                        address: proof.collision_address.clone(),
+                        key: key_for_address(&proof.collision_address)?,
                         balance: proof.collision_balance,
                         salt: proof.collision_salt,
                     },
@@ -308,7 +327,9 @@ fn run_sp1_execute(
     ))
 }
 
-fn decode_public_values(bundle: &SP1ProofWithPublicValues) -> Result<Sp1UpdatePublicValues, String> {
+fn decode_public_values(
+    bundle: &SP1ProofWithPublicValues,
+) -> Result<Sp1UpdatePublicValues, String> {
     let mut public_values = bundle.public_values.clone();
     Ok(public_values.read::<Sp1UpdatePublicValues>())
 }

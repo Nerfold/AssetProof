@@ -1,0 +1,16 @@
+/target/
+/.DS_Store
+/examples/
+/paper.pdf
+/paper.tex
+/implementation.pdf
+/implementation.tex
+/vendor/bulletproofs-bls/.cargo-ok
+/vendor/bulletproofs-bls/.cargo_vcs_info.json
+/vendor/bulletproofs-bls/.github/
+/vendor/bulletproofs-bls/benches/
+/vendor/bulletproofs-bls/docs/
+/vendor/bulletproofs-bls/CHANGELOG.md
+/vendor/bulletproofs-bls/CONTRIBUTING.md
+/vendor/bulletproofs-bls/Cargo.toml.orig
+/vendor/bulletproofs-bls/Makefile

@@ -1,0 +1,14 @@
+[package]
+name = "common"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+ark-bls12-381 = "0.6"
+ark-ec = "0.6"
+ark-ff = "0.6"
+ark-serialize = "0.6"
+blake3 = "1.8"

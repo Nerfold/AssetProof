@@ -1,0 +1,19 @@
+[package]
+name = "nizk-fixed-set"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+ark-bls12-381 = "0.6"
+ark-ec = "0.6"
+ark-ff = "0.6"
+ark-poly = "0.6"
+ark-serialize = "0.6"
+blake3 = "1.8"
+bulletproofs-bls = { version = "4.0", default-features = false, features = ["rust", "std", "yoloproofs"] }
+common = { path = "../common" }
+merlin = "3"
+rand = "0.8"

@@ -1,0 +1,10 @@
+[package]
+name = "sp1-smt-update"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+slop-algebra = "6.2.4"
+sp1-primitives = "6.2.4"
+sp1-programs-common = { path = "../common" }
+sp1-zkvm = { version = "6.2.2" }

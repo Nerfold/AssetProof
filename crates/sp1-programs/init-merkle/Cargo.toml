@@ -1,0 +1,8 @@
+[package]
+name = "sp1-init-merkle"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+sp1-programs-common = { path = "../common" }
+smt = { path = "../../smt" }

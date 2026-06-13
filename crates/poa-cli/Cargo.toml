@@ -1,0 +1,13 @@
+[package]
+name = "poa-cli"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ark-bls12-381 = "0.6"
+ark-ff = "0.6"
+common = { path = "../common" }
+mock-chain = { path = "../mock-chain" }
+nizk-fixed-set = { path = "../nizk-fixed-set" }
+smt = { path = "../smt" }
+sp1-host = { path = "../sp1-host" }

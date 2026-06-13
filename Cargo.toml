@@ -1,0 +1,18 @@
+[workspace]
+members = [
+    "crates/common",
+    "crates/mock-chain",
+    "crates/nizk-fixed-set",
+    "crates/smt",
+    "crates/smt-bench",
+    "crates/sp1-programs/common",
+    "crates/sp1-programs/init-merkle",
+    "crates/sp1-programs/smt-update",
+    "crates/sp1-programs/smt-insert",
+    "crates/sp1-host",
+    "crates/poa-cli",
+]
+resolver = "2"
+
+[patch.crates-io]
+bulletproofs-bls = { path = "vendor/bulletproofs-bls" }

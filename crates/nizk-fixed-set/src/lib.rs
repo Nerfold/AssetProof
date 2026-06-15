@@ -1,6 +1,7 @@
 pub mod commitment;
 pub mod bp;
 pub mod init;
+pub mod init_proof;
 pub mod kzg;
 pub mod polynomial;
 pub mod update;

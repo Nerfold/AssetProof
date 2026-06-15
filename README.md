@@ -88,7 +88,14 @@ cargo run -p poa-cli -- gen-srs 256 examples/mock_srs.bin
 Initialize the hidden reserve set from `examples/reserves.csv`:
 
 ```bash
-cargo run -p poa-cli -- init examples/mock_srs.bin examples/reserves.csv init-root examples/readme_state.txt
+cargo run -p poa-cli -- init examples/mock_srs.bin examples/reserves.csv init-root examples/readme_state.txt examples/readme_init_proof.txt
+```
+
+If you want to test the future real-init interface now with mock addresses and mock
+private keys, use `address,balance,mock_private_key` rows:
+
+```bash
+cargo run -p poa-cli -- init-mock-owned examples/mock_srs.bin examples/init_witness.csv ethereum-mainnet init-root session-001 examples/readme_state.txt examples/readme_init_proof.txt
 ```
 
 Apply one public delta window from `examples/deltas.csv` and create the next
@@ -101,7 +108,7 @@ cargo run -p poa-cli -- update examples/mock_srs.bin examples/readme_state.txt e
 Verify the generated proof:
 
 ```bash
-cargo run -p poa-cli -- verify examples/mock_srs.bin examples/readme_state.txt examples/deltas.csv examples/readme_next_state.txt examples/readme_proof.txt
+cargo run -p poa-cli -- verify examples/mock_srs.bin examples/readme_state.txt examples/deltas.csv examples/readme_next_state.txt examples/readme_proof.txt examples/readme_init_proof.txt
 ```
 
 On the current sample data, the update step reports:
@@ -194,9 +201,9 @@ cargo run -p poa-cli -- sp1-setup
 Commands:
 
 ```bash
-cargo run -p poa-cli -- init <srs.bin> <reserves.csv> <state-root> <state.txt>
+cargo run -p poa-cli -- init <srs.bin> <reserves.csv> <state-root> <state.txt> <init-proof.txt>
 cargo run -p poa-cli -- update <srs.bin> <state.txt> <deltas.csv> <new-state-root> <next-state.txt> <proof.txt>
-cargo run -p poa-cli -- verify <srs.bin> <state.txt> <deltas.csv> <next-state.txt> <proof.txt>
+cargo run -p poa-cli -- verify <srs.bin> <state.txt> <deltas.csv> <next-state.txt> <proof.txt> <init-proof.txt>
 ```
 
 SMT commands:

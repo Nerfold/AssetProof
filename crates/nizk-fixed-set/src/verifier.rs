@@ -1,14 +1,22 @@
 use ark_bls12_381::Fr;
-use ark_ff::PrimeField;
 use std::collections::HashSet;
 
 use common::crypto::{point_g1_from_hex, scalar_to_hex};
 use common::encoding::encode_address;
-use common::types::{Delta, StoredProof, StoredState};
+use common::types::{Delta, StoredInitProof, StoredProof, StoredState};
 
 use crate::bp::verify_logic;
+use crate::init_proof::verify_init_proof;
 use crate::kzg::{commit_g2, verify_batch, Srs};
 use crate::polynomial::product_from_roots;
+
+pub fn verify_init(
+    srs: &Srs,
+    state: &StoredState,
+    proof: &StoredInitProof,
+) -> Result<(), String> {
+    verify_init_proof(srs, state, proof)
+}
 
 pub fn verify_update(
     srs: &Srs,
@@ -89,10 +97,41 @@ fn ensure_distinct(points: &[Fr]) -> Result<(), String> {
 mod tests {
     use common::types::{Delta, ReserveEntry};
 
-    use super::verify_update;
+    use super::{verify_init, verify_update};
     use crate::init::initialize;
+    use crate::init_proof::initialize_with_proof;
     use crate::kzg::Srs;
     use crate::update::apply_update;
+
+    #[test]
+    fn accepts_honest_init() {
+        let srs = Srs::setup(16, b"test-srs-init");
+        let entries = vec![
+            ReserveEntry {
+                address: "0x1111111111111111111111111111111111111111".to_string(),
+                balance: 100,
+            },
+            ReserveEntry {
+                address: "0x2222222222222222222222222222222222222222".to_string(),
+                balance: 250,
+            },
+        ];
+        let init = initialize_with_proof(&entries, "root-0", &srs).unwrap();
+        verify_init(&srs, &init.state, &init.proof).unwrap();
+    }
+
+    #[test]
+    fn rejects_tampered_init_digest() {
+        let srs = Srs::setup(16, b"test-srs-init-bad");
+        let entries = vec![ReserveEntry {
+            address: "0x1111111111111111111111111111111111111111".to_string(),
+            balance: 100,
+        }];
+        let mut init = initialize_with_proof(&entries, "root-0", &srs).unwrap();
+        init.proof.init_digest_hex.push('0');
+        let err = verify_init(&srs, &init.state, &init.proof).expect_err("proof should fail");
+        assert!(!err.is_empty());
+    }
 
     #[test]
     fn accepts_honest_update() {

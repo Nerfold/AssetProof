@@ -7,6 +7,78 @@ pub struct ReserveEntry {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InitProvingContext {
+    pub chain_id: String,
+    pub state_root: String,
+    pub session_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InitReserveWitness {
+    pub address: String,
+    pub balance: i128,
+    pub ownership: OwnershipWitnessInput,
+    pub chain_balance_proof: ChainBalanceProofInput,
+}
+
+impl InitReserveWitness {
+    pub fn mock(address: String, balance: i128, mock_private_key: String) -> Self {
+        Self {
+            address: address.clone(),
+            balance,
+            ownership: OwnershipWitnessInput::MockPrivateKey { mock_private_key },
+            chain_balance_proof: ChainBalanceProofInput::Mock {
+                proof_label: format!("mock-balance-proof:{address}"),
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OwnershipWitnessInput {
+    MockPrivateKey { mock_private_key: String },
+    EthereumEoaPrivateKeyHex { private_key_hex: String },
+    ExternalOwnershipProof { scheme: String, proof_hex: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ChainBalanceProofInput {
+    Mock { proof_label: String },
+    EthereumAccountProof {
+        chain_id: String,
+        block_number: u64,
+        block_hash_hex: String,
+        account_proof_rlp_hex: Vec<String>,
+    },
+    GenericMerkleProof {
+        chain_id: String,
+        proof_system: String,
+        proof_payload_hex: String,
+        public_inputs_hex: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreparedOwnershipWitness {
+    pub scheme: String,
+    pub proof_digest_hex: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreparedChainBalanceWitness {
+    pub scheme: String,
+    pub proof_digest_hex: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreparedInitReserveWitness {
+    pub address: String,
+    pub balance: i128,
+    pub ownership: PreparedOwnershipWitness,
+    pub chain_balance: PreparedChainBalanceWitness,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Delta {
     pub address: String,
     pub delta: i128,
@@ -29,6 +101,31 @@ pub struct StoredState {
     pub balance_total: i128,
     pub balance_blind: Fr,
     pub balance_commitment_hex: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredInitProof {
+    pub scheme: String,
+    pub mode: String,
+    pub chain_id: String,
+    pub state_root: String,
+    pub session_id: String,
+    pub accumulator_hex: String,
+    pub balance_commitment_hex: String,
+    pub init_salt: Fr,
+    pub init_digest_hex: String,
+    pub ownership_artifact_digest_hex: String,
+    pub chain_balance_artifact_digest_hex: String,
+    pub reserve_count: usize,
+    pub zeta: Fr,
+    pub p_zeta: Fr,
+    pub product_zeta: Fr,
+    pub balance_total: i128,
+    pub balance_blind: Fr,
+    pub chain_proof_hex: String,
+    pub alg_proof_hex: String,
+    pub transcript_hex: String,
+    pub srs_hash_hex: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

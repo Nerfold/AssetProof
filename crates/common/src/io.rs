@@ -10,7 +10,10 @@ use crate::crypto::{
     write_scalar_vec_csv, write_srs_binary, write_string_vec_csv, write_u8_vec_csv,
 };
 use crate::encoding::normalize_address;
-use crate::types::{Delta, ReserveEntry, SmtLeafRecord, StoredProof, StoredSmtProof, StoredSmtState, StoredState};
+use crate::types::{
+    Delta, InitReserveWitness, ReserveEntry, SmtLeafRecord, StoredInitProof, StoredProof, StoredSmtProof,
+    StoredSmtState, StoredState,
+};
 
 pub fn read_reserve_csv(path: &Path) -> Result<Vec<ReserveEntry>, String> {
     let input = fs::read_to_string(path).map_err(|err| format!("read {}: {err}", path.display()))?;
@@ -29,6 +32,34 @@ pub fn read_reserve_csv(path: &Path) -> Result<Vec<ReserveEntry>, String> {
             .parse::<i128>()
             .map_err(|err| format!("invalid balance on line {}: {err}", line_no + 1))?;
         entries.push(ReserveEntry { address, balance });
+    }
+    Ok(entries)
+}
+
+pub fn read_init_witness_csv(path: &Path) -> Result<Vec<InitReserveWitness>, String> {
+    let input = fs::read_to_string(path).map_err(|err| format!("read {}: {err}", path.display()))?;
+    let mut entries = Vec::new();
+    for (line_no, raw_line) in input.lines().enumerate() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let parts: Vec<_> = line.split(',').map(|part| part.trim()).collect();
+        if parts.len() != 3 {
+            return Err(format!(
+                "invalid init witness csv line {}: expected address,balance,mock_private_key",
+                line_no + 1
+            ));
+        }
+        let address = normalize_address(parts[0])?;
+        let balance = parts[1]
+            .parse::<i128>()
+            .map_err(|err| format!("invalid balance on line {}: {err}", line_no + 1))?;
+        entries.push(InitReserveWitness::mock(
+            address,
+            balance,
+            parts[2].to_string(),
+        ));
     }
     Ok(entries)
 }
@@ -142,6 +173,91 @@ pub fn write_proof(path: &Path, proof: &StoredProof) -> Result<(), String> {
     lines.push(format!("bp_commitments_hex={}", proof.bp_commitments_hex));
     lines.push(format!("link_proof_hex={}", proof.link_proof_hex));
     fs::write(path, lines.join("\n")).map_err(|err| format!("write {}: {err}", path.display()))
+}
+
+pub fn write_init_proof(path: &Path, proof: &StoredInitProof) -> Result<(), String> {
+    let mut lines = Vec::new();
+    lines.push(format!("scheme={}", proof.scheme));
+    lines.push(format!("mode={}", proof.mode));
+    lines.push(format!("chain_id={}", proof.chain_id));
+    lines.push(format!("state_root={}", proof.state_root));
+    lines.push(format!("session_id={}", proof.session_id));
+    lines.push(format!("accumulator_hex={}", proof.accumulator_hex));
+    lines.push(format!(
+        "balance_commitment_hex={}",
+        proof.balance_commitment_hex
+    ));
+    lines.push(format!("init_salt={}", scalar_to_hex(&proof.init_salt)?));
+    lines.push(format!("init_digest_hex={}", proof.init_digest_hex));
+    lines.push(format!(
+        "ownership_artifact_digest_hex={}",
+        proof.ownership_artifact_digest_hex
+    ));
+    lines.push(format!(
+        "chain_balance_artifact_digest_hex={}",
+        proof.chain_balance_artifact_digest_hex
+    ));
+    lines.push(format!("reserve_count={}", proof.reserve_count));
+    lines.push(format!("zeta={}", scalar_to_hex(&proof.zeta)?));
+    lines.push(format!("p_zeta={}", scalar_to_hex(&proof.p_zeta)?));
+    lines.push(format!(
+        "product_zeta={}",
+        scalar_to_hex(&proof.product_zeta)?
+    ));
+    lines.push(format!("balance_total={}", proof.balance_total));
+    lines.push(format!(
+        "balance_blind={}",
+        scalar_to_hex(&proof.balance_blind)?
+    ));
+    lines.push(format!("chain_proof_hex={}", proof.chain_proof_hex));
+    lines.push(format!("alg_proof_hex={}", proof.alg_proof_hex));
+    lines.push(format!("transcript_hex={}", proof.transcript_hex));
+    lines.push(format!("srs_hash_hex={}", proof.srs_hash_hex));
+    fs::write(path, lines.join("\n")).map_err(|err| format!("write {}: {err}", path.display()))
+}
+
+pub fn write_init(path: &Path, proof: &StoredInitProof) -> Result<(), String> {
+    write_init_proof(path, proof)
+}
+
+pub fn read_init_proof(path: &Path) -> Result<StoredInitProof, String> {
+    let kv = read_key_value_file(path)?;
+    Ok(StoredInitProof {
+        scheme: req_string(&kv, "scheme")?,
+        mode: req_string(&kv, "mode")?,
+        chain_id: kv.get("chain_id").cloned().unwrap_or_else(|| "mock-chain".to_string()),
+        state_root: req_string(&kv, "state_root")?,
+        session_id: kv
+            .get("session_id")
+            .cloned()
+            .unwrap_or_else(|| "legacy-init-session".to_string()),
+        accumulator_hex: req_string(&kv, "accumulator_hex")?,
+        balance_commitment_hex: req_string(&kv, "balance_commitment_hex")?,
+        init_salt: req_scalar(&kv, "init_salt")?,
+        init_digest_hex: req_string(&kv, "init_digest_hex")?,
+        ownership_artifact_digest_hex: kv
+            .get("ownership_artifact_digest_hex")
+            .cloned()
+            .unwrap_or_default(),
+        chain_balance_artifact_digest_hex: kv
+            .get("chain_balance_artifact_digest_hex")
+            .cloned()
+            .unwrap_or_default(),
+        reserve_count: req_usize(&kv, "reserve_count")?,
+        zeta: req_scalar(&kv, "zeta")?,
+        p_zeta: req_scalar(&kv, "p_zeta")?,
+        product_zeta: req_scalar(&kv, "product_zeta")?,
+        balance_total: req_i128(&kv, "balance_total")?,
+        balance_blind: req_scalar(&kv, "balance_blind")?,
+        chain_proof_hex: kv.get("chain_proof_hex").cloned().unwrap_or_default(),
+        alg_proof_hex: kv.get("alg_proof_hex").cloned().unwrap_or_default(),
+        transcript_hex: req_string(&kv, "transcript_hex")?,
+        srs_hash_hex: req_string(&kv, "srs_hash_hex")?,
+    })
+}
+
+pub fn read_init(path: &Path) -> Result<StoredInitProof, String> {
+    read_init_proof(path)
 }
 
 pub fn read_proof(path: &Path) -> Result<StoredProof, String> {

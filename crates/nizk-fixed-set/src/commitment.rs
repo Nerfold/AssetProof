@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
 use ark_bls12_381::{Fr, G1Affine, G1Projective};
-use ark_ec::{AffineRepr, CurveGroup, PrimeGroup, VariableBaseMSM};
+use ark_ec::{CurveGroup, PrimeGroup, VariableBaseMSM};
 use ark_ff::PrimeField;
 
 use common::crypto::{g1_mul_generator, hash_to_scalar};

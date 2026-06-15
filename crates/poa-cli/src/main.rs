@@ -7,18 +7,19 @@ use ark_bls12_381::Fr;
 use ark_ff::Zero;
 use common::crypto::{hash_to_scalar, point_g1_to_hex};
 use common::io::{
-    read_delta_csv, read_proof, read_reserve_csv, read_smt_proof, read_smt_state, read_srs, read_srs_g1_prefix,
-    read_srs_prefix, read_state, write_proof, write_smt_proof, write_smt_state, write_srs, write_state,
+    read_delta_csv, read_init, read_init_witness_csv, read_proof, read_reserve_csv, read_smt_proof, read_smt_state,
+    read_srs, read_srs_g1_prefix, read_srs_prefix, read_state, write_init, write_proof, write_smt_proof,
+    write_smt_state, write_srs, write_state,
 };
-use common::types::{Delta, StoredState};
+use common::types::{Delta, InitProvingContext, StoredState};
 use mock_chain::generator::{generate_scenario, load_manifest, write_scenario};
 use nizk_fixed_set::commitment::commit_balance;
-use nizk_fixed_set::init::initialize;
+use nizk_fixed_set::init_proof::initialize_with_proof;
 use nizk_fixed_set::kzg::commit_g1;
 use nizk_fixed_set::kzg::Srs;
 use nizk_fixed_set::polynomial::Polynomial;
 use nizk_fixed_set::update::apply_update;
-use nizk_fixed_set::verifier::verify_update;
+use nizk_fixed_set::verifier::{verify_init, verify_update};
 use smt::insert::build_insert_witness;
 use smt::leaf::Leaf;
 use smt::state::SmtState;
@@ -67,13 +68,17 @@ fn real_main() -> Result<(), String> {
             println!("wrote SRS with max_degree={} to {}", max_degree, args[3]);
         }
         "init" => {
-            if args.len() != 6 {
-                return Err("usage: poa-cli init <srs.bin> <reserves.csv> <state-root> <state.txt>".to_string());
+            if args.len() != 7 {
+                return Err(
+                    "usage: poa-cli init <srs.bin> <reserves.csv> <state-root> <state.txt> <init-proof.txt>"
+                        .to_string(),
+                );
             }
             let srs = load_srs(Path::new(&args[2]))?;
             let reserves = read_reserve_csv(Path::new(&args[3]))?;
-            let init = initialize(&reserves, &args[4], &srs)?;
+            let init = initialize_with_proof(&reserves, &args[4], &srs)?;
             write_state(Path::new(&args[5]), &init.state)?;
+            write_init(Path::new(&args[6]), &init.proof)?;
             println!(
                 "initialized n={}, balance_total={}, state_root={}",
                 init.state.reserve_addresses.len(),
@@ -81,10 +86,35 @@ fn real_main() -> Result<(), String> {
                 init.state.state_root
             );
         }
-        "prepare-run" => {
-            if args.len() != 7 {
+        "init-mock-owned" => {
+            if args.len() != 9 {
                 return Err(
-                    "usage: poa-cli prepare-run <run-dir> <max-degree> <reserves.csv> <state-root> <state.txt>"
+                    "usage: poa-cli init-mock-owned <srs.bin> <init-witness.csv> <chain-id> <state-root> <session-id> <state.txt> <init-proof.txt>"
+                        .to_string(),
+                );
+            }
+            let srs = load_srs(Path::new(&args[2]))?;
+            let witnesses = read_init_witness_csv(Path::new(&args[3]))?;
+            let ctx = InitProvingContext {
+                chain_id: args[4].clone(),
+                state_root: args[5].clone(),
+                session_id: args[6].clone(),
+            };
+            let init = nizk_fixed_set::init_proof::initialize_from_witnesses(&ctx, &witnesses, &srs)?;
+            write_state(Path::new(&args[7]), &init.state)?;
+            write_init(Path::new(&args[8]), &init.proof)?;
+            println!(
+                "initialized mock-owned n={}, balance_total={}, chain_id={}, state_root={}",
+                init.state.reserve_addresses.len(),
+                init.state.balance_total,
+                ctx.chain_id,
+                ctx.state_root
+            );
+        }
+        "prepare-run" => {
+            if args.len() != 8 {
+                return Err(
+                    "usage: poa-cli prepare-run <run-dir> <max-degree> <reserves.csv> <state-root> <state.txt> <init-proof.txt>"
                         .to_string(),
                 );
             }
@@ -105,9 +135,10 @@ fn real_main() -> Result<(), String> {
 
             let srs = load_srs(&srs_path)?;
             let reserves = read_reserve_csv(Path::new(&args[4]))?;
-            let init = initialize(&reserves, &args[5], &srs)?;
+            let init = initialize_with_proof(&reserves, &args[5], &srs)?;
             let state_path = Path::new(&args[6]);
             write_state(state_path, &init.state)?;
+            write_init(Path::new(&args[7]), &init.proof)?;
             println!(
                 "prepared run: state={}, n={}, balance_total={}",
                 state_path.display(),
@@ -286,18 +317,21 @@ fn real_main() -> Result<(), String> {
             );
         }
         "verify" => {
-            if args.len() != 7 {
+            if args.len() != 8 {
                 return Err(
-                    "usage: poa-cli verify <srs.bin> <old-state.txt> <deltas.csv> <new-state.txt> <proof.txt>"
+                    "usage: poa-cli verify <srs.bin> <old-state.txt> <deltas.csv> <new-state.txt> <proof.txt> <init-proof.txt>"
                         .to_string(),
                 );
             }
             let old_state = read_state(Path::new(&args[3]))?;
             let deltas = read_delta_csv(Path::new(&args[4]))?;
-            let srs = load_srs_for_verify(Path::new(&args[2]), deltas.len())?;
+            let srs = load_srs_for_init_verify(Path::new(&args[2]), &old_state)?;
             let new_state = read_state(Path::new(&args[5]))?;
             let proof = read_proof(Path::new(&args[6]))?;
-            verify_update(&srs, &old_state, &deltas, &new_state, &proof)?;
+            let init_proof = read_init(Path::new(&args[7]))?;
+            verify_init(&srs, &old_state, &init_proof)?;
+            let verify_srs = load_srs_for_verify(Path::new(&args[2]), deltas.len())?;
+            verify_update(&verify_srs, &old_state, &deltas, &new_state, &proof)?;
             println!(
                 "verification passed for m={}, new_balance_total={}",
                 deltas.len(),
@@ -335,7 +369,7 @@ fn real_main() -> Result<(), String> {
             let scenario = load_manifest(Path::new(&args[3]))?;
             let mut report = String::new();
             let init_start = Instant::now();
-            let init = initialize(&scenario.reserves, &scenario.initial_root, &srs)?;
+            let init = initialize_with_proof(&scenario.reserves, &scenario.initial_root, &srs)?;
             let init_elapsed = init_start.elapsed();
             let mut current_state = init.state;
             let mut total_update_micros = 0u128;
@@ -721,19 +755,24 @@ fn load_srs_for_verify(path: &Path, modified: usize) -> Result<Srs, String> {
     load_srs_prefix(path, needed_len, needed_len)
 }
 
+fn load_srs_for_init_verify(path: &Path, state: &StoredState) -> Result<Srs, String> {
+    load_srs_prefix(path, state.masked_polynomial_coeffs.len(), state.masked_polynomial_coeffs.len())
+}
+
 fn print_usage() {
     println!("usage:");
     println!("  poa-cli sp1-setup [setup-dir]");
     println!("  poa-cli gen-srs <max-degree> <srs.bin>");
-    println!("  poa-cli init <srs.bin> <reserves.csv> <state-root> <state.txt>");
-    println!("  poa-cli prepare-run <run-dir> <max-degree> <reserves.csv> <state-root> <state.txt>");
+    println!("  poa-cli init <srs.bin> <reserves.csv> <state-root> <state.txt> <init-proof.txt>");
+    println!("  poa-cli init-mock-owned <srs.bin> <init-witness.csv> <chain-id> <state-root> <session-id> <state.txt> <init-proof.txt>");
+    println!("  poa-cli prepare-run <run-dir> <max-degree> <reserves.csv> <state-root> <state.txt> <init-proof.txt>");
     println!("  poa-cli prepare-synthetic-run <run-dir> <degree> <state-root> <state.txt>");
     println!("  poa-cli prepare-synthetic-state <srs.bin> <degree> <state-root> <state.txt>");
     println!("  poa-cli update <srs.bin> <state.txt> <deltas.csv> <new-state-root> <next-state.txt> <proof.txt>");
     println!("  poa-cli continue-run <run-dir> <current-state.txt> <deltas.csv> <new-state-root> <next-state.txt>");
     println!("  poa-cli continue-synthetic-run <run-dir> <current-state.txt> <modified-addresses> <new-state-root> <next-state.txt>");
     println!("  poa-cli continue-synthetic-state <srs.bin> <current-state.txt> <modified-addresses> <new-state-root> <next-state.txt>");
-    println!("  poa-cli verify <srs.bin> <old-state.txt> <deltas.csv> <new-state.txt> <proof.txt>");
+    println!("  poa-cli verify <srs.bin> <old-state.txt> <deltas.csv> <new-state.txt> <proof.txt> <init-proof.txt>");
     println!("  poa-cli mock-gen <out-dir> <num-accounts> <num-reserves> <num-blocks> <txs-per-block> <seed>");
     println!("  poa-cli mock-bench <srs.bin> <manifest.txt> <report.txt>");
     println!("  poa-cli synthetic-update-bench <srs.bin> <degree> <modified-addresses>");

@@ -1,0 +1,1164 @@
+\documentclass[runningheads]{llncs}
+
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{amsmath,amssymb,amsfonts,mathtools}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{algorithm}
+\usepackage[noend]{algpseudocode}
+\usepackage{xspace}
+\usepackage{url}
+\usepackage{hyperref}
+
+\hypersetup{colorlinks=true,linkcolor=blue!60!black,citecolor=blue!60!black,urlcolor=blue!60!black}
+
+\spnewtheorem{assumption}{Assumption}{\bfseries}{\itshape}
+\spnewtheorem{definitionx}{Definition}{\bfseries}{\itshape}
+\spnewtheorem{remarkx}{Remark}{\bfseries}{\itshape}
+
+\newcommand{\F}{\mathbb{F}}
+\newcommand{\G}{\mathbb{G}}
+\newcommand{\GT}{\mathbb{G}_T}
+\newcommand{\Z}{\mathbb{Z}}
+\newcommand{\bits}{\{0,1\}}
+\newcommand{\Enc}{\mathsf{Enc}}
+\newcommand{\Com}{\mathsf{Com}}
+\newcommand{\KZG}{\mathsf{KZG}}
+\newcommand{\BP}{\mathsf{BP}}
+\newcommand{\SNARK}{\mathsf{SNARK}}
+\newcommand{\SMT}{\mathsf{SMT}}
+\newcommand{\CRH}{\mathsf{H}}
+\newcommand{\bal}{\mathsf{bal}}
+\newcommand{\sr}{\mathsf{sr}}
+\newcommand{\pp}{\mathsf{pp}}
+\newcommand{\Setup}{\mathsf{Setup}}
+\newcommand{\Prove}{\mathsf{Prove}}
+\newcommand{\Verify}{\mathsf{Verify}}
+\newcommand{\Init}{\mathsf{Init}}
+\newcommand{\Upd}{\mathsf{Update}}
+\newcommand{\Insert}{\mathsf{Insert}}
+\newcommand{\Finalize}{\mathsf{Finalized}}
+\newcommand{\Sync}{\mathsf{Sync}}
+\newcommand{\Canon}{\mathsf{Canon}}
+\newcommand{\Range}{\mathsf{Range}}
+\newcommand{\negl}{\mathsf{negl}}
+\newcommand{\poly}{\mathsf{poly}}
+\newcommand{\Adv}{\mathcal{A}}
+\newcommand{\Rel}{\mathcal{R}}
+\newcommand{\View}{\mathsf{View}}
+\newcommand{\softO}{\widetilde{O}}
+\newcommand{\inner}[2]{\langle #1,#2\rangle}
+\newcommand{\dlist}{\Delta}
+\newcommand{\rootof}{\mathsf{root}}
+\newcommand{\leaf}{\mathsf{leaf}}
+\newcommand{\nil}{\bot}
+\newcommand{\NIZK}{\mathsf{NIZK}}
+\newcommand{\Hash}{\mathsf{H}}
+\newcommand{\vk}{\mathsf{vk}}
+\newcommand{\pk}{\mathsf{pk}}
+\newcommand{\wit}{\mathsf{wit}}
+\newcommand{\pub}{\mathsf{pub}}
+\newcommand{\old}{\mathsf{old}}
+\newcommand{\new}{\mathsf{new}}
+\newcommand{\bigO}{O}
+
+\algnewcommand{\LineComment}[1]{\State \(\triangleright\) #1}
+
+\title{Dynamic Privacy-Preserving Proofs of Assets for Hidden On-Chain Address Sets}
+\titlerunning{Dynamic Private Proofs of Assets}
+\author{Anonymous Author(s)}
+\authorrunning{Anonymous}
+\institute{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Proofs of solvency require a custodian to demonstrate that its assets cover its liabilities.  The on-chain asset side is usually handled by publishing reserve addresses and proving control of the corresponding keys, while academic approaches such as Provisions study stronger privacy goals~\cite{Provisions15}.  This is simple, but it reveals the reserve set and makes long-term treasury flows publicly traceable.  A fully private alternative is to prove in zero knowledge that a hidden set of controlled addresses has enough balance under a public chain state root.  The obstacle is dynamism: naively recomputing a large proof after every block is expensive, especially when the native chain state structure is not proof-friendly.
+
+We formalize dynamic private proof of assets for a hidden on-chain address set and give two concrete constructions.  The first is an algebraic fixed-set update protocol.  A scalar-masked KZG commitment binds the hidden reserve set through a randomized set polynomial, preserving zero tests while hiding the polynomial from dictionary checks.  For each public block-delta list, the prover commits to a hidden membership-status vector, uses a structured KZG evaluation commitment to bind the hidden evaluation vector to the touched addresses, and proves by a committed-R1CS Bulletproof that the committed aggregate balance change is the inner product of this hidden status vector with the public deltas.  The second construction is a compact sparse-Merkle-tree implementation in a SNARK.  It supports mutable reserve sets by proving membership, non-membership, conditional update, and insertion transitions directly over a circuit-friendly local tree.  Both constructions bind every accepted asset commitment to a finalized chain state root, hide the reserve set and aggregate delta, and compose with a liability commitment through a threshold proof.
+\keywords{Proof of assets \and proof of solvency \and zero knowledge \and KZG commitments \and Bulletproofs \and sparse Merkle trees}
+\end{abstract}
+
+\section{Introduction}
+
+A centralized exchange or custodian is solvent if it can cover its user liabilities.  A cryptographic proof of solvency decomposes this claim into two parts.  A proof of liabilities establishes the total amount owed to users, preferably without leaking individual user balances.  A proof of assets establishes that the custodian controls enough assets.  This paper focuses on the asset side for on-chain reserves.
+
+The common on-chain method is to disclose reserve addresses.  The custodian signs messages under the corresponding keys, and anyone can audit the asset total from the public chain state.  This approach is easy to explain and easy to verify, but it exposes the reserve set.  Once the reserve set is public, observers can monitor inflows and outflows, identify counterparties, infer business activity, and analyze short-term liquidity management.  These effects are not merely cosmetic: reserve-address disclosure can reveal operational strategy even when the custodian is honest and fully solvent.
+
+A natural private alternative is to use a zero-knowledge proof.  At a public state root \(\sr_i\), the prover would show that there exists a hidden set \(S\) of addresses, that the prover controls every address in \(S\), that the balance of each address is correctly read from the chain state, and that a public commitment \(C_i\) opens to the aggregate balance
+\[
+        B_i=\sum_{a\in S}\bal_{\sr_i}(a).
+\]
+This static statement is conceptually clean.  It is also unsatisfactory as a long-term audit mechanism.  First, if the native chain uses a proof-unfriendly state structure, then proving many native membership proofs inside a SNARK can dominate the cost.  Second, a single proof at one time gives weak continuous accountability.  A custodian may borrow assets shortly before the audit and return them afterwards.  If the reserve set is hidden, users cannot track the reserve addresses directly.
+
+We address this gap by making private proof of assets dynamic.  The prover first produces an initialization proof under a finalized state root.  Afterwards, every audit epoch is driven by a public delta list
+\[
+        \dlist_i=((a_1,\delta_1),\ldots,(a_m,\delta_m))
+\]
+which records the balance changes between two finalized roots.  The prover proves that the new aggregate commitment equals the old one plus exactly the deltas belonging to hidden reserve addresses:
+\[
+        B_i = B_{i-1}+\sum_{j=1}^m \mathbf{1}[a_j\in S]\delta_j.
+\]
+The proof reveals neither \(S\), nor \(S\cap\{a_1,\ldots,a_m\}\), nor the aggregate change \(\sum_j \mathbf{1}[a_j\in S]\delta_j\).  Every accepted commitment is tied to a concrete finalized root, so the verifier can follow a chain of private asset commitments over time.
+
+\paragraph{Public synchronizer.}
+The delta list is not a trusted oracle.  It is the output of a deterministic public program \(\Sync\) that reads finalized blocks, executes the chain's public balance-transition rules, merges duplicate address entries, and outputs a canonical list of address-delta pairs.  The verifier may run \(\Sync\) locally, or verify a posted output by re-execution.  The cryptographic proof does not hide or certify chain execution; it proves correct private-reserve evolution relative to this public, reproducible transformation of finalized blocks.  This is the same trust boundary used by ordinary public reserve audits: correctness of the chain state is checked by the verifier's chain policy, while the zero-knowledge layer protects the reserve set.
+
+\subsection{Contributions}
+
+We make the following contributions.
+
+\begin{enumerate}[leftmargin=2em]
+    \item \textbf{Problem formulation.} We define dynamic private proof of assets for hidden on-chain reserve sets.  The formulation captures initialization, incremental update, insertion of new reserve addresses, threshold comparison with liabilities, freshness with respect to state roots, and privacy of the hidden set and aggregate update.
+    \item \textbf{Algebraic fixed-set update.} We give a lightweight NIZK update protocol for a fixed hidden reserve set.  The reserve set is committed by a scalar-masked KZG commitment to its set polynomial.  Each update proves a hidden zero-test relation on the public touched addresses and a hidden inner-product relation against the public deltas.  The prover uses fast multipoint evaluation, avoiding the naive \(O(|S|m)\) evaluation cost.
+    \item \textbf{Compact SMT-SNARK update.} We give a direct sparse-Merkle-tree implementation for mutable reserve sets.  Instead of referring to a generic authenticated-data-structure interface, we specify the compact tree representation, membership and non-membership cases, update relation, insertion relation, and verifier logic.
+    \item \textbf{Security and costs.} We state the security games and prove soundness and privacy from the underlying commitments, zero-knowledge proofs, tree hashing, KZG evaluation binding, and synchronizer reproducibility.  We also give asymptotic costs and an evaluation plan for a prototype.
+\end{enumerate}
+
+\section{Technical Overview}
+
+\paragraph{Why static private PoA is expensive.}
+A static private proof can verify ownership of each hidden address and verify a native state proof for every hidden balance.  This works for a one-time audit, but it repeats work that is independent of the small set of addresses touched in a later block.  It also ties the proof circuit to the native chain state structure.  Ethereum-style state proofs, Bitcoin UTXO proofs, and rollup state proofs have different formats and different circuit costs.
+
+\paragraph{Dynamic update by public deltas.}
+The key observation is that after initialization the reserve set changes slowly, while chain state evolves through public balance deltas.  For a fixed set \(S\), the only private question at update epoch \(i\) is which public touched addresses lie in \(S\).  If this hidden status vector is
+\[
+        u_j=\mathbf{1}[a_j\in S],
+\]
+then the correct aggregate update is the single linear relation
+\[
+        d_i=\sum_{j=1}^m u_j\delta_j.
+\]
+Therefore the update proof should bind \(u\) to the hidden set and bind the committed delta \(d_i\) to the same \(u\), without revealing either.
+
+\paragraph{Construction I.}
+For a fixed reserve set, define the set polynomial
+\[
+        F_S(T)=\prod_{a\in S}(T-\Enc(a))
+\]
+and sample a secret nonzero scalar \(\alpha\).  The committed polynomial is
+\[
+        P_S(T)=\alpha F_S(T).
+\]
+The zero set is unchanged: \(a\in S\) iff \(P_S(\Enc(a))=0\), except with negligible encoding-collision probability.  The public set accumulator is the scalar-masked KZG commitment \(A=[P_S(\tau)]_1\).  For the update list, the prover computes \(y_j=P_S(x_j)\) for \(x_j=\Enc(a_j)\), commits to \(y\) through a blinded interpolation polynomial, and proves by one KZG batch opening that these are the correct evaluations.  A committed-R1CS Bulletproof proves that hidden variables \((u_j,y_j,z_j,w_j)_j\) satisfy
+\[
+ u_j(1-u_j)=0,\qquad u_jy_j=0,\qquad y_jz_j=w_j,\qquad (1-u_j)(w_j-1)=0.
+\]
+These constraints force \(u_j=1\) iff \(y_j=0\).  The same proof also proves that the committed balance delta opens to \(d_i=\sum_j u_j\delta_j\).  Thus the verifier learns that the public aggregate commitment was updated correctly but learns no membership bits.
+
+\paragraph{Construction II.}
+The algebraic construction is optimized for a fixed set.  To support frequent insertion of new reserve addresses in a more conventional engineering stack, we also describe a compact sparse-Merkle-tree SNARK.  The local tree contains only the hidden reserve addresses and their current balances.  For every public touched address, the witness supplies either a membership path and an updated leaf, or a non-membership proof.  The circuit recomputes the old root, applies the conditional transition, recomputes the new root, and checks the aggregate-commitment update.  Insertion is a separate relation that proves ownership of the new address, chain-state consistency of its current balance, non-membership in the old tree, and a valid root transition.
+
+\section{Preliminaries}
+
+Let \(\lambda\) be the security parameter.  All groups have prime order \(q\), and all adversaries are probabilistic polynomial-time.  We write \([m]=\{1,\ldots,m\}\) and use additive notation for groups.  We write \(\softO(\cdot)\) to hide polylogarithmic factors.
+
+\paragraph{Commitments.}
+Let \(V,H_B\in\G_1\) be independent generators.  We commit to an aggregate balance by
+\[
+        \Com_B(B;r)=B V+rH_B.
+\]
+We use the hiding and binding properties of Pedersen commitments.  Integer balances and deltas are encoded in \(\F_q\), but the default protocol proves range constraints for balances, deltas, and updated balances so that accepted field equations have the intended integer semantics.  A public modulus-safety bound can be used only as an implementation optimization.
+
+\paragraph{KZG commitments.}
+Let \((\G_1,\G_2,\GT,e)\) be bilinear groups of order \(q\).  The KZG SRS is
+\[
+\pp_{\KZG}=(([1]_1,[\tau]_1,\ldots,[\tau^D]_1),([1]_2,[\tau]_2,\ldots,[\tau^D]_2)),
+\]
+where \(\tau\) is unknown.  KZG commitments~\cite{KZG10} commit to a polynomial \(f\) of degree at most \(D\) as \([f(\tau)]_1\).  For query points \(x_1,\ldots,x_m\), let \(Z(T)=\prod_j(T-x_j)\).  If \(g(x_j)=f(x_j)\) for all \(j\), the batch opening proof is \([Q(\tau)]_1\), where \(Q=(f-g)/Z\).  The verifier checks
+\[
+        e([f(\tau)]_1-[g(\tau)]_1,[1]_2)=e([Q(\tau)]_1,[Z(\tau)]_2).
+\]
+We rely on the standard batched evaluation-binding property of KZG: after seeing the SRS, an adversary may adaptively choose the commitment, the distinct query points, the claimed values, and the proof, but it cannot make the above check accept for values that are not the evaluations of the unique committed polynomial, except with negligible probability.  Equivalently, if \([f(\tau)]_1\) is binding to a degree-at-most-\(D\) polynomial \(f\), then any accepting batch opening at distinct points \(x_1,\ldots,x_m\) binds to \(f(x_1),\ldots,f(x_m)\).  We also use the equivalent collision form: no efficient adversary can output a nonzero polynomial \(R\in\F_q[T]\) of degree at most \(D\) such that \([R(\tau)]_1=\mathcal O\).  Two different low-degree polynomials with the same KZG commitment yield such an \(R\).  This is the usual multi-opening soundness of KZG under the standard KZG assumption, and it already covers adversarially chosen evaluation points.
+
+\paragraph{Scalar-masked set commitments.}
+The algebraic construction commits to \(P_S(T)=\alpha\prod_{a\in S}(T-\Enc_{\F}(a))\) for a fresh secret \(\alpha\in\F_q^*\), rather than to the monic set polynomial itself.  This preserves the membership predicate because multiplication by \(\alpha\ne0\) does not change the roots.  It also hides the committed set polynomial in the following sense: for any fixed nonzero value \(F_S(\tau)\), the group element \([\alpha F_S(\tau)]_1\) is uniform over non-identity elements of \(\G_1\) when \(\alpha\) is uniform in \(\F_q^*\).  The exceptional event \(F_S(\tau)=0\) has probability at most \(|S|/q\) over the hidden SRS trapdoor.
+
+
+\paragraph{Committed-R1CS Bulletproofs.}
+Bulletproofs~\cite{Bulletproofs18} give short inner-product proofs; in our use, a committed-R1CS Bulletproof proves knowledge of variables that satisfy arithmetic constraints and open public multi-generator commitments.  We need the frontend to support equations of the form
+\[
+        C=\sum_j a_jG_j+rH,
+\]
+where \((G_j)_j,H\) are public group elements.  The proof must bind the same variables to the external commitments and to the R1CS constraints.  The final proof is logarithmic-size in the number of multiplication gates, with linear prover and verifier work.
+
+\paragraph{Sparse Merkle trees.}
+Sparse Merkle trees are a standard hash-based authenticated structure~\cite{Merkle88}.  The SMT construction uses a depth-\(\ell\) binary tree over keys \(\kappa\in\bits^\ell\).  Empty subtree hashes are fixed public values \(E_0,\ldots,E_\ell\).  A leaf containing key \(\kappa\), balance \(b\), and a long random leaf salt \(\eta\) is
+\[
+        L=\CRH(\mathtt{leaf},\kappa,b,\eta),
+\]
+where \(\CRH\) is a circuit-friendly collision-resistant compression function.  An internal node at level \(d\) is
+\[
+        N=\CRH(\mathtt{node},d,N_0,N_1).
+\]
+The prover stores the tree compactly: default subtrees are not materialized, and only non-default branches are kept.  Membership and non-membership witnesses are private circuit witnesses.  The salt prevents the public root from becoming a deterministic commitment to small candidate address sets.
+
+\paragraph{Public synchronizer.}
+For finalized roots \(\sr_{i-1},\sr_i\), the deterministic public program
+\[
+        \dlist_i\leftarrow \Sync(\sr_{i-1},\sr_i)
+\]
+outputs a canonical list of balance changes \(((a_1,\delta_1),\ldots,(a_m,\delta_m))\).  Canonical means that addresses are uniquely encoded, sorted, and deduplicated.  Duplicate effects on the same address are merged into one integer delta.  The verifier accepts an update proof only for a delta list equal to the output of this public program under its finality policy.
+
+\section{Model and Security Definitions}
+
+\subsection{System state}
+
+We first define the single-chain problem.  At epoch \(i\), the public state is
+\[
+        X_i=(\sr_i,R_i,C_i),
+\]
+where \(\sr_i\) is a finalized chain state root, \(R_i\) is either the fixed KZG set commitment \(A\) or the SMT root, and \(C_i=\Com_B(B_i;r_i)\) is a commitment to the aggregate reserve balance.  The private state contains the reserve set \(S\), the opening \((B_i,r_i)\), and either the masked set polynomial \(P_S\) and its unmasked zero set, or the compact salted SMT state.  The intended aggregate is
+\[
+        B_i=\sum_{a\in S}\bal_{\sr_i}(a).
+\]
+A liability proof is external to this paper.  We assume the verifier has either a public liability value \(L_i\) or a liability commitment together with a zero-knowledge proof that it opens to \(L_i\).  The asset proof composes with it by proving \(B_i\ge L_i\) or, more generally, \(B_i-L_i\ge 0\) for committed values.
+
+\subsection{Algorithms}
+
+A dynamic private PoA scheme consists of the following algorithms.
+
+\begin{itemize}[leftmargin=1.5em]
+    \item \(\Setup(1^\lambda)\) outputs public parameters.
+    \item \(\Init\) takes a finalized root \(\sr_0\) and private reserve set data.  It outputs \(X_0\) and a proof \(\pi_{\mathsf{init}}\).
+    \item \(\Upd\) takes an accepted state \(X_{i-1}\), a new finalized root \(\sr_i\), the public delta list \(\dlist_i=\Sync(\sr_{i-1},\sr_i)\), and private state.  It outputs \(X_i\) and \(\pi_{\mathsf{upd}}\).
+    \item \(\Insert\) adds a new reserve address.  It proves address ownership, current chain-state consistency of the inserted balance, non-membership before insertion, and a valid root and commitment transition.
+    \item \(\Verify\) checks finality, recomputes or verifies the public synchronizer output, verifies the zero-knowledge proof, and checks that the old state referenced by an update is the last accepted state.
+    \item \(\mathsf{ProveThr}\) proves a threshold statement over the current balance commitment.
+\end{itemize}
+
+\subsection{Security properties}
+
+\begin{definitionx}[Initialization soundness]
+A scheme has initialization soundness if no efficient adversary can produce an accepted \((X_0,\pi_{\mathsf{init}})\) such that the hidden state contains an address not controlled by the prover, a balance not equal to the balance under \(\sr_0\), a malformed reserve-set commitment/root, or a balance commitment not equal to the aggregate induced by the hidden reserve set.
+\end{definitionx}
+
+\begin{definitionx}[Update soundness]
+A scheme has update soundness if no efficient adversary can produce an accepted transition from \(X_{i-1}\) to \(X_i\) for a public delta list \(\dlist_i\) such that
+\[
+        C_i \not\equiv C_{i-1}+\Com_B\Big(\sum_{(a,\delta)\in\dlist_i\,:\,a\in S}\delta;\rho_i\Big)
+\]
+for any valid blinding difference \(\rho_i\), where \(S\) is the reserve set bound by the previous accepted state.  In the SMT construction, update soundness also requires that the new root is the correct root obtained by applying exactly the conditional updates for touched reserve addresses.
+\end{definitionx}
+
+\begin{definitionx}[Threshold soundness]
+A scheme has threshold soundness if no efficient adversary can convince the verifier to accept a threshold proof for \((C_i,T)\) when every valid opening \((B_i,r_i)\) of \(C_i\) satisfies \(B_i<T\).
+\end{definitionx}
+
+\begin{definitionx}[Privacy]
+Address privacy and balance privacy are simulation-based.  The verifier's view consists of finalized roots, public delta lists, public roots/commitments, threshold statements, and proof strings.  For any two executions with the same public leakage and the same truth value of the threshold predicate, the views are computationally indistinguishable.  In particular, the verifier learns neither the reserve set, nor the touched reserve subset, nor the exact aggregate balance or aggregate delta beyond what follows from accepted threshold statements.
+\end{definitionx}
+
+\begin{definitionx}[Freshness]
+A scheme has freshness if an accepted asset statement is bound to the state root named in the public state.  A proof for an older root cannot be reused for a newer root unless there is an accepted chain of update proofs linking the old public state to the new one.
+\end{definitionx}
+
+\section{Construction I: Algebraic Fixed-Set Update}
+
+This construction is optimized for a fixed reserve set.  It is suitable when the custodian initializes a reserve set and then refreshes the aggregate balance frequently.  Address-set extension is possible but is not the fast path; the mutable-set construction in Section~\ref{sec:smt} is better suited for frequent insertions.
+
+\subsection{State and initialization}
+
+Let \(S\) be the hidden address set and let \(x_a=\Enc_{\F}(a)\).  Define
+\[
+        F_S(T)=\prod_{a\in S}(T-x_a),\qquad P_S(T)=\alpha F_S(T)
+\]
+for a secret \(\alpha\leftarrow\F_q^*\).  The public set accumulator is the scalar-masked KZG commitment
+\[
+        A=[P_S(\tau)]_1.
+\]
+The roots of \(P_S\) are exactly the encoded reserve addresses, while the random scalar \(\alpha\) prevents a public dictionary test against the monic polynomial of a guessed set.  At epoch \(i\), the public state is
+\[
+        X_i=(\sr_i,A,C_i),\qquad C_i=\Com_B(B_i;r_i).
+\]
+The private state is \((S,\alpha,F_S,P_S,B_i,r_i)\).
+
+The initialization proof is the only place where the prover proves that the hidden reserve set is a real controlled on-chain set under \(\sr_0\).  Afterwards the verifier keeps only the public accumulator \(A\) and the aggregate commitment \(C_0\).  We write the relation below for a fixed public size bound \(n\).  If \(n\) is not fixed by the system parameters, it is included in the public initialization statement and in the Fiat--Shamir transcript; it is then part of the intentional leakage.
+
+\paragraph{Initialization statement.}
+Let the hidden reserve list be \((a_1,\ldots,a_n)\), let
+\[
+        x_k=\Enc_{\F}(a_k),\qquad b_k=\bal_{\sr_0}(a_k),
+\]
+and let \(p_0,\ldots,p_n\) be the coefficient representation of
+\[
+        P(T)=\sum_{t=0}^n p_tT^t .
+\]
+The public input is \((\sr_0,A,C_0,n)\), with \(n\) omitted when fixed globally.  The witness contains
+\[
+ \bigl((a_k,x_k,b_k,\omega_k^{\mathsf{own}},\pi_k^{\mathsf{chain}})_{k=1}^n,
+        \alpha,(p_t)_{t=0}^n,B_0,r_0\bigr).
+\]
+The relation requires the following facts.
+\begin{enumerate}[leftmargin=1.5em]
+    \item \textbf{Ownership.}  For every \(k\), the private proof \(\omega_k^{\mathsf{own}}\) satisfies an address-ownership predicate
+    \[
+        \mathsf{Own}(a_k,\omega_k^{\mathsf{own}};\mathsf{ch}_{\mathsf{init}})=1,
+    \]
+    where \(\mathsf{ch}_{\mathsf{init}}=\Hash(\mathtt{init},\sr_0,A,C_0,n)\).  For an externally owned account this can be instantiated by verifying a signature on \(\mathsf{ch}_{\mathsf{init}}\) and checking that the verification key derives to \(a_k\); contract-wallet predicates can be treated as a chain-specific ownership relation.
+    \item \textbf{Native state consistency.}  For every \(k\), the native chain proof verifies
+    \[
+        \mathsf{ChainVerify}(\sr_0,a_k,b_k,\pi_k^{\mathsf{chain}})=1 .
+    \]
+    Thus \(b_k\) is exactly the balance of the hidden address under the public finalized root \(\sr_0\).  The proof also range-checks \(b_k\) so that later field equations represent integer balances.
+    \item \textbf{No duplicate reserve address.}  The relation checks that the hidden addresses are distinct.  A direct implementation sorts the address bitstrings and proves \(a_1<\cdots<a_n\).  A hash-tree implementation instead inserts the hidden keys into a private SMT and proves that every insertion was into an empty position.  This check is necessary: otherwise the prover could count the same controlled address more than once in \(B_0\).
+    \item \textbf{Algebraic set binding.}  The hidden polynomial bound by \(A\) must be the scalar-masked set polynomial
+    \[
+        P(T)=\alpha\prod_{k=1}^n(T-x_k),\qquad \alpha\ne0,
+    \]
+    and the KZG accumulator must be
+    \[
+        A=[P(\tau)]_1=\sum_{t=0}^n p_t[\tau^t]_1 .
+    \]
+    The equality with \(A\) is a group-linear relation in the private coefficients \((p_t)_t\).
+    \item \textbf{Aggregate balance binding.}  The aggregate and its commitment satisfy
+    \[
+        B_0=\sum_{k=1}^n b_k,
+        \qquad
+        C_0=B_0V+r_0H_B .
+    \]
+\end{enumerate}
+
+\paragraph{Efficient product check.}
+A literal circuit for the coefficient identity \(P(T)=\alpha\prod_k(T-x_k)\) can be implemented by a product tree, but it is unnecessary for initialization soundness.  The prover first fixes the public commitments \((A,C_0)\) and the hidden-vector bindings used by the proof system, and the verifier derives
+\[
+        \zeta=\Hash(\mathsf{init\mbox{-}poly},\sr_0,A,C_0,n)\in\F_q .
+\]
+The proof checks only the random evaluation identity
+\[
+        \sum_{t=0}^n p_t\zeta^t
+        =
+        \alpha\prod_{k=1}^n(\zeta-x_k).
+\]
+Inside the circuit this costs \(O(n)\) multiplication gates by the recurrence
+\[
+\begin{aligned}
+        g_0&=1,\\
+        g_k&=g_{k-1}(\zeta-x_k),\\
+        \widehat P&=\sum_{t=0}^n p_t\zeta^t,
+\end{aligned}
+\]
+followed by \(\widehat P=\alpha g_n\).  Since \(A\) binds the coefficient vector before \(\zeta\) is derived, a false degree-at-most-\(n\) product identity passes with probability at most \(n/q\).  This turns the expensive coefficient-product check into a linear-size randomized algebraic check.  If one wants deterministic checking, the same relation can replace this step by a product-tree coefficient computation at \(\softO(n)\) arithmetic cost outside the circuit and \(O(n\log n)\) or larger in-circuit cost, depending on the circuit model.
+
+\paragraph{Split implementation.}
+The initialization proof may be realized as one monolithic SNARK/ZKVM proof, but a more efficient implementation is a two-part proof
+\[
+        \pi_{\mathsf{init}}=(C_X,C_B,\pi_{\mathsf{chain}},\pi_{\mathsf{alg}}).
+\]
+Here
+\[
+        C_X=\sum_{k=1}^n x_kG_k^X+\rho_XH_X,
+        \qquad
+        C_B=\sum_{k=1}^n b_kG_k^B+\rho_BH_B'
+\]
+are hiding vector commitments to the encoded addresses and balances.  The ZKVM proof \(\pi_{\mathsf{chain}}\) verifies the native chain proofs, ownership predicates, duplicate-freeness, and the openings of \(C_X,C_B\).  The algebraic proof \(\pi_{\mathsf{alg}}\) opens the same \(C_X,C_B\), proves the randomized product check above, proves the group-linear KZG equation for \(A\), and proves \(C_0\) commits to \(\sum_kb_k\).  The public commitments \(C_X,C_B\) are the glue that prevents the two subproofs from using different hidden address or balance vectors.  They are hiding, so they do not reveal the reserve set.
+
+\begin{algorithm}[H]
+\caption{Algebraic initialization protocol}
+\label{alg:alg-init}
+\begin{algorithmic}[1]
+\Require Public finalized root \(\sr_0\); private reserve witnesses \((a_k,\omega_k^{\mathsf{own}},\pi_k^{\mathsf{chain}})_{k=1}^n\).
+\State For each \(k\), decode the native proof to obtain \(b_k\) and set \(x_k=\Enc_{\F}(a_k)\).
+\State Sort or privately insert the addresses to prove that no \(a_k\) is repeated.
+\State Sample \(\alpha\leftarrow\F_q^*\), form \(P(T)=\alpha\prod_{k=1}^n(T-x_k)=\sum_{t=0}^np_tT^t\), and compute \(A=\sum_{t=0}^np_t[\tau^t]_1\).
+\State Compute \(B_0=\sum_{k=1}^nb_k\), sample \(r_0\leftarrow\F_q\), and compute \(C_0=B_0V+r_0H_B\).
+\State Generate \(\pi_{\mathsf{init}}\) for the relation \(\Rel_{\mathsf{init}}^{\mathsf{alg}}\), using either the monolithic relation or the split proof with \(C_X,C_B\).
+\State Output \(X_0=(\sr_0,A,C_0)\), private state \((S,\alpha,P,B_0,r_0)\), and \(\pi_{\mathsf{init}}\).
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[H]
+\caption{Algebraic initialization relation \(\Rel_{\mathsf{init}}^{\mathsf{alg}}\)}
+\label{alg:alg-init-rel}
+\begin{algorithmic}[1]
+\Require Public input \((\sr_0,A,C_0,n)\); witness \((a_k,x_k,b_k,\omega_k^{\mathsf{own}},\pi_k^{\mathsf{chain}})_{k=1}^n,\alpha,(p_t)_{t=0}^n,B_0,r_0\).
+\State Check \(x_k=\Enc_{\F}(a_k)\) for all \(k\).
+\State Verify \(\mathsf{Own}(a_k,\omega_k^{\mathsf{own}};\mathsf{ch}_{\mathsf{init}})=1\) for all \(k\).
+\State Verify \(\mathsf{ChainVerify}(\sr_0,a_k,b_k,\pi_k^{\mathsf{chain}})=1\) for all \(k\).
+\State Check that \((a_1,\ldots,a_n)\) has no duplicates.
+\State Check \(\alpha\ne0\), derive \(\zeta=\Hash(\mathsf{init\mbox{-}poly},\sr_0,A,C_0,n)\), and check \(\sum_{t=0}^np_t\zeta^t=\alpha\prod_{k=1}^n(\zeta-x_k)\).
+\State Check the group-linear KZG commitment equation \(A=\sum_{t=0}^np_t[\tau^t]_1\).
+\State Check \(B_0=\sum_{k=1}^nb_k\) and \(C_0=B_0V+r_0H_B\).
+\State Check all integer range constraints for \((b_k)_k\) and \(B_0\).
+\end{algorithmic}
+\end{algorithm}
+
+\paragraph{Initialization cost.}
+Let \(c_{\mathsf{chain}}\) be the cost of one hidden native state proof plus one hidden ownership proof.  The monolithic relation costs \(O(nc_{\mathsf{chain}})\) plus \(O(n)\) arithmetic constraints for summation and the randomized product check, and one group-linear proof for the KZG commitment to the private coefficient vector.  The prover may still compute the coefficients of \(P\) outside the circuit using a product tree in \(\softO(n)\) polynomial work.  In the split implementation, the ZKVM handles the chain-specific work, while the algebraic proof handles only vector openings, the product evaluation check, the KZG linear equation, and the aggregate commitment.  This is usually preferable because native state verification uses chain-specific primitives such as Merkle-Patricia hashing and signature verification, whereas the algebraic part is small and curve-friendly.
+
+\subsection{Update proof}
+
+Let the public update list be
+\[
+        \dlist_i=((a_1,\delta_1),\ldots,(a_m,\delta_m)),
+\]
+where the \(a_j\)'s are distinct.  Set \(x_j=\Enc_{\F}(a_j)\).  The prover computes
+\[
+        y_j=P_S(x_j),\qquad u_j=\begin{cases}1 & y_j=0,\\ 0 & y_j\ne 0,\end{cases}
+\]
+and
+\[
+        d_i=\sum_{j=1}^m u_j\delta_j.
+\]
+The proof must show that \(u\) is exactly the membership vector and that \(d_i\) is computed from the same \(u\).
+
+Let \((U_1,\ldots,U_m,H_U,V,H_B)\in\G_1\) be domain-separated public generators.  The prover samples \(r_U,r_D,\rho_Y\leftarrow\F_q\) and computes
+\[
+        C_U=\sum_{j=1}^m u_jU_j+r_UH_U,
+        \qquad
+        C_D=d_iV+r_DH_B.
+\]
+The new balance commitment is defined by homomorphism:
+\[
+        C_i=C_{i-1}+C_D.
+\]
+
+\paragraph{Hidden evaluation commitment.}
+Let
+\[
+        Z_i(T)=\prod_{j=1}^m (T-x_j)
+\]
+and let \(L_j(T)\) be the Lagrange polynomial satisfying \(L_j(x_\ell)=1[j=\ell]\).  Define
+\[
+        I_Y(T)=\sum_{j=1}^m y_jL_j(T),
+        \qquad
+        J_Y(T)=I_Y(T)+\rho_Y Z_i(T).
+\]
+Since \(Z_i(x_j)=0\), we have \(J_Y(x_j)=P_S(x_j)\) for all \(j\).  The prover sends
+\[
+        C_Y=[J_Y(\tau)]_1
+\]
+and
+\[
+        \pi_{\mathsf{eval}}=[Q_i(\tau)]_1,
+        \qquad
+        Q_i(T)=\frac{P_S(T)-J_Y(T)}{Z_i(T)}.
+\]
+The verifier checks
+\[
+        e(A-C_Y,[1]_2)=e(\pi_{\mathsf{eval}},[Z_i(\tau)]_2).
+\]
+
+The same element \(C_Y\) is used inside the Bulletproof only through a public group-linear equation.  The verifier derives
+\[
+        B_j=[L_j(\tau)]_1,
+        \qquad
+        H_Y=[Z_i(\tau)]_1,
+\]
+so that a witness \((y,\rho_Y)\) satisfies
+\[
+        C_Y=\sum_{j=1}^m y_jB_j+\rho_YH_Y
+\]
+if and only if it defines the degree-at-most-\(m\) polynomial
+\[
+        J_{y,\rho_Y}(T)=\sum_{j=1}^m y_jL_j(T)+\rho_YZ_i(T)
+\]
+with KZG commitment \([J_{y,\rho_Y}(\tau)]_1=C_Y\).  This is not an ordinary Pedersen commitment under independent random bases.  The bases \((B_j)_j,H_Y\) are structured by the public query set and the KZG SRS.  Therefore the opening soundness of \(C_Y\) is not based on independence of these generators.  The Bulletproof provides knowledge of some structured opening \((y,\rho_Y)\); KZG binding and the decomposition lemma below make that opening unique and force its coordinates to be the true evaluations of the fixed set polynomial.
+
+The following lemma is the point that makes the dual use of \(C_Y\) well-defined.
+
+\begin{lemma}[Structured opening uniqueness]\label{lem:structured-cy}
+Fix distinct query points \(x_1,\ldots,x_m\).  Let \(Z_i(T)=\prod_j(T-x_j)\) and let \(L_j\) be the corresponding Lagrange basis.  For every polynomial \(J\) of degree at most \(m\), there is a unique tuple \((y_1,\ldots,y_m,\rho)\) such that
+\[
+        J(T)=\sum_{j=1}^m y_jL_j(T)+\rho Z_i(T).
+\]
+Consequently, under KZG binding for degree at most \(m\), a group element \(C_Y=[J(\tau)]_1\) has at most one opening of the form \(C_Y=\sum_j y_j[L_j(\tau)]_1+\rho[Z_i(\tau)]_1\).
+\end{lemma}
+
+\begin{proof}
+Evaluating at \(x_j\) gives \(y_j=J(x_j)\), so \(y\) is unique.  Then \(J-\sum_jy_jL_j\) vanishes at every \(x_j\), hence equals \(\rho Z_i\) because both sides have degree at most \(m\).  If two distinct tuples opened the same group element, the corresponding polynomials \(J,J'\) would satisfy \(R=J-J'\ne0\) and \([R(\tau)]_1=\mathcal O\), violating degree-\(m\) KZG binding.
+\end{proof}
+
+\begin{lemma}[Adversarial-query binding of \(C_Y\)]\label{lem:adv-query-cy}
+Let \(A=[P_S(\tau)]_1\) be fixed before the update proof, and let the adversary choose any distinct query points \(x_1,\ldots,x_m\) after seeing the SRS and after influencing the public block if desired.  Suppose an extracted Bulletproof witness satisfies
+\[
+        C_Y=\sum_j y_j[L_j(\tau)]_1+\rho[Z_i(\tau)]_1
+\]
+and the KZG batch check
+\[
+        e(A-C_Y,[1]_2)=e(\pi_{\mathsf{eval}},[Z_i(\tau)]_2)
+\]
+accepts within the prescribed degree bound.  Then, except with negligible probability in the batched KZG evaluation-binding experiment,
+\[
+        y_j=P_S(x_j)\qquad\text{for every }j\in[m].
+\]
+\end{lemma}
+
+\begin{proof}
+The extracted tuple defines
+\[
+        J_{y,\rho}(T)=\sum_j y_jL_j(T)+\rho Z_i(T).
+\]
+By the group-linear equation and the verifier-derived bases, \(C_Y=[J_{y,\rho}(\tau)]_1\).  The pairing check gives a polynomial \(Q\) represented by \(\pi_{\mathsf{eval}}\) such that, at the SRS point,
+\[
+        [P_S(\tau)-J_{y,\rho}(\tau)-Q(\tau)Z_i(\tau)]_1=\mathcal O .
+\]
+If some \(y_j\ne P_S(x_j)\), then \(P_S-J_{y,\rho}\) is not divisible by \(Z_i\).  Writing
+\[
+        P_S(T)-J_{y,\rho}(T)=Q(T)Z_i(T)+R(T)
+\]
+with \(0\ne R\) and \(\deg R<m\), the accepted pairing gives \([R(\tau)]_1=\mathcal O\), contradicting KZG evaluation binding.  Hence \(y_j=P_S(x_j)\) for all \(j\).
+\end{proof}
+
+\begin{lemma}[Hiding of the structured evaluation commitment]\label{lem:cy-hiding}
+For fixed distinct query points, if \(H_Y=[Z_i(\tau)]_1\ne\mathcal O\) and \(\rho_Y\) is uniform in \(\F_q\), then
+\[
+        C_Y=\sum_j y_jB_j+\rho_YH_Y
+\]
+is statistically independent of \(y\).
+\end{lemma}
+
+\begin{proof}
+The element \(H_Y\) has order \(q\).  Therefore \(\rho_YH_Y\) is uniform over \(\G_1\), and adding the fixed term \(\sum_jy_jB_j\) preserves the uniform distribution.
+\end{proof}
+
+\begin{remarkx}[No unpredictable-address assumption]
+The update list may be fully known to the prover before it constructs \(C_Y\), and the prover may influence the touched addresses by sending transactions.  Soundness does not rely on at least one touched address being unpredictable.  The reason is that \(A=[P_S(\tau)]_1\) is fixed by initialization before the update list is chosen, while the verifier recomputes \(Z_i,L_j,B_j,H_Y\) from the canonical public list.  Lemma~\ref{lem:structured-cy} fixes the structured opening used by the Bulletproof, and Lemma~\ref{lem:adv-query-cy} forces its coordinates to be the true evaluations of \(P_S\) at the adversarially chosen query points.
+\end{remarkx}
+
+\paragraph{Logic proof.}
+The prover gives a committed-R1CS Bulletproof \(\pi_{\mathsf{logic}}\) for witness
+\[
+        (u,y,z,w,d_i,r_U,\rho_Y,r_D)
+\]
+and public commitments \((C_U,C_Y,C_D)\).  The proof includes the group-linear opening equations
+\[
+ C_U=\sum_j u_jU_j+r_UH_U,
+\quad
+ C_Y=\sum_j y_jB_j+\rho_YH_Y,
+\quad
+ C_D=d_iV+r_DH_B,
+\]
+the zero-test constraints
+\[
+ u_j(1-u_j)=0,
+ \quad u_jy_j=0,
+ \quad y_jz_j=w_j,
+ \quad (1-u_j)(w_j-1)=0,
+\]
+and the balance-projection constraint
+\[
+        d_i-\sum_{j=1}^m u_j\delta_j=0.
+\]
+The Bulletproof relation treats \(B_j\) and \(H_Y\) as fixed public group coefficients derived by the verifier.  Its knowledge soundness extracts one witness satisfying the displayed group-linear equation; it does not need to show that these structured bases are independent.  Uniqueness and evaluation consistency of the extracted \((y,\rho_Y)\) are supplied by Lemmas~\ref{lem:structured-cy} and~\ref{lem:adv-query-cy}.
+Range constraints prove integer safety for \(d_i\) and for the updated aggregate value \(B_{i-1}+d_i\).
+
+\begin{algorithm}[t]
+\caption{Algebraic fixed-set update}
+\begin{algorithmic}[1]
+\Require Old state \(X_{i-1}=(\sr_{i-1},A,C_{i-1})\), new root \(\sr_i\), and \(\dlist_i=\Sync(\sr_{i-1},\sr_i)\).
+\Require Witness \((S,\alpha,F_S,P_S,B_{i-1},r_{i-1})\).
+\State For each \((a_j,\delta_j)\in\dlist_i\), set \(x_j=\Enc_{\F}(a_j)\), \(y_j=P_S(x_j)\), and \(u_j=1[y_j=0]\).
+\State Compute \(d_i=\sum_j u_j\delta_j\).
+\State Compute \(C_U=\sum_j u_jU_j+r_UH_U\), \(C_D=d_iV+r_DH_B\), and \(C_i=C_{i-1}+C_D\).
+\State Form \(Z_i\), \((L_j)_j\), \(J_Y=\sum_j y_jL_j+\rho_YZ_i\), \(C_Y=[J_Y(\tau)]_1\), and \(\pi_{\mathsf{eval}}=[(P_S-J_Y)/Z_i](\tau)_1\).
+\State Generate \(\pi_{\mathsf{logic}}\) for the committed-R1CS relation above.
+\State Output \(X_i=(\sr_i,A,C_i)\) and \(\pi_i^{\mathsf{alg}}=(C_U,C_Y,C_D,\pi_{\mathsf{eval}},\pi_{\mathsf{logic}})\).
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[t]
+\caption{Verifier for algebraic update}
+\begin{algorithmic}[1]
+\Require Old state \(X_{i-1}\), claimed new state \(X_i\), proof \(\pi_i^{\mathsf{alg}}\), and roots \(\sr_{i-1},\sr_i\).
+\State Check that \(\sr_i\) is finalized and that \(\dlist_i=\Sync(\sr_{i-1},\sr_i)\) is canonical.
+\State Check that the KZG set commitment \(A\) is unchanged and that \(C_i=C_{i-1}+C_D\).
+\State Compute \(x_j=\Enc_{\F}(a_j)\), check that the \(x_j\)'s are distinct, form \(Z_i(T)=\prod_j(T-x_j)\), \([Z_i(\tau)]_2\), \(H_Y=[Z_i(\tau)]_1\), and \(B_j=[L_j(\tau)]_1\).
+\State Reject if \(H_Y=\mathcal O\).  Check \(e(A-C_Y,[1]_2)=e(\pi_{\mathsf{eval}},[Z_i(\tau)]_2)\).
+\State Verify \(\pi_{\mathsf{logic}}\) against the public statement containing \(A,C_{i-1},C_U,C_Y,C_D,\dlist_i,(U_j)_j,H_U,(B_j)_j,H_Y,V,H_B\).
+\State Accept iff all checks pass.
+\end{algorithmic}
+\end{algorithm}
+
+\paragraph{Cost.}
+Let \(n=|S|\) and \(m=|\dlist_i|\).  The prover stores \(P_S\) in coefficient, FFT/NTT, or product-tree form.  The evaluation vector \((P_S(x_1),\ldots,P_S(x_m))\) is computed by fast multipoint evaluation in \(\softO(n+m)\) time in the usual polynomial-arithmetic model, or conservatively \(O(n\log m+m\log^2 m)\).  The logic proof has \(4m\) multiplication gates plus the range constraints required for integer safety.  The proof contains a constant-size KZG batch proof and an \(O(\log m)\)-size Bulletproof/IPA proof.  Verification requires constant pairings plus \(\softO(m)\) group work to derive the public interpolation bases and verify the Bulletproof.
+
+
+\subsection{Parallelization by Polynomial Sharding}\label{sec:alg-parallel}
+
+The fixed-set construction above can be parallelized by replacing one large set polynomial with several smaller set polynomials.  This is an engineering change rather than a change to the public update semantics: the verifier still accepts one evolving aggregate balance commitment, but the hidden set accumulator becomes a vector of KZG commitments.
+
+Let the prover choose a shard count \(t\) and partition the hidden reserve set into disjoint subsets
+\[
+        S=S^{(1)}\sqcup\cdots\sqcup S^{(t)},
+        \qquad |S^{(\ell)}|\le n_\ell .
+\]
+For each shard, define
+\[
+        F_\ell(T)=\prod_{a\in S^{(\ell)}}(T-\Enc_{\F}(a)),
+        \qquad
+        P_\ell(T)=\alpha_\ell F_\ell(T),
+        \qquad
+        A_\ell=[P_\ell(\tau)]_1,
+\]
+where \(\alpha_\ell\leftarrow\F_q^*\) is sampled independently.  The public algebraic accumulator is now
+\[
+        A=(A_1,\ldots,A_t).
+\]
+The values \(t\) and the shard size bounds \((n_\ell)_\ell\) should be treated as intentional leakage.  If one wants to hide the precise distribution of reserve addresses among workers, the shards can be padded to a fixed public size bound.
+
+\paragraph{Parallel initialization.}
+Initialization proves the same facts as before, except that the algebraic set-binding check is performed independently for each polynomial \(P_\ell\).  The global initialization relation must still prove duplicate-freeness across all shards, not merely inside each shard.  Equivalently, the witness contains one hidden ordered list of addresses and a public or private shard assignment, and the proof checks that every address appears in exactly one shard.  Each worker can then construct \(P_\ell\), compute \(A_\ell\), and prove the randomized product identity
+\[
+        \sum_{r=0}^{n_\ell}p_{\ell,r}\zeta_\ell^r
+        =
+        \alpha_\ell\prod_{a\in S^{(\ell)}}(\zeta_\ell-\Enc_\F(a))
+\]
+with a shard-specific Fiat--Shamir challenge \(\zeta_\ell\).  The aggregate balance commitment remains single:
+\[
+        B_0=\sum_{\ell=1}^t\sum_{a\in S^{(\ell)}}\bal_{\sr_0}(a),
+        \qquad
+        C_0=B_0V+r_0H_B.
+\]
+Thus initialization can be executed by \(t\) independent polynomial provers plus one coordinator that checks global duplicate-freeness and forms the global balance commitment.
+
+\paragraph{Parallel update.}
+For the public delta list \(\dlist_i=((a_1,\delta_1),\ldots,(a_m,\delta_m))\), all shards use the same query points \(x_j=\Enc_\F(a_j)\) and the same vanishing polynomial
+\[
+        Z_i(T)=\prod_{j=1}^m(T-x_j).
+\]
+Shard \(\ell\) computes in parallel
+\[
+        y_j^{(\ell)}=P_\ell(x_j),
+        \qquad
+        u_j^{(\ell)}=\mathbf 1[y_j^{(\ell)}=0],
+        \qquad
+        d_i^{(\ell)}=\sum_{j=1}^m u_j^{(\ell)}\delta_j .
+\]
+It also forms
+\[
+        J_\ell(T)=\sum_{j=1}^m y_j^{(\ell)}L_j(T)+\rho_{Y,\ell}Z_i(T),
+        \qquad
+        C_{Y,\ell}=[J_\ell(\tau)]_1,
+\]
+with quotient proof
+\[
+        \pi_{\mathsf{eval},\ell}
+        =\left[\frac{P_\ell-J_\ell}{Z_i}(\tau)\right]_1 .
+\]
+Because the initialization proof establishes that the shards are disjoint, for every touched address at most one shard has \(u_j^{(\ell)}=1\).  Hence the global membership vector is simply
+\[
+        u_j=\sum_{\ell=1}^t u_j^{(\ell)},
+        \qquad
+        d_i=\sum_{j=1}^m u_j\delta_j
+            =\sum_{\ell=1}^t d_i^{(\ell)} .
+\]
+
+\paragraph{Batch verification of KZG evaluation proofs.}
+All shard openings are with respect to the same \(Z_i\).  The verifier can therefore batch their KZG checks by sampling Fiat--Shamir challenges \(\beta_1,\ldots,\beta_t\in\F_q\) after seeing \((A_\ell,C_{Y,\ell},\pi_{\mathsf{eval},\ell})_{\ell=1}^t\), and checking one pairing equation
+\[
+        e\!\left(\sum_{\ell=1}^t\beta_\ell(A_\ell-C_{Y,\ell}),[1]_2\right)
+        =
+        e\!\left(\sum_{\ell=1}^t\beta_\ell\pi_{\mathsf{eval},\ell},[Z_i(\tau)]_2\right).
+\]
+If every shard proof is valid, this equation holds by linearity.  If at least one shard proof is invalid, the random linear combination hides the bad component except with probability at most \(t/q\), up to the usual KZG binding error.  Thus the verifier pays essentially one KZG batch-opening verification, plus \(O(t)\) group additions and scalar multiplications to form the linear combination.
+
+\paragraph{One aggregate inner-product proof.}
+The balance-projection part should not be repeated \(t\) times.  Each shard first proves, or contributes to a global proof of, the local zero-test relation linking \(C_{Y,\ell}\) to a committed status vector
+\[
+        C_{U,\ell}=\sum_{j=1}^m u_j^{(\ell)}U_j+r_{U,\ell}H_U .
+\]
+The coordinator then computes
+\[
+        C_U=\sum_{\ell=1}^t C_{U,\ell}
+            =\sum_{j=1}^m u_jU_j+r_UH_U,
+        \qquad r_U=\sum_{\ell=1}^t r_{U,\ell},
+\]
+and generates a single committed inner-product proof that the same aggregate opening \(u\) satisfies
+\[
+        d_i=\sum_{j=1}^m u_j\delta_j,
+        \qquad
+        C_D=d_iV+r_DH_B,
+        \qquad
+        C_i=C_{i-1}+C_D.
+\]
+In other words, the zero-test work is shard-local and parallel, while the final balance update is proved once after summing the \(u\)-vectors.  A monolithic implementation may put all local zero-test constraints and the global inner-product constraint into one large Bulletproof; a more memory-friendly implementation uses \(t\) local zero-test proofs together with one global projection proof.  In both cases, the Fiat--Shamir transcript must bind the complete vector \((A_\ell,C_{Y,\ell},C_{U,\ell})_{\ell=1}^t\), the public delta list, and the final commitment update.
+
+\paragraph{Cost.}
+With balanced shards \(n_\ell\approx n/t\), each worker performs multipoint evaluation and quotient computation for a degree-\(n/t\) polynomial at the same \(m\) public points.  The total algebraic work is roughly the work of the original protocol plus the interpolation overhead repeated across shards, but the wall-clock time becomes approximately the maximum per-shard time plus the coordinator's aggregation time.  The KZG verifier uses one batched pairing check instead of \(t\) separate checks.  The logic layer has \(O(tm)\) local zero-test constraints and only one \(O(m)\) balance-projection/inner-product proof.  Therefore sharding is most useful when the initialization polynomial or the large-degree multipoint evaluation is the bottleneck and the machine has enough cores or separate prover workers.
+
+\section{Construction II: Compact SMT-SNARK Update}\label{sec:smt}
+
+The second construction is designed for deployment and mutable reserve sets.  It uses a circuit-friendly local sparse Merkle tree over the hidden reserve addresses.  The tree is not the native chain state tree.  Native chain proofs are used only during initialization and insertion.  Incremental updates use the public synchronizer output and the local tree.
+
+\subsection{Tree state}
+
+For an address \(a\), let \(\kappa=\Enc_{\mathsf{key}}(a)\in\bits^\ell\).  A non-empty reserve leaf stores \((\kappa,b,\eta)\), where \(b\) is the current balance of the reserve address and \(\eta\) is a random leaf salt.  The leaf hash is
+\[
+        L=\CRH(\mathtt{leaf},\kappa,b,\eta).
+\]
+The public state is
+\[
+        X_i=(\sr_i,R_i,C_i),
+\]
+where \(R_i\) is the SMT root and \(C_i=\Com_B(B_i;r_i)\).  The private state is the compact tree, the reserve set, the leaf balances, the leaf salts, and the opening \((B_i,r_i)\).
+
+\subsection{Initialization}
+
+The SMT initialization proof has public input \((\sr_0,R_0,C_0,n)\), with \(n\) omitted if fixed by the system parameters.  The witness contains the hidden reserve addresses, ownership witnesses, native chain-state proofs, balances, leaf salts, and a compact representation of the local SMT.  It proves that the public SMT root is a salted commitment to exactly the controlled addresses whose native balances are read from \(\sr_0\).
+
+More explicitly, for each hidden address \(a_k\), the circuit computes
+\[
+        \kappa_k=\Enc_{\mathsf{key}}(a_k),
+        \qquad
+        L_k=\CRH(\mathtt{leaf},\kappa_k,b_k,\eta_k),
+\]
+where \(b_k\) is verified by the native chain proof and \(\eta_k\) is a fresh private salt.  The compact tree is then reconstructed from the sorted keys \((\kappa_k)_k\) and leaves \((L_k)_k\).  The circuit checks that the keys are strictly ordered, or equivalently that each private insertion is performed at an empty position.  This simultaneously proves duplicate-freeness and binds every non-empty leaf of the local SMT to one hidden reserve address.  Finally it checks
+\[
+        R_0=\rootof(\{(\kappa_k,b_k,\eta_k)\}_{k=1}^n),
+        \qquad
+        B_0=\sum_{k=1}^n b_k,
+        \qquad
+        C_0=B_0V+r_0H_B .
+\]
+
+\begin{algorithm}[H]
+\caption{SMT initialization relation \(\Rel_{\mathsf{init}}^{\mathsf{smt}}\)}
+\label{alg:smt-init-rel}
+\begin{algorithmic}[1]
+\Require Public input \((\sr_0,R_0,C_0,n)\); witness \((a_k,b_k,\eta_k,\omega_k^{\mathsf{own}},\pi_k^{\mathsf{chain}})_{k=1}^n\), compact tree data, and \((B_0,r_0)\).
+\For{\(k=1\) to \(n\)}
+    \State Verify \(\mathsf{Own}(a_k,\omega_k^{\mathsf{own}};\mathsf{ch}_{\mathsf{init}})=1\).
+    \State Verify \(\mathsf{ChainVerify}(\sr_0,a_k,b_k,\pi_k^{\mathsf{chain}})=1\).
+    \State Compute \(\kappa_k=\Enc_{\mathsf{key}}(a_k)\) and \(L_k=\CRH(\mathtt{leaf},\kappa_k,b_k,\eta_k)\).
+    \State Range-check \(b_k\).
+\EndFor
+\State Check that the keys \((\kappa_k)_k\) are duplicate-free, by sorted order or by private empty-position insertions.
+\State Recompute the compact SMT root from \((\kappa_k,L_k)_k\) and the public default hashes \((E_d)_d\); check that it equals \(R_0\).
+\State Check \(B_0=\sum_{k=1}^nb_k\), \(C_0=B_0V+r_0H_B\), and the range bound on \(B_0\).
+\end{algorithmic}
+\end{algorithm}
+
+This step is intentionally allowed to be heavy.  Its purpose is to bind the hidden reserve set and local tree to a real chain state root.  Later updates do not repeat native chain membership proofs.  In an efficient implementation, native chain verification and ownership checking can again be placed in a ZKVM subproof, while a smaller SNARK checks the circuit-friendly SMT construction and aggregate commitment.  The two subproofs must share hiding commitments to the same key and balance vectors, just as in the split algebraic initialization; otherwise the chain proof and the local-tree proof could refer to different hidden addresses.
+
+\subsection{Update relation}
+
+For a public delta list \(\dlist_i=((a_1,\delta_1),\ldots,(a_m,\delta_m))\), the witness contains, for every \(j\), one of two cases.
+
+\paragraph{Membership case.}
+The address is in the reserve tree.  The witness contains the old balance \(b_j\), the leaf salt \(\eta_j\), the old membership path, and the new balance
+\[
+        b'_j=b_j+\delta_j.
+\]
+The circuit recomputes the old path using the salted leaf \(\CRH(\mathtt{leaf},\kappa_j,b_j,\eta_j)\) and the new path after replacing it by \(\CRH(\mathtt{leaf},\kappa_j,b'_j,\eta_j)\).  The bit \(u_j\) is set to 1.
+
+\paragraph{Non-membership case.}
+The address is not in the reserve tree.  The witness contains either a default-subtree witness, showing that the search path reaches a default subtree, or a collision-leaf witness, showing that the search path reaches a different salted leaf with key \(\kappa'\ne\kappa_j\).  The circuit checks the non-membership witness against the old root.  The root is unchanged for this address and \(u_j=0\).
+
+The circuit processes the touched addresses in canonical order.  If several membership updates affect different leaves, it uses a compact multiproof representation to share common path nodes.  The circuit checks that no address is omitted or duplicated because it receives exactly the public canonical list \(\dlist_i\).
+
+The balance delta is
+\[
+        d_i=\sum_{j=1}^m u_j\delta_j.
+\]
+The commitment check is
+\[
+        C_i=C_{i-1}+d_iV+\rho_iH_B,
+\]
+where \(\rho_i=r_i-r_{i-1}\) is private.  The final root after all conditional updates must equal the public \(R_i\).
+
+\begin{algorithm}[t]
+\caption{SMT update relation \(\Rel_{\mathsf{upd}}^{\mathsf{smt}}\)}
+\begin{algorithmic}[1]
+\Require Public input \((X_{i-1},X_i,\dlist_i)\), where \(X_{i-1}=(\sr_{i-1},R_{i-1},C_{i-1})\), \(X_i=(\sr_i,R_i,C_i)\).
+\Require Witness: compact old tree, membership/non-membership witnesses for each public touched address, old balances and salts for member leaves, collision-leaf data for non-membership witnesses, and blinding difference \(\rho_i\).
+\State Set running root accumulator \(\widehat R\leftarrow R_{i-1}\) and \(d\leftarrow 0\).
+\For{\(j=1\) to \(m\)}
+    \State Set \(\kappa_j=\Enc_{\mathsf{key}}(a_j)\).
+    \State Verify either a membership witness or a non-membership witness for \(\kappa_j\) against the current compact root representation.
+    \If{membership case}
+        \State Check old salted leaf \((\kappa_j,b_j,\eta_j)\), compute \(b'_j=b_j+\delta_j\), and range-check \(b'_j\).
+        \State Update the compact path and set \(\widehat R\) to the resulting root.
+        \State Set \(d\leftarrow d+\delta_j\).
+    \Else
+        \State Leave \(\widehat R\) unchanged.
+    \EndIf
+\EndFor
+\State Check \(\widehat R=R_i\).
+\State Check \(C_i-C_{i-1}=dV+\rho_iH_B\).
+\State Check integer range constraints for \(d\) and updated balances.
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Insertion relation}
+
+To insert a new reserve address \(a_{\mathsf{new}}\), the prover supplies an ownership proof, a chain proof showing current balance \(b\) under the current root \(\sr_i\), and an SMT non-membership proof for \(\kappa=\Enc_{\mathsf{key}}(a_{\mathsf{new}})\) under \(R_i\).  The circuit inserts the new leaf, computes the new root \(R'_i\), and checks
+\[
+        C'_i=C_i+bV+\rho H_B.
+\]
+Deletion can be supported similarly, but we keep deletion out of the main construction because reserve proofs usually benefit from monotone expansion: if an exchange wants to stop tracking an address, it can move its balance to another tracked address and then use an update epoch to reduce the old leaf to zero.
+
+\begin{algorithm}[t]
+\caption{SMT insertion relation \(\Rel_{\mathsf{ins}}^{\mathsf{smt}}\)}
+\begin{algorithmic}[1]
+\Require Public input \((\sr_i,R_i,C_i,R'_i,C'_i)\); witness \((a,b,\eta,\omega^{\mathsf{own}},\pi^{\mathsf{chain}},\pi^{\mathsf{non}},\rho)\).
+\State Verify ownership proof \(\omega^{\mathsf{own}}\) for \(a\).
+\State Verify chain proof \(\pi^{\mathsf{chain}}\) that \(b=\bal_{\sr_i}(a)\).
+\State Verify non-membership of \(\kappa=\Enc_{\mathsf{key}}(a)\) in the old tree root \(R_i\).
+\State Sample or witness a fresh salt \(\eta\), insert leaf \(\CRH(\mathtt{leaf},\kappa,b,\eta)\), and recompute root \(R'_i\).
+\State Check \(C'_i-C_i=bV+\rho H_B\) and range-check \(b\).
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Verifier logic}
+
+The verifier accepts an SMT update only if \(\sr_i\) is finalized, \(\dlist_i=\Sync(\sr_{i-1},\sr_i)\) is canonical, the old public state equals the last accepted state, and the SNARK proof verifies for \(\Rel_{\mathsf{upd}}^{\mathsf{smt}}\).  Insertion and threshold proofs are checked against the current accepted state.  The verifier never receives raw reserve addresses, per-address tree paths, or balances.
+
+\paragraph{Cost.}
+Let \(m=|\dlist_i|\), \(t\le m\) be the number of touched reserve addresses, and \(\ell\) be the tree depth.  Independent paths cost \(O(m\ell)\) hash checks.  A compact multiproof shares common path nodes and costs \(O(N_{\mathsf{frontier}})\) hash checks, where \(N_{\mathsf{frontier}}\le O(m\ell)\) is the number of distinct non-default nodes touched by the update.  The SNARK verifier is succinct.  The prover cost is dominated by the circuit-friendly hash constraints for the compact multiproof and by range checks for updated balances.
+
+
+\section{Security Analysis}
+
+We prove the main claims for accepted public states.  The statements are relative to the public synchronizer output: the verifier recomputes \(\dlist_i=\Sync(\sr_{i-1},\sr_i)\) and accepts only canonical, deduplicated lists.
+
+\begin{theorem}[Initialization soundness]
+Assume soundness of the initialization SNARK or ZKVM, soundness of the address-ownership and native chain-state proofs, KZG binding for the algebraic construction, collision resistance of \(\CRH\) for the SMT construction, binding of the balance commitment, and integer range soundness.  If an initialization proof for \(X_0\) accepts, then there exists a reserve set \(S\) controlled by the prover such that the public root or accumulator binds to \(S\), and \(C_0\) opens to
+\[
+        \sum_{a\in S}\bal_{\sr_0}(a).
+\]
+\end{theorem}
+
+\begin{proof}
+SNARK soundness extracts a witness satisfying the initialization relation.  Ownership-proof soundness gives control of every extracted address.  Chain-proof soundness gives \(b_0(a)=\bal_{\sr_0}(a)\).  The duplicate-freeness check ensures that the extracted list represents a set rather than a multiset.  In the algebraic construction, the relation checks \(\alpha\ne0\), the group-linear equation \(A=\sum_t p_t[\tau^t]_1\), and the randomized identity
+\[
+        \sum_t p_t\zeta^t=\alpha\prod_{a\in S}(\zeta-\Enc_\F(a)).
+\]
+KZG binding fixes the degree-at-most-\(n\) polynomial represented by \((p_t)_t\) before \(\zeta\) is derived.  If this polynomial were not \(\alpha\prod_{a\in S}(T-\Enc_\F(a))\), the difference would be a nonzero polynomial of degree at most \(n\), and the random evaluation check would pass with probability at most \(n/q\).  In the SMT construction, the relation recomputes the salted leaves and the root; collision resistance prevents inconsistent leaf assignments for the same root.  In both constructions, the relation checks \(C_0=B_0V+r_0H_B\) with \(B_0=\sum_{a\in S}b_0(a)\), and Pedersen binding fixes the committed aggregate value.
+\end{proof}
+
+\begin{theorem}[Algebraic update soundness]\label{thm:alg-update-sound}
+Assume KZG binding and batched evaluation binding for the stated degree bounds, knowledge soundness of the committed-R1CS Bulletproof for public group-linear relations, binding of the balance commitment, injectivity or collision resistance of \(\Enc_\F\), and integer range soundness.  The adversary may choose the public touched addresses adaptively after seeing the SRS, subject to the verifier's distinctness check.  Suppose the previous accepted algebraic state binds to a set \(S\) and balance \(B_{i-1}\).  If the verifier accepts an update from \(X_{i-1}\) to \(X_i\), then \(C_i\) opens to
+\[
+        B_{i-1}+\sum_{(a,\delta)\in\dlist_i:a\in S}\delta .
+\]
+\end{theorem}
+
+\begin{proof}
+Bulletproof knowledge soundness extracts
+\[
+        (u,y,z,w,d_i,r_U,\rho_Y,r_D)
+\]
+satisfying the group-linear equations and the R1CS constraints.  In particular,
+\[
+        C_Y=\sum_j y_j[L_j(\tau)]_1+\rho_Y[Z_i(\tau)]_1.
+\]
+By Lemma~\ref{lem:structured-cy}, this is a structured KZG opening of a unique polynomial
+\[
+        J_{y,\rho_Y}(T)=\sum_j y_jL_j(T)+\rho_YZ_i(T).
+\]
+The accepted KZG check for \(A-C_Y\) and \(Z_i\), together with Lemma~\ref{lem:adv-query-cy}, gives \(y_j=P_S(x_j)\) for every public query point.  The zero-test constraints give
+\[
+        u_j\in\{0,1\},\qquad u_j=1 \Longleftrightarrow y_j=0 .
+\]
+Since \(P_S=\alpha F_S\) and \(\alpha\ne0\), this is equivalent to \(F_S(x_j)=0\), hence to \(a_j\in S\) except with negligible encoding-collision probability.  The linear constraint gives \(d_i=\sum_j u_j\delta_j\), and the extracted opening \(C_D=d_iV+r_DH_B\) is fixed by Pedersen binding.  The verifier checks \(C_i=C_{i-1}+C_D\), so the accepted commitment opens to the claimed updated aggregate.
+\end{proof}
+
+\begin{theorem}[SMT update soundness]\label{thm:smt-update-sound}
+Assume SNARK soundness, collision resistance of \(\CRH\), binding of the balance commitment, and integer range soundness.  Suppose the previous accepted SMT state binds to a salted reserve tree with aggregate balance \(B_{i-1}\).  If the verifier accepts an SMT update from \(X_{i-1}\) to \(X_i\), then \(R_i\) is the root obtained by applying exactly the public deltas for touched reserve addresses, and \(C_i\) opens to the corresponding updated aggregate balance.
+\end{theorem}
+
+\begin{proof}
+SNARK soundness extracts a witness satisfying \(\Rel_{\mathsf{upd}}^{\mathsf{smt}}\).  For each public touched key, the circuit verifies either a membership path for a salted leaf or a non-membership proof against the current compact root representation.  In the membership case it range-checks \(b_j+\delta_j\), updates the salted leaf with the same salt, and adds \(\delta_j\) to the aggregate delta.  In the non-membership case it proves absence by a default-subtree or collision-leaf witness and leaves the root and aggregate delta unchanged.  Collision resistance prevents two different compact trees, leaves, or paths from producing the same verified root.  The circuit recomputes the final root \(R_i\) and checks \(C_i-C_{i-1}=d_iV+\rho_iH_B\); Pedersen binding fixes the committed value.
+\end{proof}
+
+\begin{theorem}[Insertion soundness]
+Assume SNARK soundness, soundness of address-ownership and native chain-state proofs, collision resistance of \(\CRH\), binding of the balance commitment, and integer range soundness.  If an SMT insertion proof accepts, then the inserted address is controlled by the prover, was absent from the old tree, its inserted balance equals \(\bal_{\sr_i}(a)\), and the new root and balance commitment are the honest insertion result.
+\end{theorem}
+
+\begin{proof}
+SNARK soundness extracts a witness satisfying \(\Rel_{\mathsf{ins}}^{\mathsf{smt}}\).  Ownership and chain-proof soundness give control of the address and correctness of the inserted balance.  The non-membership check proves absence from the old root, except with collision probability for \(\CRH\).  The circuit recomputes the inserted salted leaf, the new root, and the balance-commitment difference.  Binding fixes the committed aggregate increase.
+\end{proof}
+
+\begin{theorem}[Threshold soundness]
+Assume soundness of the comparison proof and binding of the balance and liability commitments.  If a threshold proof for the current state accepts, then every valid opening of the checked commitments satisfies the stated integer inequality.
+\end{theorem}
+
+\begin{proof}
+The proof system extracts openings used in the comparison relation.  Commitment binding makes these openings unique for the public commitments, and range soundness gives integer semantics.  Hence an accepted proof implies the claimed inequality for the committed balances.
+\end{proof}
+
+\begin{theorem}[Inductive asset soundness and freshness]
+Assume initialization soundness and the corresponding update and insertion soundness theorem for the chosen construction.  For any accepted sequence
+\[
+        X_0\rightarrow X_1\rightarrow\cdots\rightarrow X_i,
+\]
+where every transition uses the verifier's public synchronizer output between the named finalized roots, \(C_i\) opens to the aggregate balance obtained from the initialized hidden reserve set by applying all accepted public updates and insertions.  Moreover, the statement is fresh for \(\sr_i\): a proof for an older root cannot be accepted for \(\sr_i\) without an accepted chain of transitions to \(X_i\).
+\end{theorem}
+
+\begin{proof}
+The base case is initialization soundness.  The induction step is Theorem~\ref{thm:alg-update-sound} for the algebraic fixed-set construction, or Theorem~\ref{thm:smt-update-sound} plus insertion soundness for the SMT construction.  The verifier checks that each update references the last accepted state and the synchronizer output for the named roots.  Therefore accepted states form a single public chain, and stale states cannot be relabeled as newer roots.
+\end{proof}
+
+\begin{theorem}[Privacy]
+Assume zero knowledge of the proof systems, hiding of Pedersen commitments, the scalar mask \(\alpha\in\F_q^*\) in the algebraic accumulator, fresh blindings in \(C_U,C_Y,C_D\), and independent SMT leaf salts.  Then two executions with the same public leakage and the same threshold outcomes give computationally indistinguishable verifier views.
+\end{theorem}
+
+\begin{proof}
+All addresses, balances, paths, membership bits, polynomial evaluations, and commitment openings are private witnesses.  Zero knowledge simulates the proofs.  Pedersen hiding simulates balance and delta commitments.  In the algebraic construction, \(A=[\alpha F_S(\tau)]_1\) is scalar-masked except with probability at most \(|S|/q\) that \(F_S(\tau)=0\), and \(C_Y\) is statistically hiding by Lemma~\ref{lem:cy-hiding} when \(H_Y\ne\mathcal O\).  In the SMT construction, salted leaves prevent the public root from being a deterministic hash of unsalted address-balance pairs.  Thus the public view is simulatable from public roots, delta lists, commitments, and accepted predicates.
+\end{proof}
+
+\section{Implementation and Evaluation}
+
+This section states the implementation plan and the quantities that must be measured in a prototype.  We do not report fabricated benchmark numbers.
+
+\paragraph{Initialization prototype.}
+The prototype should report initialization separately from update.  For the algebraic construction it measures native proof verification, address-ownership verification, duplicate-freeness, product-tree construction of \(P_S\), the randomized product check, the KZG group-linear proof, and the aggregate commitment check.  For the SMT construction it measures native proof verification, salted-leaf construction, compact tree construction, root recomputation, and aggregate commitment checking.  This separation is important because initialization is one-time and chain-specific, while updates are repeated frequently.
+
+\paragraph{Algebraic prototype.}
+The prover stores the set polynomial \(F_S\) in a representation supporting fast multipoint evaluation.  For each \(m\)-element update list, the prototype measures product-tree construction, multipoint evaluation of \(F_S\), interpolation of \(I_Y\), quotient computation, KZG commitments, and the committed-R1CS Bulletproof.  The main baselines are the naive \(O(|S|m)\) evaluation strategy and a static SNARK that rechecks all hidden balances.
+
+\paragraph{SMT-SNARK prototype.}
+The circuit uses a SNARK-friendly hash such as Poseidon or Rescue for local tree nodes.  It measures independent paths versus compact multiproofs, the number of hash constraints, range constraints, proof generation time, proof size, and verifier time.  The relevant parameters are reserve-set size \(n\), update-list length \(m\), number of touched reserve addresses \(t\), and tree depth \(\ell\).
+
+\begin{table}[t]
+\centering
+\caption{Asymptotic update costs, excluding one-time initialization.}
+\label{tab:costs}
+\begin{tabular}{lll}
+\toprule
+Construction & Prover work & Proof / verifier work \\
+\midrule
+Algebraic KZG+BP & \(\softO(n+m)+O(m)\) gates & \(O(\log m)\) proof, \(\softO(m)\) verifier \\
+SMT-SNARK & \(O(N_{\mathsf{frontier}})\) hash checks & succinct proof, verifier independent of \(m\) \\
+Static SNARK baseline & native proofs for all \(n\) addresses & succinct proof, large prover circuit \\
+Public-address audit & public chain scan & no privacy \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Extensions: Multichain Aggregation}
+
+The single-chain state extends naturally to multiple chains.  Let tracked chains be \(c\in[k]\).  The public state contains a vector of finalized roots
+\[
+        \boldsymbol{\sr}_i=(\sr_i^{(1)},\ldots,\sr_i^{(k)})
+\]
+and a vector of balance commitments
+\[
+        \mathbf C_i=(C_i^{(1)},\ldots,C_i^{(k)}).
+\]
+The hidden reserve leaf in the SMT construction stores a balance vector \(\mathbf b(a)=(b^{(1)}(a),\ldots,b^{(k)}(a))\).  In the algebraic construction, the membership vector is shared across chains, and the inner-product constraints are repeated for each chain coordinate or compressed by a Fiat-Shamir random linear combination when appropriate.
+
+Each chain has its own public synchronizer.  The merged public delta list contains address-vector-delta pairs \((a,\boldsymbol\delta(a))\).  The update proof shows
+\[
+        B_i^{(c)}=B_{i-1}^{(c)}+\sum_{a\in S}\delta^{(c)}(a)
+        \quad\text{for every }c\in[k].
+\]
+A threshold proof can express a per-chain lower bound, a simple global sum, or a weighted linear form
+\[
+        \inner{\boldsymbol\alpha}{\mathbf B_i}\ge T.
+\]
+This makes the aggregation semantics explicit and prevents a prover from silently changing what ``total assets'' means between epochs.
+
+Rollups and bridges require a finality policy.  A verifier may use L1-posted roots, native L2 finalized roots, or a hybrid policy.  If a rollup reorg invalidates a previously accepted root, the verifier rolls back to the last common accepted state and asks for a new update chain.  The cryptographic update proof remains unchanged because it is parameterized only by the public root vector and public synchronizer outputs.
+
+\section{Related Work}
+
+\paragraph{Proofs of liabilities.}
+Early exchange-audit proposals used Merkle sum trees so that users could verify inclusion of their own liabilities~\cite{Maxwell14}.  Maxwell's proof-of-liabilities idea motivated many later systems, but naive sum-tree constructions can be vulnerable to binding errors if balances are not committed carefully.  Follow-up work studied these attacks and proposed fixes and generalizations~\cite{Hu18,Ji21}.  Recent work on short private proofs of liabilities and accumulator-based systems such as Notus focuses on the liability side~\cite{Falzon23,Notus24}: Falzon et al. use sparse summation Verkle trees, while Notus gives a dynamic PoL system based on zero-knowledge RSA accumulators and a MultiSwap protocol.  These works motivate our dynamic security style, but their objects are liabilities rather than on-chain reserve balances.
+
+\paragraph{Proofs of assets and solvency.}
+Provisions~\cite{Provisions15} is the closest classical academic work.  It gives privacy-preserving proofs of solvency for Bitcoin exchanges by combining hidden asset proofs with liability proofs.  Its setting is essentially static and Bitcoin-oriented.  Later SNARK-based and succinct solvency proofs similarly prove ownership of hidden addresses and committed balances in one large statement~\cite{Reddy22,Xiezhi24}.  These schemes do not directly solve the dynamic on-chain setting considered here, where the reserve commitment must be refreshed frequently from public block deltas without rechecking all native state proofs.
+
+\paragraph{Industrial proof of reserves.}
+Many exchange proof-of-reserve systems disclose wallet addresses or combine public asset lists with Merkle or ZK liability proofs.  This gives transparency but not reserve-set privacy.  Our work targets the missing case: an on-chain asset proof that keeps reserve addresses hidden while still providing continuous updates tied to finalized chain roots.
+
+\paragraph{Authenticated state and zero knowledge.}
+Merkle trees, sparse Merkle trees, and Ethereum-style Merkle-Patricia tries are standard tools for authenticated state~\cite{Merkle88,WoodYellowPaper,MPTdoc}.  They are not equally convenient inside zero-knowledge circuits.  Our SMT construction deliberately uses a circuit-friendly local tree rather than the native chain tree after initialization.  KZG commitments~\cite{KZG10} and Bulletproofs~\cite{Bulletproofs18} provide the algebraic tools for the fixed-set construction: KZG gives succinct polynomial batch evaluation, and Bulletproofs give logarithmic-size proofs for committed arithmetic relations.
+
+\section{Conclusion}
+
+We introduced dynamic private proof of assets for hidden on-chain reserve sets.  The central idea is to separate the expensive initialization proof from cheap incremental updates driven by public block-delta lists.  We gave two concrete constructions: a specialized KZG-and-Bulletproof update protocol for fixed reserve sets and a compact SMT-SNARK construction for mutable reserve sets.  Both bind aggregate asset commitments to finalized chain state roots while hiding reserve addresses and aggregate deltas.  Future work includes a full implementation, optimized circuits for compact multiproofs, and a detailed empirical comparison with static SNARK-based audits.
+
+\bibliographystyle{splncs04}
+\begin{thebibliography}{18}
+
+\bibitem{KZG10}
+A. Kate, G. M. Zaverucha, and I. Goldberg.
+\newblock Constant-size commitments to polynomials and their applications.
+\newblock In \emph{ASIACRYPT}, 2010.
+
+\bibitem{Bulletproofs18}
+B. Bünz, J. Bootle, D. Boneh, A. Poelstra, P. Wuille, and G. Maxwell.
+\newblock Bulletproofs: Short proofs for confidential transactions and more.
+\newblock In \emph{IEEE Symposium on Security and Privacy}, 2018.
+
+\bibitem{Groth16}
+J. Groth.
+\newblock On the size of pairing-based non-interactive arguments.
+\newblock In \emph{EUROCRYPT}, 2016.
+
+\bibitem{Merkle88}
+R. C. Merkle.
+\newblock A digital signature based on a conventional encryption function.
+\newblock In \emph{CRYPTO}, 1987.
+
+\bibitem{Poseidon19}
+L. Grassi, D. Khovratovich, C. Rechberger, A. Roy, and M. Schofnegger.
+\newblock Poseidon: A new hash function for zero-knowledge proof systems.
+\newblock In \emph{USENIX Security Symposium}, 2021.
+
+\bibitem{Provisions15}
+G. G. Dagher, B. Bünz, J. Bonneau, J. Clark, and D. Boneh.
+\newblock Provisions: Privacy-preserving proofs of solvency for Bitcoin exchanges.
+\newblock In \emph{ACM CCS}, 2015.
+
+\bibitem{Maxwell14}
+G. Maxwell.
+\newblock Proving your Bitcoin reserves.
+\newblock Bitcoin Forum post, 2014.
+
+\bibitem{Hu18}
+K. Hu, Z. Zhang, and D. Lin.
+\newblock Breaking the binding: Attacks on the Merkle approach to proving liabilities and its applications.
+\newblock Cryptology ePrint Archive, Report 2018/1139, 2018.
+
+\bibitem{Ji21}
+Y. Ji and K. Chalkias.
+\newblock Generalized proof of liabilities.
+\newblock In \emph{Financial Cryptography and Data Security}, 2021.
+
+\bibitem{Falzon23}
+F. Falzon, K. Elkhiyaoui, Y. Manevich, and A. De Caro.
+\newblock Short privacy-preserving proofs of liabilities.
+\newblock In \emph{ACM CCS}, 2023.
+
+\bibitem{Notus24}
+J. Xin, A. Haghighi, X. Tian, and D. Papadopoulos.
+\newblock Notus: Dynamic proofs of liabilities from zero-knowledge RSA accumulators.
+\newblock In \emph{USENIX Security Symposium}, 2024.
+
+\bibitem{Xiezhi24}
+Y. Deng and J. Clark.
+\newblock Xiezhi: Toward succinct proofs of solvency.
+\newblock Cryptology ePrint Archive, Paper 2024/2001, 2024.
+
+\bibitem{Reddy22}
+B. S. Reddy.
+\newblock A ZK-SNARK based proof of assets protocol for Bitcoin exchanges.
+\newblock arXiv:2208.01263, 2022.
+
+\bibitem{WoodYellowPaper}
+G. Wood.
+\newblock Ethereum: A secure decentralised generalised transaction ledger.
+\newblock Ethereum Yellow Paper, 2014--2024.
+
+\bibitem{Verkle}
+J. Kuszmaul.
+\newblock Verkle trees.
+\newblock Cryptology ePrint Archive, Report 2018/923, 2018.
+
+\bibitem{Zerocash14}
+E. Ben-Sasson, A. Chiesa, C. Garman, M. Green, I. Miers, E. Tromer, and M. Virza.
+\newblock Zerocash: Decentralized anonymous payments from Bitcoin.
+\newblock In \emph{IEEE Symposium on Security and Privacy}, 2014.
+
+\bibitem{MPTdoc}
+Ethereum Foundation.
+\newblock Merkle Patricia Trie.
+\newblock Ethereum developer documentation.
+
+\bibitem{HistoricalStorage24}
+M. Kirejczyk, M. Kalka, and L. Logvinov.
+\newblock Historical and multichain storage proofs.
+\newblock arXiv:2411.00193, 2024.
+
+\end{thebibliography}
+
+\appendix
+\setcounter{section}{0}
+\renewcommand{\thesection}{\Alph{section}}
+\renewcommand{\theHsection}{appendix.\Alph{section}}
+
+\section{Full Bulletproof/IPA Specification}\label{app:bp}
+
+This appendix expands the proof denoted \(\pi_{\mathsf{logic}}\).  The witness vector is
+\[
+        a=(u_1,\ldots,u_m,y_1,\ldots,y_m,z_1,\ldots,z_m,w_1,\ldots,w_m,d,r_U,\rho_Y,r_D).
+\]
+The public group-linear equations are
+\[
+ C_U=\sum_j u_jU_j+r_UH_U,
+ \quad
+ C_Y=\sum_j y_jB_j+\rho_YH_Y,
+ \quad
+ C_D=dV+r_DH_B.
+\]
+For each \(j\), the four multiplication gates are
+\[
+ u_j(1-u_j)=0,
+ \quad u_jy_j=0,
+ \quad y_jz_j=w_j,
+ \quad (1-u_j)(w_j-1)=0.
+\]
+The public linear equation is \(d-\sum_j\delta_ju_j=0\).  A standard committed-R1CS Bulletproof aggregates these constraints and reduces the final check to an inner-product argument.
+
+For completeness, recall the inner-product argument.  Let \(N\) be a power of two, let \(G=(G_1^*,\ldots,G_N^*)\) and \(H=(H_1^*,\ldots,H_N^*)\), and let \(U^*\) be an additional generator.  The public instance is
+\[
+        P=\inner{a}{G}+\inner{b}{H}+\inner{a}{b}U^*.
+\]
+If \(N>1\), split vectors into left and right halves and send
+\[
+ L=\inner{a_L}{G_R}+\inner{b_R}{H_L}+\inner{a_L}{b_R}U^*,
+\quad
+ R=\inner{a_R}{G_L}+\inner{b_L}{H_R}+\inner{a_R}{b_L}U^*.
+\]
+After challenge \(x\), both parties fold
+\[
+ a'=xa_L+x^{-1}a_R,
+ \quad b'=x^{-1}b_L+xb_R,
+\]
+\[
+ G'=x^{-1}G_L+xG_R,
+ \quad H'=xH_L+x^{-1}H_R,
+ \quad P'=P+x^2L+x^{-2}R.
+\]
+The protocol recurses until one coordinate remains.  The proof contains \((L_1,R_1,\ldots,L_{\log N},R_{\log N},a_{\mathsf{final}},b_{\mathsf{final}})\).
+
+\section{Concrete R1CS Rows}\label{app:r1cs}
+
+For each update index \(j\), the zero-test relation can be written as R1CS rows \(\ell(a)r(a)=o(a)\):
+\[
+\begin{array}{c|c|c|c}
+\text{gate} & \ell(a) & r(a) & o(a) \\
+\hline
+\text{bit} & u_j & 1-u_j & 0 \\
+\text{zero if member} & u_j & y_j & 0 \\
+\text{inverse test} & y_j & z_j & w_j \\
+\text{nonzero if nonmember} & 1-u_j & w_j-1 & 0
+\end{array}
+\]
+If \(u_j=1\), the second row forces \(y_j=0\).  If \(u_j=0\), the fourth row forces \(w_j=1\), and the third row then gives \(y_jz_j=1\), hence \(y_j\ne 0\).  Together with the first row, this proves \(u_j=1\) iff \(y_j=0\).
+
+\section{Omitted Proof Details}\label{app:proofs}
+
+\paragraph{Structured bases in \(C_Y\).}
+The element \(C_Y\) is not a Pedersen commitment under independent random bases.  It is a KZG commitment to \(J_Y\), and also equals \(\sum_jy_j[L_j(\tau)]_1+\rho_Y[Z_i(\tau)]_1\).  The public bases may depend on block addresses, and those addresses may be influenced by the prover.  This does not give the prover arbitrary generators: after the canonical list is fixed, the verifier recomputes \(L_j,Z_i,B_j,H_Y\) from the SRS.  Any two openings \((y,\rho)\) and \((y',\rho')\) define two degree-at-most-\(m\) polynomials
+\[
+        J(T)=\sum_jy_jL_j(T)+\rho Z_i(T),
+        \quad
+        J'(T)=\sum_jy'_jL_j(T)+\rho'Z_i(T).
+\]
+If both open the same KZG commitment within the degree bound, KZG binding implies \(J=J'\).  Evaluating at each \(x_j\) gives \(y_j=y'_j\), and then \((\rho-\rho')Z_i=0\) gives \(\rho=\rho'\).  The multi-opening step is a standard KZG zero-test.  Once the Bulletproof extractor gives \(J\), the pairing equation says that the fixed commitment \(A=[P_S(\tau)]_1\) opens at the public query set to the vector \((J(x_1),\ldots,J(x_m))=(y_1,\ldots,y_m)\).  If this vector differed from \((P_S(x_1),\ldots,P_S(x_m))\), the prover would have produced a forged batched KZG opening.  Thus batched evaluation binding, not Pedersen generator independence, is the property that forces \(y_j=P_S(x_j)\) for all public query points.
+
+\paragraph{Simulation.}
+The algebraic simulator chooses random blinded commitments \(C_U,C_Y,C_D\) consistent with the public commitment update and simulates the zero-knowledge Bulletproof and KZG opening transcript.  The SMT simulator outputs simulated SNARK proofs and random hiding commitments.  Indistinguishability follows from the zero-knowledge property of the underlying proof systems and the hiding of the commitments.
+
+\section{Multipoint Evaluation Details}\label{app:mpe}
+
+The prover should not compute \(P_S(x_j)\) independently for all \(j\), which would cost \(O(nm)\).  Instead it builds the product tree for the query polynomial \(Z_i(T)=\prod_j(T-x_j)\), reduces \(P_S\) down the tree, and reads the remainders at the leaves.  With FFT-based polynomial arithmetic this costs \(\softO(n+m)\).  Interpolation of \(I_Y\) uses the same product tree and one batch inversion for denominators.  The quotient \((P_S-J_Y)/Z_i\) is then computed by polynomial division.
+
+\section{SMT Non-Membership Cases}\label{app:smt-nonmem}
+
+A sparse Merkle non-membership proof has two circuit cases.
+
+\paragraph{Default-subtree case.}
+The path for key \(\kappa\) reaches a subtree whose root equals the precomputed default hash \(E_d\).  Since every leaf below this node is empty, \(\kappa\) is absent.  The circuit checks the path from this default node to the root.
+
+\paragraph{Collision-leaf case.}
+The path reaches a non-empty leaf with key \(\kappa'\ne\kappa\).  The circuit checks that \(\kappa'\) diverges from \(\kappa\) at the claimed bit, recomputes the leaf hash for \(\kappa'\), and verifies the path to the root.  Collision resistance of \(\CRH\) prevents the prover from using the same root for two inconsistent leaf assignments.
+
+\end{document}

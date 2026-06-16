@@ -25,6 +25,13 @@ pub struct LogicProof {
 }
 
 #[derive(Clone, Debug)]
+enum LinkLayout {
+    Full { m: usize },
+    ZeroTest { m: usize },
+    Projection { m: usize },
+}
+
+#[derive(Clone, Debug)]
 struct LinkProof {
     r_bp: Vec<BpG1>,
     r_u_ext: ArkG1,
@@ -147,6 +154,234 @@ pub fn verify_logic(
     )
 }
 
+pub fn prove_zero_test_logic(
+    srs: &Srs,
+    witness: &UpdateWitness,
+    deltas: &[Delta],
+    c_u_hex: &str,
+    c_y_hex: &str,
+    r_u: Fr,
+    rho_y: Fr,
+    query_ctx: Option<&QueryContext>,
+) -> Result<LogicProof, String> {
+    let values = flatten_zero_test_values(witness);
+    let bp_values = values
+        .iter()
+        .map(fr_to_bp_scalar)
+        .collect::<Result<Vec<_>, _>>()?;
+    let bp_blinds = derive_bp_blinds(&values)?;
+
+    let pc_gens = PedersenGens::default();
+    let bp_gens = BulletproofGens::new((deltas.len() * 4).max(1).next_power_of_two(), 1);
+    let mut transcript = Transcript::new(b"dynamic-poa-zero-test-r1cs");
+    append_zero_test_public_to_transcript(&mut transcript, c_u_hex, c_y_hex, deltas);
+    let mut prover = Prover::new(&pc_gens, &mut transcript);
+
+    let mut commitments = Vec::with_capacity(values.len());
+    let mut vars = Vec::with_capacity(values.len());
+    for (value, blind) in bp_values.iter().zip(bp_blinds.iter()) {
+        let (commitment, var) = prover.commit(*value, *blind);
+        commitments.push(commitment);
+        vars.push(var);
+    }
+
+    zero_test_relation(&mut prover, &vars, deltas.len())?;
+    let bp_proof = prover
+        .prove(&bp_gens)
+        .map_err(|err| format!("zero-test bulletproof prove: {err}"))?;
+    let link_proof = prove_link_with_layout(
+        srs,
+        deltas,
+        &witness.x_values,
+        &commitments,
+        &values,
+        &bp_blinds,
+        c_u_hex,
+        c_y_hex,
+        "",
+        r_u,
+        rho_y,
+        Fr::zero(),
+        query_ctx,
+        LinkLayout::ZeroTest { m: deltas.len() },
+    )?;
+
+    Ok(LogicProof {
+        bp_proof_hex: hex_encode(&bp_proof.to_bytes()),
+        bp_commitments_hex: encode_bp_points(&commitments),
+        link_proof_hex: encode_link_proof(&link_proof)?,
+    })
+}
+
+pub fn verify_zero_test_logic(
+    srs: &Srs,
+    deltas: &[Delta],
+    x_values: &[Fr],
+    c_u_hex: &str,
+    c_y_hex: &str,
+    bp_proof_hex: &str,
+    bp_commitments_hex: &str,
+    link_proof_hex: &str,
+) -> Result<(), String> {
+    let commitments = decode_bp_points(bp_commitments_hex)?;
+    let expected_len = deltas.len() * 4;
+    if commitments.len() != expected_len {
+        return Err(format!(
+            "zero-test Bulletproof commitment length mismatch: got {}, expected {}",
+            commitments.len(),
+            expected_len
+        ));
+    }
+
+    let pc_gens = PedersenGens::default();
+    let bp_gens = BulletproofGens::new((deltas.len() * 4).max(1).next_power_of_two(), 1);
+    let mut transcript = Transcript::new(b"dynamic-poa-zero-test-r1cs");
+    append_zero_test_public_to_transcript(&mut transcript, c_u_hex, c_y_hex, deltas);
+    let mut verifier = Verifier::new(&mut transcript);
+    let vars = commitments
+        .iter()
+        .map(|commitment| verifier.commit(*commitment))
+        .collect::<Vec<_>>();
+    zero_test_relation(&mut verifier, &vars, deltas.len())?;
+    let bp_bytes = hex_decode(bp_proof_hex)?;
+    let bp_proof = R1CSProof::from_bytes(&bp_bytes).map_err(|err| format!("zero-test bulletproof parse: {err}"))?;
+    verifier
+        .verify(&bp_proof, &pc_gens, &bp_gens)
+        .map_err(|err| format!("zero-test bulletproof verify: {err}"))?;
+
+    let link_proof = decode_link_proof(link_proof_hex, expected_len)?;
+    verify_link_with_layout(
+        srs,
+        deltas,
+        x_values,
+        &commitments,
+        c_u_hex,
+        c_y_hex,
+        "",
+        &link_proof,
+        LinkLayout::ZeroTest { m: deltas.len() },
+    )
+}
+
+pub fn prove_projection_logic(
+    u_values: &[Fr],
+    d_value: i128,
+    deltas: &[Delta],
+    c_u_hex: &str,
+    c_d_hex: &str,
+    r_u: Fr,
+    r_d: Fr,
+) -> Result<LogicProof, String> {
+    if u_values.len() != deltas.len() {
+        return Err("projection u/delta length mismatch".to_string());
+    }
+    let values = flatten_projection_values(u_values, d_value);
+    let bp_values = values
+        .iter()
+        .map(fr_to_bp_scalar)
+        .collect::<Result<Vec<_>, _>>()?;
+    let bp_blinds = derive_bp_blinds(&values)?;
+
+    let pc_gens = PedersenGens::default();
+    let bp_gens = BulletproofGens::new(deltas.len().max(1).next_power_of_two(), 1);
+    let mut transcript = Transcript::new(b"dynamic-poa-projection-r1cs");
+    append_projection_public_to_transcript(&mut transcript, c_u_hex, c_d_hex, deltas);
+    let mut prover = Prover::new(&pc_gens, &mut transcript);
+
+    let mut commitments = Vec::with_capacity(values.len());
+    let mut vars = Vec::with_capacity(values.len());
+    for (value, blind) in bp_values.iter().zip(bp_blinds.iter()) {
+        let (commitment, var) = prover.commit(*value, *blind);
+        commitments.push(commitment);
+        vars.push(var);
+    }
+
+    projection_relation(&mut prover, &vars, deltas)?;
+    let bp_proof = prover
+        .prove(&bp_gens)
+        .map_err(|err| format!("projection bulletproof prove: {err}"))?;
+    let link_proof = prove_link_with_layout(
+        &Srs {
+            max_degree: 0,
+            tau: Fr::zero(),
+            tau_g1_powers: Vec::new(),
+            tau_g2_powers: Vec::new(),
+        },
+        deltas,
+        &[],
+        &commitments,
+        &values,
+        &bp_blinds,
+        c_u_hex,
+        "",
+        c_d_hex,
+        r_u,
+        Fr::zero(),
+        r_d,
+        None,
+        LinkLayout::Projection { m: deltas.len() },
+    )?;
+
+    Ok(LogicProof {
+        bp_proof_hex: hex_encode(&bp_proof.to_bytes()),
+        bp_commitments_hex: encode_bp_points(&commitments),
+        link_proof_hex: encode_link_proof(&link_proof)?,
+    })
+}
+
+pub fn verify_projection_logic(
+    deltas: &[Delta],
+    c_u_hex: &str,
+    c_d_hex: &str,
+    bp_proof_hex: &str,
+    bp_commitments_hex: &str,
+    link_proof_hex: &str,
+) -> Result<(), String> {
+    let commitments = decode_bp_points(bp_commitments_hex)?;
+    let expected_len = deltas.len() + 1;
+    if commitments.len() != expected_len {
+        return Err(format!(
+            "projection Bulletproof commitment length mismatch: got {}, expected {}",
+            commitments.len(),
+            expected_len
+        ));
+    }
+
+    let pc_gens = PedersenGens::default();
+    let bp_gens = BulletproofGens::new(deltas.len().max(1).next_power_of_two(), 1);
+    let mut transcript = Transcript::new(b"dynamic-poa-projection-r1cs");
+    append_projection_public_to_transcript(&mut transcript, c_u_hex, c_d_hex, deltas);
+    let mut verifier = Verifier::new(&mut transcript);
+    let vars = commitments
+        .iter()
+        .map(|commitment| verifier.commit(*commitment))
+        .collect::<Vec<_>>();
+    projection_relation(&mut verifier, &vars, deltas)?;
+    let bp_bytes = hex_decode(bp_proof_hex)?;
+    let bp_proof = R1CSProof::from_bytes(&bp_bytes).map_err(|err| format!("projection bulletproof parse: {err}"))?;
+    verifier
+        .verify(&bp_proof, &pc_gens, &bp_gens)
+        .map_err(|err| format!("projection bulletproof verify: {err}"))?;
+
+    let link_proof = decode_link_proof(link_proof_hex, expected_len)?;
+    verify_link_with_layout(
+        &Srs {
+            max_degree: 0,
+            tau: Fr::zero(),
+            tau_g1_powers: Vec::new(),
+            tau_g2_powers: Vec::new(),
+        },
+        deltas,
+        &[],
+        &commitments,
+        c_u_hex,
+        "",
+        c_d_hex,
+        &link_proof,
+        LinkLayout::Projection { m: deltas.len() },
+    )
+}
+
 fn update_relation<CS: ConstraintSystem>(
     cs: &mut CS,
     vars: &[bulletproofs_bls::r1cs::Variable],
@@ -187,6 +422,52 @@ fn update_relation<CS: ConstraintSystem>(
     Ok(())
 }
 
+fn zero_test_relation<CS: ConstraintSystem>(
+    cs: &mut CS,
+    vars: &[bulletproofs_bls::r1cs::Variable],
+    m: usize,
+) -> Result<(), String> {
+    let u_offset = 0;
+    let y_offset = m;
+    let z_offset = 2 * m;
+    let w_offset = 3 * m;
+
+    for j in 0..m {
+        let u = vars[u_offset + j];
+        let y = vars[y_offset + j];
+        let z = vars[z_offset + j];
+        let w = vars[w_offset + j];
+
+        let (_, _, u_sq) = cs.multiply(u.into(), u.into());
+        cs.constrain(u_sq - u);
+
+        let (_, _, uy) = cs.multiply(u.into(), y.into());
+        cs.constrain(uy.into());
+
+        let (_, _, yz) = cs.multiply(y.into(), z.into());
+        cs.constrain(yz - w);
+
+        let (_, _, one_minus_u_times_w_minus_one) =
+            cs.multiply(bp_one() - u, w - bp_one());
+        cs.constrain(one_minus_u_times_w_minus_one.into());
+    }
+    Ok(())
+}
+
+fn projection_relation<CS: ConstraintSystem>(
+    cs: &mut CS,
+    vars: &[bulletproofs_bls::r1cs::Variable],
+    deltas: &[Delta],
+) -> Result<(), String> {
+    let d_index = deltas.len();
+    let mut delta_lc: LinearCombination = vars[d_index].into();
+    for (j, delta) in deltas.iter().enumerate() {
+        delta_lc = delta_lc - bp_scalar_from_i128(delta.delta)? * vars[j];
+    }
+    cs.constrain(delta_lc);
+    Ok(())
+}
+
 fn prove_link(
     srs: &Srs,
     witness: &UpdateWitness,
@@ -201,6 +482,40 @@ fn prove_link(
     rho_y: Fr,
     r_d: Fr,
     query_ctx: Option<&QueryContext>,
+) -> Result<LinkProof, String> {
+    prove_link_with_layout(
+        srs,
+        deltas,
+        &witness.x_values,
+        bp_commitments,
+        values,
+        bp_blinds,
+        c_u_hex,
+        c_y_hex,
+        c_d_hex,
+        r_u,
+        rho_y,
+        r_d,
+        query_ctx,
+        LinkLayout::Full { m: deltas.len() },
+    )
+}
+
+fn prove_link_with_layout(
+    srs: &Srs,
+    deltas: &[Delta],
+    x_values: &[Fr],
+    bp_commitments: &[BpG1],
+    values: &[Fr],
+    bp_blinds: &[BpScalar],
+    c_u_hex: &str,
+    c_y_hex: &str,
+    c_d_hex: &str,
+    r_u: Fr,
+    rho_y: Fr,
+    r_d: Fr,
+    query_ctx: Option<&QueryContext>,
+    layout: LinkLayout,
 ) -> Result<LinkProof, String> {
     let m = deltas.len();
     let pc_gens = PedersenGens::default();
@@ -225,13 +540,18 @@ fn prove_link(
         })
         .collect::<Vec<_>>();
 
-    let r_u_ext = external_u_commit(&t_values[0..m], t_r_u);
-    let r_y_ext = external_y_commit(srs, &witness.x_values, &t_values[m..2 * m], t_rho_y, query_ctx)?;
-    let r_d_ext = crate::commitment::commit_balance(0, Fr::zero())
-        + crate::commitment::derive_generator("balance-v", 0)
-            .mul_bigint(t_values[4 * m].into_bigint())
-        + crate::commitment::derive_generator("balance-h", 0)
-            .mul_bigint(t_r_d.into_bigint());
+    let r_u_ext = external_u_commit(link_u_values(&t_values, &layout), t_r_u);
+    let r_y_ext = match layout {
+        LinkLayout::Full { .. } | LinkLayout::ZeroTest { .. } => {
+            external_y_commit(srs, x_values, link_y_values(&t_values, &layout), t_rho_y, query_ctx)?
+        }
+        LinkLayout::Projection { .. } => ArkG1::zero(),
+    };
+    let r_d_ext = match layout {
+        LinkLayout::Full { m } => external_d_commit(t_values[4 * m], t_r_d),
+        LinkLayout::Projection { m } => external_d_commit(t_values[m], t_r_d),
+        LinkLayout::ZeroTest { .. } => ArkG1::zero(),
+    };
 
     let challenge = link_challenge(
         deltas,
@@ -280,8 +600,35 @@ fn verify_link(
     c_d_hex: &str,
     proof: &LinkProof,
 ) -> Result<(), String> {
-    let m = deltas.len();
-    let expected_len = 4 * m + 1;
+    verify_link_with_layout(
+        srs,
+        deltas,
+        x_values,
+        bp_commitments,
+        c_u_hex,
+        c_y_hex,
+        c_d_hex,
+        proof,
+        LinkLayout::Full { m: deltas.len() },
+    )
+}
+
+fn verify_link_with_layout(
+    srs: &Srs,
+    deltas: &[Delta],
+    x_values: &[Fr],
+    bp_commitments: &[BpG1],
+    c_u_hex: &str,
+    c_y_hex: &str,
+    c_d_hex: &str,
+    proof: &LinkProof,
+    layout: LinkLayout,
+) -> Result<(), String> {
+    let expected_len = match layout {
+        LinkLayout::Full { m } => 4 * m + 1,
+        LinkLayout::ZeroTest { m } => 4 * m,
+        LinkLayout::Projection { m } => m + 1,
+    };
     if proof.s_values.len() != expected_len
         || proof.s_bp_blinds.len() != expected_len
         || proof.r_bp.len() != expected_len
@@ -312,26 +659,57 @@ fn verify_link(
     }
 
     let c_u = point_g1_from_hex(c_u_hex)?;
-    let c_y = point_g1_from_hex(c_y_hex)?;
-    let c_d = point_g1_from_hex(c_d_hex)?;
-    let lhs_u = external_u_commit(&proof.s_values[0..m], proof.s_r_u);
+    let c_y = if c_y_hex.is_empty() {
+        ArkG1::zero()
+    } else {
+        point_g1_from_hex(c_y_hex)?
+    };
+    let c_d = if c_d_hex.is_empty() {
+        ArkG1::zero()
+    } else {
+        point_g1_from_hex(c_d_hex)?
+    };
+    let lhs_u = external_u_commit(link_u_values(&proof.s_values, &layout), proof.s_r_u);
     let rhs_u = proof.r_u_ext + c_u.mul_bigint(challenge.into_bigint());
     if lhs_u != rhs_u {
         return Err("link proof C_U equation failed".to_string());
     }
 
-    let lhs_y = external_y_commit(srs, x_values, &proof.s_values[m..2 * m], proof.s_rho_y, None)?;
-    let rhs_y = proof.r_y_ext + c_y.mul_bigint(challenge.into_bigint());
-    if lhs_y != rhs_y {
-        return Err("link proof C_Y equation failed".to_string());
+    match layout {
+        LinkLayout::Full { .. } | LinkLayout::ZeroTest { .. } => {
+            let lhs_y = external_y_commit(srs, x_values, link_y_values(&proof.s_values, &layout), proof.s_rho_y, None)?;
+            let rhs_y = proof.r_y_ext + c_y.mul_bigint(challenge.into_bigint());
+            if lhs_y != rhs_y {
+                return Err("link proof C_Y equation failed".to_string());
+            }
+        }
+        LinkLayout::Projection { .. } => {
+            if proof.r_y_ext != ArkG1::zero() || c_y != ArkG1::zero() {
+                return Err("projection link proof expected empty C_Y".to_string());
+            }
+        }
     }
 
-    let lhs_d = crate::commitment::derive_generator("balance-v", 0)
-        .mul_bigint(proof.s_values[4 * m].into_bigint())
-        + crate::commitment::derive_generator("balance-h", 0).mul_bigint(proof.s_r_d.into_bigint());
-    let rhs_d = proof.r_d_ext + c_d.mul_bigint(challenge.into_bigint());
-    if lhs_d != rhs_d {
-        return Err("link proof C_D equation failed".to_string());
+    match layout {
+        LinkLayout::Full { m } => {
+            let lhs_d = external_d_commit(proof.s_values[4 * m], proof.s_r_d);
+            let rhs_d = proof.r_d_ext + c_d.mul_bigint(challenge.into_bigint());
+            if lhs_d != rhs_d {
+                return Err("link proof C_D equation failed".to_string());
+            }
+        }
+        LinkLayout::Projection { m } => {
+            let lhs_d = external_d_commit(proof.s_values[m], proof.s_r_d);
+            let rhs_d = proof.r_d_ext + c_d.mul_bigint(challenge.into_bigint());
+            if lhs_d != rhs_d {
+                return Err("projection link proof C_D equation failed".to_string());
+            }
+        }
+        LinkLayout::ZeroTest { .. } => {
+            if c_d != ArkG1::zero() || proof.r_d_ext != ArkG1::zero() {
+                return Err("zero-test link proof expected empty C_D".to_string());
+            }
+        }
     }
 
     Ok(())
@@ -347,10 +725,31 @@ fn flatten_values(witness: &UpdateWitness) -> Vec<Fr> {
     values
 }
 
+fn flatten_zero_test_values(witness: &UpdateWitness) -> Vec<Fr> {
+    let mut values = Vec::with_capacity(witness.u_values.len() * 4);
+    values.extend_from_slice(&witness.u_values);
+    values.extend_from_slice(&witness.y_values);
+    values.extend_from_slice(&witness.z_values);
+    values.extend_from_slice(&witness.w_values);
+    values
+}
+
+fn flatten_projection_values(u_values: &[Fr], d_value: i128) -> Vec<Fr> {
+    let mut values = Vec::with_capacity(u_values.len() + 1);
+    values.extend_from_slice(u_values);
+    values.push(common::crypto::scalar_from_i128(d_value));
+    values
+}
+
 fn external_u_commit(values: &[Fr], blind: Fr) -> ArkG1 {
     let bases = generator_window("membership-u", values.len());
     ArkG1::msm_unchecked(&bases, values)
         + derive_generator("membership-h", 0).mul_bigint(blind.into_bigint())
+}
+
+fn external_d_commit(value: Fr, blind: Fr) -> ArkG1 {
+    crate::commitment::derive_generator("balance-v", 0).mul_bigint(value.into_bigint())
+        + crate::commitment::derive_generator("balance-h", 0).mul_bigint(blind.into_bigint())
 }
 
 fn external_y_commit(
@@ -372,6 +771,47 @@ fn external_y_commit(
     let i_poly = ctx.interpolate(values)?;
     let j_poly = i_poly.add(&z_poly.mul_scalar(blind));
     commit_g1(srs, &j_poly)
+}
+
+fn link_u_values<'a>(values: &'a [Fr], layout: &LinkLayout) -> &'a [Fr] {
+    match layout {
+        LinkLayout::Full { m } => &values[0..*m],
+        LinkLayout::ZeroTest { m } => &values[0..*m],
+        LinkLayout::Projection { m } => &values[0..*m],
+    }
+}
+
+fn link_y_values<'a>(values: &'a [Fr], layout: &LinkLayout) -> &'a [Fr] {
+    match layout {
+        LinkLayout::Full { m } => &values[*m..2 * *m],
+        LinkLayout::ZeroTest { m } => &values[*m..2 * *m],
+        LinkLayout::Projection { .. } => &[],
+    }
+}
+
+fn append_zero_test_public_to_transcript(
+    transcript: &mut Transcript,
+    c_u: &str,
+    c_y: &str,
+    deltas: &[Delta],
+) {
+    append_public_to_transcript(transcript, c_u, c_y, "", deltas);
+}
+
+fn append_projection_public_to_transcript(
+    transcript: &mut Transcript,
+    c_u: &str,
+    c_d: &str,
+    deltas: &[Delta],
+) {
+    transcript.append_message(b"dom-sep", b"dynamic-poa-projection-relation");
+    transcript.append_u64(b"m", deltas.len() as u64);
+    transcript.append_message(b"C_U", c_u.as_bytes());
+    transcript.append_message(b"C_D", c_d.as_bytes());
+    for delta in deltas {
+        transcript.append_message(b"addr", delta.address.as_bytes());
+        transcript.append_message(b"delta", &delta.delta.to_le_bytes());
+    }
 }
 
 fn append_public_to_transcript(transcript: &mut Transcript, c_u: &str, c_y: &str, c_d: &str, deltas: &[Delta]) {

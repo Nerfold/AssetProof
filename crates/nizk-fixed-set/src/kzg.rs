@@ -1,6 +1,6 @@
 use ark_bls12_381::{Bls12_381, Fr, G1Affine, G1Projective, G2Affine, G2Projective};
-use ark_ec::{pairing::Pairing, AffineRepr, CurveGroup, VariableBaseMSM};
-use ark_ff::Zero;
+use ark_ec::{pairing::Pairing, AffineRepr, CurveGroup, PrimeGroup, VariableBaseMSM};
+use ark_ff::{PrimeField, Zero};
 
 use common::crypto::{g1_mul_generator, g2_mul_generator, hash_to_scalar};
 
@@ -76,4 +76,42 @@ pub fn verify_batch(
     let lhs = Bls12_381::pairing((*accumulator - *c_y).into_affine(), G2Affine::generator());
     let rhs = Bls12_381::pairing(eval_proof.into_affine(), z_commit_g2.into_affine());
     lhs == rhs
+}
+
+pub fn verify_batch_many(
+    accumulators: &[G1Projective],
+    c_y_values: &[G1Projective],
+    eval_proofs: &[G1Projective],
+    z_commit_g2: &G2Projective,
+    transcript_seed: &[u8],
+) -> Result<bool, String> {
+    if accumulators.len() != c_y_values.len() || accumulators.len() != eval_proofs.len() {
+        return Err("KZG batch vector length mismatch".to_string());
+    }
+    if accumulators.is_empty() {
+        return Err("KZG batch must contain at least one opening".to_string());
+    }
+
+    let mut lhs = G1Projective::zero();
+    let mut rhs = G1Projective::zero();
+    for index in 0..accumulators.len() {
+        let beta = batch_randomizer(transcript_seed, index);
+        lhs += (accumulators[index] - c_y_values[index]).mul_bigint(beta.into_bigint());
+        rhs += eval_proofs[index].mul_bigint(beta.into_bigint());
+    }
+
+    Ok(Bls12_381::pairing(lhs.into_affine(), G2Affine::generator())
+        == Bls12_381::pairing(rhs.into_affine(), z_commit_g2.into_affine()))
+}
+
+fn batch_randomizer(seed: &[u8], index: usize) -> Fr {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"dynamic-poa-parallel-kzg-batch");
+    hasher.update(seed);
+    hasher.update(&(index as u64).to_le_bytes());
+    let mut beta = Fr::from_le_bytes_mod_order(hasher.finalize().as_bytes());
+    if beta.is_zero() {
+        beta = Fr::from((index as u64) + 1);
+    }
+    beta
 }

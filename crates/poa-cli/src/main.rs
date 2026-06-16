@@ -7,16 +7,21 @@ use ark_bls12_381::Fr;
 use ark_ff::Zero;
 use common::crypto::{hash_to_scalar, point_g1_to_hex};
 use common::io::{
-    read_delta_csv, read_init, read_init_witness_csv, read_proof, read_reserve_csv, read_smt_proof, read_smt_state,
-    read_srs, read_srs_g1_prefix, read_srs_prefix, read_state, write_init, write_proof, write_smt_proof,
-    write_smt_state, write_srs, write_state,
+    read_delta_csv, read_init, read_init_witness_csv, read_parallel_init, read_parallel_proof,
+    read_parallel_state, read_proof, read_reserve_csv, read_smt_proof, read_smt_state, read_srs,
+    read_srs_g1_prefix, read_srs_prefix, read_state, write_init, write_parallel_init,
+    write_parallel_proof, write_parallel_state, write_proof, write_smt_proof, write_smt_state, write_srs,
+    write_state,
 };
-use common::types::{Delta, InitProvingContext, StoredState};
+use common::types::{Delta, InitProvingContext, StoredParallelState, StoredState};
 use mock_chain::generator::{generate_scenario, load_manifest, write_scenario};
 use nizk_fixed_set::commitment::commit_balance;
 use nizk_fixed_set::init_proof::initialize_with_proof;
 use nizk_fixed_set::kzg::commit_g1;
 use nizk_fixed_set::kzg::Srs;
+use nizk_fixed_set::parallel::{
+    apply_parallel_update, initialize_parallel, verify_parallel_init, verify_parallel_update,
+};
 use nizk_fixed_set::polynomial::Polynomial;
 use nizk_fixed_set::update::apply_update;
 use nizk_fixed_set::verifier::{verify_init, verify_update};
@@ -212,6 +217,70 @@ fn real_main() -> Result<(), String> {
                 state_path.display(),
                 degree,
                 srs.max_degree
+            );
+        }
+        "parallel-init" => {
+            if args.len() != 8 {
+                return Err(
+                    "usage: poa-cli parallel-init <srs.bin> <reserves.csv> <state-root> <shards> <state.txt> <init-proof.txt>"
+                        .to_string(),
+                );
+            }
+            let srs = load_srs(Path::new(&args[2]))?;
+            let reserves = read_reserve_csv(Path::new(&args[3]))?;
+            let shards = args[5]
+                .parse::<usize>()
+                .map_err(|err| format!("invalid shards: {err}"))?;
+            let init = initialize_parallel(&reserves, &args[4], &srs, shards)?;
+            write_parallel_state(Path::new(&args[6]), &init.state)?;
+            write_parallel_init(Path::new(&args[7]), &init.proof)?;
+            println!(
+                "parallel initialized shards={}, balance_total={}, state_root={}",
+                init.state.shards.len(),
+                init.state.balance_total,
+                init.state.state_root
+            );
+        }
+        "parallel-update" => {
+            if args.len() != 8 {
+                return Err(
+                    "usage: poa-cli parallel-update <srs.bin> <state.txt> <deltas.csv> <new-state-root> <next-state.txt> <proof.txt>"
+                        .to_string(),
+                );
+            }
+            let state = read_parallel_state(Path::new(&args[3]))?;
+            let deltas = read_delta_csv(Path::new(&args[4]))?;
+            let srs = load_srs_for_update(Path::new(&args[2]), &flatten_parallel_state(&state), deltas.len())?;
+            let updated = apply_parallel_update(&srs, &state, &deltas, &args[5])?;
+            write_parallel_state(Path::new(&args[6]), &updated.next_state)?;
+            write_parallel_proof(Path::new(&args[7]), &updated.proof)?;
+            println!(
+                "parallel updated shards={}, m={}, aggregate_delta={}",
+                updated.next_state.shards.len(),
+                deltas.len(),
+                updated.proof.d_value
+            );
+        }
+        "parallel-verify" => {
+            if args.len() != 8 {
+                return Err(
+                    "usage: poa-cli parallel-verify <srs.bin> <old-state.txt> <deltas.csv> <new-state.txt> <proof.txt> <init-proof.txt>"
+                        .to_string(),
+                );
+            }
+            let old_state = read_parallel_state(Path::new(&args[3]))?;
+            let deltas = read_delta_csv(Path::new(&args[4]))?;
+            let new_state = read_parallel_state(Path::new(&args[5]))?;
+            let proof = read_parallel_proof(Path::new(&args[6]))?;
+            let init = read_parallel_init(Path::new(&args[7]))?;
+            let srs = load_srs_for_parallel_state(Path::new(&args[2]), &old_state, deltas.len())?;
+            verify_parallel_init(&srs, &old_state, &init)?;
+            verify_parallel_update(&srs, &old_state, &deltas, &new_state, &proof)?;
+            println!(
+                "parallel verification passed for shards={}, m={}, new_balance_total={}",
+                old_state.shards.len(),
+                deltas.len(),
+                new_state.balance_total
             );
         }
         "update" => {
@@ -750,6 +819,22 @@ fn load_srs_for_update(path: &Path, state: &StoredState, modified: usize) -> Res
     load_srs_prefix(path, needed_g1_len, needed_g2_len)
 }
 
+fn load_srs_for_parallel_state(
+    path: &Path,
+    state: &StoredParallelState,
+    modified: usize,
+) -> Result<Srs, String> {
+    let needed_g1_len = state
+        .shards
+        .iter()
+        .map(|shard| shard.masked_polynomial_coeffs.len())
+        .max()
+        .unwrap_or(1)
+        .max(modified + 1);
+    let needed_g2_len = modified + 1;
+    load_srs_prefix(path, needed_g1_len, needed_g2_len)
+}
+
 fn load_srs_for_verify(path: &Path, modified: usize) -> Result<Srs, String> {
     let needed_len = modified + 1;
     load_srs_prefix(path, needed_len, needed_len)
@@ -757,6 +842,27 @@ fn load_srs_for_verify(path: &Path, modified: usize) -> Result<Srs, String> {
 
 fn load_srs_for_init_verify(path: &Path, state: &StoredState) -> Result<Srs, String> {
     load_srs_prefix(path, state.masked_polynomial_coeffs.len(), state.masked_polynomial_coeffs.len())
+}
+
+fn flatten_parallel_state(state: &StoredParallelState) -> StoredState {
+    let max_coeff_len = state
+        .shards
+        .iter()
+        .map(|shard| shard.masked_polynomial_coeffs.len())
+        .max()
+        .unwrap_or(1);
+    StoredState {
+        state_root: state.state_root.clone(),
+        srs_max_degree: state.srs_max_degree,
+        alpha: Fr::from(1u64),
+        reserve_addresses: Vec::new(),
+        reserve_balances: Vec::new(),
+        masked_polynomial_coeffs: vec![Fr::zero(); max_coeff_len],
+        accumulator_hex: String::new(),
+        balance_total: state.balance_total,
+        balance_blind: state.balance_blind,
+        balance_commitment_hex: state.balance_commitment_hex.clone(),
+    }
 }
 
 fn print_usage() {
@@ -768,6 +874,9 @@ fn print_usage() {
     println!("  poa-cli prepare-run <run-dir> <max-degree> <reserves.csv> <state-root> <state.txt> <init-proof.txt>");
     println!("  poa-cli prepare-synthetic-run <run-dir> <degree> <state-root> <state.txt>");
     println!("  poa-cli prepare-synthetic-state <srs.bin> <degree> <state-root> <state.txt>");
+    println!("  poa-cli parallel-init <srs.bin> <reserves.csv> <state-root> <shards> <state.txt> <init-proof.txt>");
+    println!("  poa-cli parallel-update <srs.bin> <state.txt> <deltas.csv> <new-state-root> <next-state.txt> <proof.txt>");
+    println!("  poa-cli parallel-verify <srs.bin> <old-state.txt> <deltas.csv> <new-state.txt> <proof.txt> <init-proof.txt>");
     println!("  poa-cli update <srs.bin> <state.txt> <deltas.csv> <new-state-root> <next-state.txt> <proof.txt>");
     println!("  poa-cli continue-run <run-dir> <current-state.txt> <deltas.csv> <new-state-root> <next-state.txt>");
     println!("  poa-cli continue-synthetic-run <run-dir> <current-state.txt> <modified-addresses> <new-state-root> <next-state.txt>");

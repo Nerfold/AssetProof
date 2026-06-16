@@ -152,6 +152,70 @@ pub struct StoredProof {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredParallelShardState {
+    pub shard_id: usize,
+    pub alpha: Fr,
+    pub reserve_addresses: Vec<String>,
+    pub reserve_balances: Vec<i128>,
+    pub masked_polynomial_coeffs: Vec<Fr>,
+    pub accumulator_hex: String,
+    pub balance_total: i128,
+    pub balance_blind: Fr,
+    pub balance_commitment_hex: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredParallelState {
+    pub state_root: String,
+    pub srs_max_degree: usize,
+    pub shards: Vec<StoredParallelShardState>,
+    pub balance_total: i128,
+    pub balance_blind: Fr,
+    pub balance_commitment_hex: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredParallelShardProof {
+    pub shard_id: usize,
+    pub c_u_hex: String,
+    pub c_y_hex: String,
+    pub eval_proof_hex: String,
+    pub r_u: Fr,
+    pub rho_y: Fr,
+    pub d_value: i128,
+    pub gate_count: usize,
+    pub bp_proof_hex: String,
+    pub bp_commitments_hex: String,
+    pub link_proof_hex: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredParallelProof {
+    pub old_state_root: String,
+    pub new_state_root: String,
+    pub shard_proofs: Vec<StoredParallelShardProof>,
+    pub c_u_hex: String,
+    pub c_d_hex: String,
+    pub d_value: i128,
+    pub r_u: Fr,
+    pub r_d: Fr,
+    pub projection_bp_proof_hex: String,
+    pub projection_bp_commitments_hex: String,
+    pub projection_link_proof_hex: String,
+    pub transcript_hex: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredParallelInitProof {
+    pub state_root: String,
+    pub shard_proofs: Vec<StoredInitProof>,
+    pub balance_total: i128,
+    pub balance_blind: Fr,
+    pub balance_commitment_hex: String,
+    pub transcript_hex: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SmtLeafRecord {
     pub address: String,
     pub balance: i128,

@@ -529,6 +529,56 @@ fn real_main() -> Result<(), String> {
             println!("aggregate_delta={}", updated.proof.d_value);
             println!("gate_count={}", updated.proof.gate_count);
         }
+        "parallel-synthetic-update-bench" => {
+            if args.len() != 6 {
+                return Err(
+                    "usage: poa-cli parallel-synthetic-update-bench <srs.bin> <degree> <modified-addresses> <shards>"
+                        .to_string(),
+                );
+            }
+            let degree = args[3]
+                .parse::<usize>()
+                .map_err(|err| format!("invalid degree: {err}"))?;
+            let modified = args[4]
+                .parse::<usize>()
+                .map_err(|err| format!("invalid modified-addresses: {err}"))?;
+            let shards = args[5]
+                .parse::<usize>()
+                .map_err(|err| format!("invalid shards: {err}"))?;
+            if shards == 0 {
+                return Err("shards must be greater than zero".to_string());
+            }
+            let shard_degree = degree.div_ceil(shards);
+            let needed_degree = shard_degree.max(modified);
+            let srs = load_srs_prefix(Path::new(&args[2]), needed_degree + 1, modified + 1)?;
+
+            let state_start = Instant::now();
+            let state = build_parallel_synthetic_state(&srs, degree, shards)?;
+            let deltas = build_synthetic_deltas(modified);
+            let state_elapsed = state_start.elapsed();
+            eprintln!("stage=parallel_state_complete millis={}", state_elapsed.as_millis());
+
+            let update_start = Instant::now();
+            let updated = apply_parallel_update(&srs, &state, &deltas, "parallel-synthetic-next-root")?;
+            let update_elapsed = update_start.elapsed();
+            eprintln!("stage=parallel_update_complete millis={}", update_elapsed.as_millis());
+
+            let verify_start = Instant::now();
+            verify_parallel_update(&srs, &state, &deltas, &updated.next_state, &updated.proof)?;
+            let verify_elapsed = verify_start.elapsed();
+            eprintln!("stage=parallel_verify_complete millis={}", verify_elapsed.as_millis());
+
+            println!("synthetic_degree={degree}");
+            println!("modified_addresses={modified}");
+            println!("shards={}", state.shards.len());
+            println!("shard_degree={shard_degree}");
+            println!("state_build_millis={}", state_elapsed.as_millis());
+            println!("update_millis={}", update_elapsed.as_millis());
+            println!("verify_millis={}", verify_elapsed.as_millis());
+            println!("aggregate_delta={}", updated.proof.d_value);
+            println!("zero_test_gate_count={}", updated.proof.shard_proofs.iter().map(|proof| proof.gate_count).sum::<usize>());
+            println!("projection_gate_count={}", modified);
+        }
         "smt-init" => {
             if args.len() != 6 {
                 return Err("usage: poa-cli smt-init <depth> <reserves.csv> <state-root> <state.txt>".to_string());
@@ -885,6 +935,7 @@ fn print_usage() {
     println!("  poa-cli mock-gen <out-dir> <num-accounts> <num-reserves> <num-blocks> <txs-per-block> <seed>");
     println!("  poa-cli mock-bench <srs.bin> <manifest.txt> <report.txt>");
     println!("  poa-cli synthetic-update-bench <srs.bin> <degree> <modified-addresses>");
+    println!("  poa-cli parallel-synthetic-update-bench <srs.bin> <degree> <modified-addresses> <shards>");
     println!("  poa-cli smt-init <depth> <reserves.csv> <state-root> <state.txt>");
     println!("  poa-cli smt-update <state.txt> <deltas.csv> <new-state-root> <next-state.txt> <proof.txt>");
     println!("  poa-cli smt-insert <state.txt> <address> <balance> <new-state-root> <next-state.txt> <proof.txt>");
@@ -922,6 +973,62 @@ fn build_synthetic_state(srs: &Srs, degree: usize) -> Result<StoredState, String
         reserve_balances: Vec::new(),
         masked_polynomial_coeffs: poly.coeffs,
         accumulator_hex: point_g1_to_hex(&accumulator)?,
+        balance_total: 0,
+        balance_blind: Fr::zero(),
+        balance_commitment_hex: point_g1_to_hex(&balance_commitment)?,
+    })
+}
+
+fn build_parallel_synthetic_state(
+    srs: &Srs,
+    degree: usize,
+    shards: usize,
+) -> Result<StoredParallelState, String> {
+    let active_shards = shards.max(1);
+    let base = degree / active_shards;
+    let remainder = degree % active_shards;
+    let mut shard_states = Vec::with_capacity(active_shards);
+    let mut balance_commitment = commit_balance(0, Fr::zero());
+
+    for shard_id in 0..active_shards {
+        let shard_degree = base + usize::from(shard_id < remainder);
+        let mut coeffs = Vec::with_capacity(shard_degree + 1);
+        for index in 0..shard_degree {
+            let payload = format!("{shard_id}:{index}");
+            coeffs.push(hash_to_scalar("parallel-synthetic-poly", payload.as_bytes()));
+        }
+        let leading = {
+            let payload = format!("{shard_id}:{shard_degree}");
+            let scalar = hash_to_scalar("parallel-synthetic-poly-leading", payload.as_bytes());
+            if scalar.is_zero() {
+                Fr::from(1u64)
+            } else {
+                scalar
+            }
+        };
+        coeffs.push(leading);
+
+        let poly = Polynomial::from_coeffs(coeffs);
+        let accumulator = commit_g1(srs, &poly)?;
+        let shard_balance_commitment = commit_balance(0, Fr::zero());
+        balance_commitment += shard_balance_commitment;
+        shard_states.push(common::types::StoredParallelShardState {
+            shard_id,
+            alpha: Fr::from(1u64),
+            reserve_addresses: Vec::new(),
+            reserve_balances: Vec::new(),
+            masked_polynomial_coeffs: poly.coeffs,
+            accumulator_hex: point_g1_to_hex(&accumulator)?,
+            balance_total: 0,
+            balance_blind: Fr::zero(),
+            balance_commitment_hex: point_g1_to_hex(&shard_balance_commitment)?,
+        });
+    }
+
+    Ok(StoredParallelState {
+        state_root: "parallel-synthetic-root".to_string(),
+        srs_max_degree: srs.max_degree,
+        shards: shard_states,
         balance_total: 0,
         balance_blind: Fr::zero(),
         balance_commitment_hex: point_g1_to_hex(&balance_commitment)?,

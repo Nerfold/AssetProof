@@ -2,7 +2,7 @@
 members = [
     "crates/common",
     "crates/mock-chain",
-    "crates/nizk-fixed-set",
+    "crates/nizk",
     "crates/smt",
     "crates/smt-bench",
     "crates/sp1-programs/common",

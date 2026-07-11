@@ -66,7 +66,8 @@ pub fn run_synthetic_bench(
 
     let post_update_balance_total = update_state.balance_total;
     let insert_start = Instant::now();
-    let _insert_proof = apply_insert_in_place(&mut update_state, "smt-bench-root-2", &insert_witness)?;
+    let _insert_proof =
+        apply_insert_in_place(&mut update_state, "smt-bench-root-2", &insert_witness)?;
     let insert_elapsed = insert_start.elapsed();
 
     Ok(SmtBenchResult {

@@ -8,10 +8,10 @@ use ark_ff::Zero;
 use common::crypto::{hash_to_scalar, point_g1_to_hex};
 use common::io::{
     read_delta_csv, read_init, read_init_witness_csv, read_parallel_init, read_parallel_proof,
-    read_parallel_state, read_proof, read_reserve_csv, read_smt_proof, read_smt_state, read_srs,
-    read_srs_g1_prefix, read_srs_prefix, read_state, write_init, write_parallel_init,
-    write_parallel_proof, write_parallel_state, write_proof, write_smt_proof, write_smt_state, write_srs,
-    write_state,
+    read_parallel_state, read_proof, read_public_state, read_reserve_csv, read_smt_proof,
+    read_smt_state, read_srs, read_srs_g1_prefix, read_srs_prefix, read_state, write_init,
+    write_parallel_init, write_parallel_proof, write_parallel_state, write_proof,
+    write_public_state, write_smt_proof, write_smt_state, write_srs, write_state,
 };
 use common::types::{Delta, InitProvingContext, StoredParallelState, StoredState};
 use mock_chain::generator::{generate_scenario, load_manifest, write_scenario};
@@ -24,12 +24,12 @@ use nizk_fixed_set::parallel::{
 };
 use nizk_fixed_set::polynomial::Polynomial;
 use nizk_fixed_set::update::apply_update;
-use nizk_fixed_set::verifier::{verify_init, verify_update};
+use nizk_fixed_set::verifier::{verify_init_debug, verify_update, verify_update_debug};
 use smt::insert::build_insert_witness;
 use smt::leaf::Leaf;
 use smt::state::SmtState;
-use sp1_host::setup::default_setup_dir;
 use sp1_host::insert::{build_and_execute_insert, prove_insert, verify_insert_proof};
+use sp1_host::setup::default_setup_dir;
 use sp1_host::update::{
     build_and_execute_update, build_and_prove_update, ensure_sp1_setup,
     verify_update_proof as verify_smt_update_proof,
@@ -69,7 +69,12 @@ fn real_main() -> Result<(), String> {
                 .parse::<usize>()
                 .map_err(|err| format!("invalid max-degree: {err}"))?;
             let srs = Srs::setup(max_degree, b"dynamic-poa-srs");
-            write_srs(Path::new(&args[3]), srs.max_degree, &srs.tau_g1_powers, &srs.tau_g2_powers)?;
+            write_srs(
+                Path::new(&args[3]),
+                srs.max_degree,
+                &srs.tau_g1_powers,
+                &srs.tau_g2_powers,
+            )?;
             println!("wrote SRS with max_degree={} to {}", max_degree, args[3]);
         }
         "init" => {
@@ -82,7 +87,9 @@ fn real_main() -> Result<(), String> {
             let srs = load_srs(Path::new(&args[2]))?;
             let reserves = read_reserve_csv(Path::new(&args[3]))?;
             let init = initialize_with_proof(&reserves, &args[4], &srs)?;
-            write_state(Path::new(&args[5]), &init.state)?;
+            let state_path = Path::new(&args[5]);
+            write_state(state_path, &init.state)?;
+            write_public_state(&public_state_path(state_path), &init.state.public_state())?;
             write_init(Path::new(&args[6]), &init.proof)?;
             println!(
                 "initialized n={}, balance_total={}, state_root={}",
@@ -105,8 +112,11 @@ fn real_main() -> Result<(), String> {
                 state_root: args[5].clone(),
                 session_id: args[6].clone(),
             };
-            let init = nizk_fixed_set::init_proof::initialize_from_witnesses(&ctx, &witnesses, &srs)?;
-            write_state(Path::new(&args[7]), &init.state)?;
+            let init =
+                nizk_fixed_set::init_proof::initialize_from_witnesses(&ctx, &witnesses, &srs)?;
+            let state_path = Path::new(&args[7]);
+            write_state(state_path, &init.state)?;
+            write_public_state(&public_state_path(state_path), &init.state.public_state())?;
             write_init(Path::new(&args[8]), &init.proof)?;
             println!(
                 "initialized mock-owned n={}, balance_total={}, chain_id={}, state_root={}",
@@ -124,7 +134,8 @@ fn real_main() -> Result<(), String> {
                 );
             }
             let run_dir = Path::new(&args[2]);
-            fs::create_dir_all(run_dir).map_err(|err| format!("create {}: {err}", run_dir.display()))?;
+            fs::create_dir_all(run_dir)
+                .map_err(|err| format!("create {}: {err}", run_dir.display()))?;
 
             let max_degree = args[3]
                 .parse::<usize>()
@@ -132,7 +143,12 @@ fn real_main() -> Result<(), String> {
             let srs_path = run_dir.join("srs.bin");
             if !srs_path.exists() {
                 let srs = Srs::setup(max_degree, b"dynamic-poa-srs");
-                write_srs(&srs_path, srs.max_degree, &srs.tau_g1_powers, &srs.tau_g2_powers)?;
+                write_srs(
+                    &srs_path,
+                    srs.max_degree,
+                    &srs.tau_g1_powers,
+                    &srs.tau_g2_powers,
+                )?;
                 println!("generated srs at {}", srs_path.display());
             } else {
                 println!("reusing existing srs at {}", srs_path.display());
@@ -143,6 +159,7 @@ fn real_main() -> Result<(), String> {
             let init = initialize_with_proof(&reserves, &args[5], &srs)?;
             let state_path = Path::new(&args[6]);
             write_state(state_path, &init.state)?;
+            write_public_state(&public_state_path(state_path), &init.state.public_state())?;
             write_init(Path::new(&args[7]), &init.proof)?;
             println!(
                 "prepared run: state={}, n={}, balance_total={}",
@@ -159,7 +176,8 @@ fn real_main() -> Result<(), String> {
                 );
             }
             let run_dir = Path::new(&args[2]);
-            fs::create_dir_all(run_dir).map_err(|err| format!("create {}: {err}", run_dir.display()))?;
+            fs::create_dir_all(run_dir)
+                .map_err(|err| format!("create {}: {err}", run_dir.display()))?;
 
             let degree = args[3]
                 .parse::<usize>()
@@ -167,7 +185,12 @@ fn real_main() -> Result<(), String> {
             let srs_path = run_dir.join("srs.bin");
             if !srs_path.exists() {
                 let srs = Srs::setup(degree, b"dynamic-poa-srs");
-                write_srs(&srs_path, srs.max_degree, &srs.tau_g1_powers, &srs.tau_g2_powers)?;
+                write_srs(
+                    &srs_path,
+                    srs.max_degree,
+                    &srs.tau_g1_powers,
+                    &srs.tau_g2_powers,
+                )?;
                 println!("generated srs at {}", srs_path.display());
             } else {
                 println!("reusing existing srs at {}", srs_path.display());
@@ -184,6 +207,7 @@ fn real_main() -> Result<(), String> {
             state.state_root = args[4].clone();
             let state_path = Path::new(&args[5]);
             write_state(state_path, &state)?;
+            write_public_state(&public_state_path(state_path), &state.public_state())?;
             println!(
                 "prepared synthetic run: state={}, degree={}, accumulator_bound={}",
                 state_path.display(),
@@ -212,6 +236,7 @@ fn real_main() -> Result<(), String> {
             state.state_root = args[4].clone();
             let state_path = Path::new(&args[5]);
             write_state(state_path, &state)?;
+            write_public_state(&public_state_path(state_path), &state.public_state())?;
             println!(
                 "prepared synthetic state: state={}, degree={}, accumulator_bound={}",
                 state_path.display(),
@@ -250,7 +275,11 @@ fn real_main() -> Result<(), String> {
             }
             let state = read_parallel_state(Path::new(&args[3]))?;
             let deltas = read_delta_csv(Path::new(&args[4]))?;
-            let srs = load_srs_for_update(Path::new(&args[2]), &flatten_parallel_state(&state), deltas.len())?;
+            let srs = load_srs_for_update(
+                Path::new(&args[2]),
+                &flatten_parallel_state(&state),
+                deltas.len(),
+            )?;
             let updated = apply_parallel_update(&srs, &state, &deltas, &args[5])?;
             write_parallel_state(Path::new(&args[6]), &updated.next_state)?;
             write_parallel_proof(Path::new(&args[7]), &updated.proof)?;
@@ -294,12 +323,17 @@ fn real_main() -> Result<(), String> {
             let deltas = read_delta_csv(Path::new(&args[4]))?;
             let srs = load_srs_for_update(Path::new(&args[2]), &state, deltas.len())?;
             let updated = apply_update(&srs, &state, &deltas, &args[5])?;
-            write_state(Path::new(&args[6]), &updated.next_state)?;
+            let next_state_path = Path::new(&args[6]);
+            write_state(next_state_path, &updated.next_state)?;
+            write_public_state(
+                &public_state_path(next_state_path),
+                &updated.next_state.public_state(),
+            )?;
             write_proof(Path::new(&args[7]), &updated.proof)?;
             println!(
                 "updated m={}, aggregate_delta={}, gate_count={}",
                 deltas.len(),
-                updated.proof.d_value,
+                updated.aggregate_delta,
                 updated.proof.gate_count
             );
         }
@@ -319,15 +353,20 @@ fn real_main() -> Result<(), String> {
             let deltas = read_delta_csv(Path::new(&args[4]))?;
             let srs = load_srs_for_update(&srs_path, &state, deltas.len())?;
             let updated = apply_update(&srs, &state, &deltas, &args[5])?;
-            write_state(Path::new(&args[6]), &updated.next_state)?;
-            let proof_path = derive_companion_proof_path(Path::new(&args[6]))?;
+            let next_state_path = Path::new(&args[6]);
+            write_state(next_state_path, &updated.next_state)?;
+            write_public_state(
+                &public_state_path(next_state_path),
+                &updated.next_state.public_state(),
+            )?;
+            let proof_path = derive_companion_proof_path(next_state_path)?;
             write_proof(&proof_path, &updated.proof)?;
             println!(
                 "continued run: next_state={}, proof={}, m={}, aggregate_delta={}",
                 args[6],
                 proof_path.display(),
                 deltas.len(),
-                updated.proof.d_value
+                updated.aggregate_delta
             );
         }
         "continue-synthetic-run" => {
@@ -349,15 +388,20 @@ fn real_main() -> Result<(), String> {
             let srs = load_srs_for_update(&srs_path, &state, modified)?;
             let deltas = build_synthetic_deltas(modified);
             let updated = apply_update(&srs, &state, &deltas, &args[5])?;
-            write_state(Path::new(&args[6]), &updated.next_state)?;
-            let proof_path = derive_companion_proof_path(Path::new(&args[6]))?;
+            let next_state_path = Path::new(&args[6]);
+            write_state(next_state_path, &updated.next_state)?;
+            write_public_state(
+                &public_state_path(next_state_path),
+                &updated.next_state.public_state(),
+            )?;
+            let proof_path = derive_companion_proof_path(next_state_path)?;
             write_proof(&proof_path, &updated.proof)?;
             println!(
                 "continued synthetic run: next_state={}, proof={}, m={}, aggregate_delta={}",
                 args[6],
                 proof_path.display(),
                 deltas.len(),
-                updated.proof.d_value
+                updated.aggregate_delta
             );
         }
         "continue-synthetic-state" => {
@@ -374,15 +418,20 @@ fn real_main() -> Result<(), String> {
             let srs = load_srs_for_update(Path::new(&args[2]), &state, modified)?;
             let deltas = build_synthetic_deltas(modified);
             let updated = apply_update(&srs, &state, &deltas, &args[5])?;
-            write_state(Path::new(&args[6]), &updated.next_state)?;
-            let proof_path = derive_companion_proof_path(Path::new(&args[6]))?;
+            let next_state_path = Path::new(&args[6]);
+            write_state(next_state_path, &updated.next_state)?;
+            write_public_state(
+                &public_state_path(next_state_path),
+                &updated.next_state.public_state(),
+            )?;
+            let proof_path = derive_companion_proof_path(next_state_path)?;
             write_proof(&proof_path, &updated.proof)?;
             println!(
                 "continued synthetic state: next_state={}, proof={}, m={}, aggregate_delta={}",
                 args[6],
                 proof_path.display(),
                 deltas.len(),
-                updated.proof.d_value
+                updated.aggregate_delta
             );
         }
         "verify" => {
@@ -392,19 +441,23 @@ fn real_main() -> Result<(), String> {
                         .to_string(),
                 );
             }
-            let old_state = read_state(Path::new(&args[3]))?;
+            let old_state_path = Path::new(&args[3]);
+            let old_state = read_state(old_state_path)?;
             let deltas = read_delta_csv(Path::new(&args[4]))?;
             let srs = load_srs_for_init_verify(Path::new(&args[2]), &old_state)?;
-            let new_state = read_state(Path::new(&args[5]))?;
+            let new_state_path = Path::new(&args[5]);
+            let new_state = read_state(new_state_path)?;
             let proof = read_proof(Path::new(&args[6]))?;
             let init_proof = read_init(Path::new(&args[7]))?;
-            verify_init(&srs, &old_state, &init_proof)?;
+            verify_init_debug(&srs, &old_state, &init_proof)?;
             let verify_srs = load_srs_for_verify(Path::new(&args[2]), deltas.len())?;
-            verify_update(&verify_srs, &old_state, &deltas, &new_state, &proof)?;
+            let old_public = read_public_state_or_derive(old_state_path, &old_state)?;
+            let new_public = read_public_state_or_derive(new_state_path, &new_state)?;
+            verify_update_debug(&verify_srs, &old_public, &deltas, &new_public, &proof)?;
             println!(
-                "verification passed for m={}, new_balance_total={}",
+                "verification passed for m={}, new_state_root={}",
                 deltas.len(),
-                new_state.balance_total
+                new_public.state_root
             );
         }
         "mock-gen" => {
@@ -416,11 +469,21 @@ fn real_main() -> Result<(), String> {
             }
             let out_dir = Path::new(&args[2]);
             let scenario = generate_scenario(
-                args[7].parse::<u64>().map_err(|err| format!("seed: {err}"))?,
-                args[3].parse::<usize>().map_err(|err| format!("num-accounts: {err}"))?,
-                args[4].parse::<usize>().map_err(|err| format!("num-reserves: {err}"))?,
-                args[5].parse::<usize>().map_err(|err| format!("num-blocks: {err}"))?,
-                args[6].parse::<usize>().map_err(|err| format!("txs-per-block: {err}"))?,
+                args[7]
+                    .parse::<u64>()
+                    .map_err(|err| format!("seed: {err}"))?,
+                args[3]
+                    .parse::<usize>()
+                    .map_err(|err| format!("num-accounts: {err}"))?,
+                args[4]
+                    .parse::<usize>()
+                    .map_err(|err| format!("num-reserves: {err}"))?,
+                args[5]
+                    .parse::<usize>()
+                    .map_err(|err| format!("num-blocks: {err}"))?,
+                args[6]
+                    .parse::<usize>()
+                    .map_err(|err| format!("txs-per-block: {err}"))?,
             )?;
             let manifest_path = write_scenario(out_dir, &scenario)?;
             println!(
@@ -432,7 +495,9 @@ fn real_main() -> Result<(), String> {
         }
         "mock-bench" => {
             if args.len() != 5 {
-                return Err("usage: poa-cli mock-bench <srs.bin> <manifest.txt> <report.txt>".to_string());
+                return Err(
+                    "usage: poa-cli mock-bench <srs.bin> <manifest.txt> <report.txt>".to_string(),
+                );
             }
             let srs = load_srs(Path::new(&args[2]))?;
             let scenario = load_manifest(Path::new(&args[3]))?;
@@ -458,17 +523,23 @@ fn real_main() -> Result<(), String> {
                 total_update_micros += update_start.elapsed().as_micros();
 
                 let verify_start = Instant::now();
-                verify_update(&srs, &current_state, &window.deltas, &updated.next_state, &updated.proof)?;
+                verify_update_debug(
+                    &srs,
+                    &current_state.public_state(),
+                    &window.deltas,
+                    &updated.next_state.public_state(),
+                    &updated.proof,
+                )?;
                 total_verify_micros += verify_start.elapsed().as_micros();
 
                 total_m += window.deltas.len();
-                total_delta += updated.proof.d_value;
+                total_delta += updated.aggregate_delta;
                 report.push_str(&format!(
                     "window_{:04}_m={}\nwindow_{:04}_delta={}\nwindow_{:04}_gate_count={}\n",
                     window.index,
                     window.deltas.len(),
                     window.index,
-                    updated.proof.d_value,
+                    updated.aggregate_delta,
                     window.index,
                     updated.proof.gate_count
                 ));
@@ -492,42 +563,93 @@ fn real_main() -> Result<(), String> {
             );
         }
         "synthetic-update-bench" => {
-            if args.len() != 5 {
+            if !(5..=7).contains(&args.len()) {
                 return Err(
-                    "usage: poa-cli synthetic-update-bench <srs.bin> <degree> <modified-addresses>".to_string(),
+                    "usage: poa-cli synthetic-update-bench <srs.bin> <degree> <modified-addresses> [iterations] [warmup]"
+                        .to_string(),
                 );
             }
-            let srs = load_srs(Path::new(&args[2]))?;
             let degree = args[3]
                 .parse::<usize>()
                 .map_err(|err| format!("invalid degree: {err}"))?;
             let modified = args[4]
                 .parse::<usize>()
                 .map_err(|err| format!("invalid modified-addresses: {err}"))?;
+            let iterations = parse_bench_count(args.get(5), "iterations", 5)?;
+            let warmup = parse_bench_count(args.get(6), "warmup", 1)?;
+
+            warn_debug_benchmark();
+            let srs_start = Instant::now();
+            let srs = load_srs_prefix(Path::new(&args[2]), degree + 1, modified + 1)?;
+            let srs_elapsed = srs_start.elapsed();
+            eprintln!(
+                "phase=setup stage=srs_prefix_load millis={} g1_powers={} g2_powers={}",
+                srs_elapsed.as_millis(),
+                degree + 1,
+                modified + 1
+            );
 
             let state_start = Instant::now();
             let state = build_synthetic_state(&srs, degree)?;
             let deltas = build_synthetic_deltas(modified);
             let state_elapsed = state_start.elapsed();
-            eprintln!("stage=state_complete millis={}", state_elapsed.as_millis());
+            eprintln!(
+                "phase=setup stage=state_build millis={}",
+                state_elapsed.as_millis()
+            );
 
-            let update_start = Instant::now();
-            let updated = apply_update(&srs, &state, &deltas, "synthetic-next-root")?;
-            let update_elapsed = update_start.elapsed();
-            eprintln!("stage=update_complete millis={}", update_elapsed.as_millis());
-
-            let verify_start = Instant::now();
-            verify_update(&srs, &state, &deltas, &updated.next_state, &updated.proof)?;
-            let verify_elapsed = verify_start.elapsed();
-            eprintln!("stage=verify_complete millis={}", verify_elapsed.as_millis());
+            let result =
+                run_update_benchmark(&srs, &state, &deltas, iterations, warmup, "synthetic")?;
 
             println!("synthetic_degree={degree}");
             println!("modified_addresses={modified}");
+            println!("iterations={iterations}");
+            println!("warmup={warmup}");
+            println!("srs_load_millis={}", srs_elapsed.as_millis());
             println!("state_build_millis={}", state_elapsed.as_millis());
-            println!("update_millis={}", update_elapsed.as_millis());
-            println!("verify_millis={}", verify_elapsed.as_millis());
-            println!("aggregate_delta={}", updated.proof.d_value);
-            println!("gate_count={}", updated.proof.gate_count);
+            print_update_benchmark_result(&result);
+        }
+        "update-bench" => {
+            if !(5..=7).contains(&args.len()) {
+                return Err(
+                    "usage: poa-cli update-bench <srs.bin> <state.txt> <deltas.csv> [iterations] [warmup]"
+                        .to_string(),
+                );
+            }
+            let iterations = parse_bench_count(args.get(5), "iterations", 5)?;
+            let warmup = parse_bench_count(args.get(6), "warmup", 1)?;
+            warn_debug_benchmark();
+
+            let input_start = Instant::now();
+            let state = read_state(Path::new(&args[3]))?;
+            let deltas = read_delta_csv(Path::new(&args[4]))?;
+            let input_elapsed = input_start.elapsed();
+            let srs_start = Instant::now();
+            let srs = load_srs_for_update(Path::new(&args[2]), &state, deltas.len())?;
+            let srs_elapsed = srs_start.elapsed();
+            eprintln!(
+                "phase=setup stage=input_load millis={}",
+                input_elapsed.as_millis()
+            );
+            eprintln!(
+                "phase=setup stage=srs_prefix_load millis={} g1_powers={} g2_powers={}",
+                srs_elapsed.as_millis(),
+                state.masked_polynomial_coeffs.len(),
+                deltas.len() + 1
+            );
+
+            let result =
+                run_update_benchmark(&srs, &state, &deltas, iterations, warmup, "stored-state")?;
+            println!(
+                "polynomial_degree={}",
+                state.masked_polynomial_coeffs.len() - 1
+            );
+            println!("modified_addresses={}", deltas.len());
+            println!("iterations={iterations}");
+            println!("warmup={warmup}");
+            println!("input_load_millis={}", input_elapsed.as_millis());
+            println!("srs_load_millis={}", srs_elapsed.as_millis());
+            print_update_benchmark_result(&result);
         }
         "parallel-synthetic-update-bench" => {
             if args.len() != 6 {
@@ -556,17 +678,27 @@ fn real_main() -> Result<(), String> {
             let state = build_parallel_synthetic_state(&srs, degree, shards)?;
             let deltas = build_synthetic_deltas(modified);
             let state_elapsed = state_start.elapsed();
-            eprintln!("stage=parallel_state_complete millis={}", state_elapsed.as_millis());
+            eprintln!(
+                "stage=parallel_state_complete millis={}",
+                state_elapsed.as_millis()
+            );
 
             let update_start = Instant::now();
-            let updated = apply_parallel_update(&srs, &state, &deltas, "parallel-synthetic-next-root")?;
+            let updated =
+                apply_parallel_update(&srs, &state, &deltas, "parallel-synthetic-next-root")?;
             let update_elapsed = update_start.elapsed();
-            eprintln!("stage=parallel_update_complete millis={}", update_elapsed.as_millis());
+            eprintln!(
+                "stage=parallel_update_complete millis={}",
+                update_elapsed.as_millis()
+            );
 
             let verify_start = Instant::now();
             verify_parallel_update(&srs, &state, &deltas, &updated.next_state, &updated.proof)?;
             let verify_elapsed = verify_start.elapsed();
-            eprintln!("stage=parallel_verify_complete millis={}", verify_elapsed.as_millis());
+            eprintln!(
+                "stage=parallel_verify_complete millis={}",
+                verify_elapsed.as_millis()
+            );
 
             println!("synthetic_degree={degree}");
             println!("modified_addresses={modified}");
@@ -576,12 +708,27 @@ fn real_main() -> Result<(), String> {
             println!("update_millis={}", update_elapsed.as_millis());
             println!("verify_millis={}", verify_elapsed.as_millis());
             println!("aggregate_delta={}", updated.proof.d_value);
-            println!("zero_test_gate_count={}", updated.proof.shard_proofs.iter().map(|proof| proof.gate_count).sum::<usize>());
-            println!("projection_gate_count={}", modified);
+            println!(
+                "zero_test_gate_count={}",
+                updated
+                    .proof
+                    .shard_proofs
+                    .iter()
+                    .map(|proof| proof.gate_count)
+                    .sum::<usize>()
+            );
+            println!("projection_gate_count=0");
+            println!(
+                "projection_ipa_bytes={}",
+                updated.proof.projection_ipa_proof.len()
+            );
         }
         "smt-init" => {
             if args.len() != 6 {
-                return Err("usage: poa-cli smt-init <depth> <reserves.csv> <state-root> <state.txt>".to_string());
+                return Err(
+                    "usage: poa-cli smt-init <depth> <reserves.csv> <state-root> <state.txt>"
+                        .to_string(),
+                );
             }
             let depth = args[2]
                 .parse::<usize>()
@@ -616,23 +763,67 @@ fn real_main() -> Result<(), String> {
                 result.next_state.balance_total
             );
         }
+        "smt-update-local" => {
+            if args.len() != 7 {
+                return Err(
+                    "usage: poa-cli smt-update-local <state.txt> <deltas.csv> <new-state-root> <next-state.txt> <proof.txt>"
+                        .to_string(),
+                );
+            }
+            let old_state = SmtState::from_stored(&read_smt_state(Path::new(&args[2]))?)?;
+            let deltas = read_delta_csv(Path::new(&args[3]))?;
+            let blind_delta = hash_to_scalar("smt-update-blind", args[4].as_bytes());
+            let witness = smt::update::build_update_witness(&old_state, &deltas, blind_delta)?;
+            let result = smt::update::apply_update_with_witness(&old_state, &args[4], &witness)?;
+            write_smt_state(Path::new(&args[5]), &result.next_state.to_stored()?)?;
+            write_smt_proof(Path::new(&args[6]), &result.proof)?;
+            println!(
+                "smt locally updated m={}, aggregate_delta={}, new_balance_total={}",
+                deltas.len(),
+                result.proof.aggregate_delta,
+                result.next_state.balance_total
+            );
+        }
+        "smt-update-execute" => {
+            if args.len() != 6 {
+                return Err(
+                    "usage: poa-cli smt-update-execute <state.txt> <deltas.csv> <new-state-root> <next-state.txt>"
+                        .to_string(),
+                );
+            }
+            let old_state = SmtState::from_stored(&read_smt_state(Path::new(&args[2]))?)?;
+            let deltas = read_delta_csv(Path::new(&args[3]))?;
+            let blind_delta = hash_to_scalar("smt-update-blind", args[4].as_bytes());
+            let exec = build_and_execute_update(&old_state, &deltas, &args[4], blind_delta)?;
+            write_smt_state(Path::new(&args[5]), &exec.next_state.to_stored()?)?;
+            println!("smt execute updated m={}", deltas.len());
+            println!("update_execute_instructions={}", exec.instruction_count);
+            println!("aggregate_delta={}", exec.public_values.aggregate_delta);
+            println!("new_balance_total={}", exec.public_values.new_balance_total);
+        }
         "smt-verify" => {
             if args.len() != 6 {
-                return Err("usage: poa-cli smt-verify <old-state.txt> <new-state.txt> <proof.txt> <mode>".to_string());
+                return Err(
+                    "usage: poa-cli smt-verify <old-state.txt> <new-state.txt> <proof.txt> <mode>"
+                        .to_string(),
+                );
             }
             let old_state = SmtState::from_stored(&read_smt_state(Path::new(&args[2]))?)?;
             let new_state = SmtState::from_stored(&read_smt_state(Path::new(&args[3]))?)?;
             let proof = read_smt_proof(Path::new(&args[4]))?;
             match args[5].as_str() {
                 "update" => verify_smt_update_proof(&old_state, &new_state, &proof)?,
+                "update-local" => smt::update::verify_update(&old_state, &new_state, &proof)?,
                 "insert" => verify_insert_proof(&old_state, &new_state, &proof)?,
-                other => return Err(format!("unknown smt-verify mode {other}, expected update or insert")),
+                other => {
+                    return Err(format!(
+                        "unknown smt-verify mode {other}, expected update, update-local, or insert"
+                    ))
+                }
             }
             println!(
                 "smt verification passed mode={}, old_root={}, new_root={}",
-                args[5],
-                old_state.state_root,
-                new_state.state_root
+                args[5], old_state.state_root, new_state.state_root
             );
         }
         "smt-insert" => {
@@ -653,9 +844,7 @@ fn real_main() -> Result<(), String> {
             write_smt_proof(Path::new(&args[7]), &result.proof)?;
             println!(
                 "smt inserted address={}, balance={}, new_balance_total={}",
-                args[3],
-                balance,
-                result.next_state.balance_total
+                args[3], balance, result.next_state.balance_total
             );
         }
         "prepare-smt-run" => {
@@ -666,7 +855,8 @@ fn real_main() -> Result<(), String> {
                 );
             }
             let run_dir = Path::new(&args[2]);
-            fs::create_dir_all(run_dir).map_err(|err| format!("create {}: {err}", run_dir.display()))?;
+            fs::create_dir_all(run_dir)
+                .map_err(|err| format!("create {}: {err}", run_dir.display()))?;
             let depth = args[3]
                 .parse::<usize>()
                 .map_err(|err| format!("invalid depth: {err}"))?;
@@ -726,11 +916,19 @@ fn real_main() -> Result<(), String> {
                 build_insert_witness(&update_result.next_state, &insert_address, 1, insert_blind)?;
 
             let insert_start = Instant::now();
-            let insert_result = prove_insert(&update_result.next_state, "smt-synth-root-2", insert_witness)?;
+            let insert_result = prove_insert(
+                &update_result.next_state,
+                "smt-synth-root-2",
+                insert_witness,
+            )?;
             let insert_elapsed = insert_start.elapsed();
 
             let insert_verify_start = Instant::now();
-            verify_insert_proof(&update_result.next_state, &insert_result.next_state, &insert_result.proof)?;
+            verify_insert_proof(
+                &update_result.next_state,
+                &insert_result.next_state,
+                &insert_result.proof,
+            )?;
             let insert_verify_elapsed = insert_verify_start.elapsed();
 
             println!("depth={depth}");
@@ -742,8 +940,14 @@ fn real_main() -> Result<(), String> {
             println!("insert_millis={}", insert_elapsed.as_millis());
             println!("insert_verify_millis={}", insert_verify_elapsed.as_millis());
             println!("aggregate_delta={}", update_result.proof.aggregate_delta);
-            println!("post_update_balance_total={}", update_result.next_state.balance_total);
-            println!("post_insert_balance_total={}", insert_result.next_state.balance_total);
+            println!(
+                "post_update_balance_total={}",
+                update_result.next_state.balance_total
+            );
+            println!(
+                "post_insert_balance_total={}",
+                insert_result.next_state.balance_total
+            );
         }
         "smt-synthetic-execute" => {
             if args.len() != 5 {
@@ -797,12 +1001,27 @@ fn real_main() -> Result<(), String> {
             println!("modified_addresses={modified}");
             println!("init_millis={}", init_elapsed.as_millis());
             println!("update_execute_millis={}", update_elapsed.as_millis());
-            println!("update_execute_instructions={}", update_exec.instruction_count);
+            println!(
+                "update_execute_instructions={}",
+                update_exec.instruction_count
+            );
             println!("insert_execute_millis={}", insert_elapsed.as_millis());
-            println!("insert_execute_instructions={}", insert_exec.instruction_count);
-            println!("aggregate_delta={}", update_exec.public_values.aggregate_delta);
-            println!("post_update_balance_total={}", update_exec.public_values.new_balance_total);
-            println!("post_insert_balance_total={}", insert_exec.public_values.new_balance_total);
+            println!(
+                "insert_execute_instructions={}",
+                insert_exec.instruction_count
+            );
+            println!(
+                "aggregate_delta={}",
+                update_exec.public_values.aggregate_delta
+            );
+            println!(
+                "post_update_balance_total={}",
+                update_exec.public_values.new_balance_total
+            );
+            println!(
+                "post_insert_balance_total={}",
+                insert_exec.public_values.new_balance_total
+            );
         }
         "continue-smt-run" => {
             if args.len() != 7 {
@@ -827,6 +1046,52 @@ fn real_main() -> Result<(), String> {
                 result.proof.aggregate_delta
             );
         }
+        "continue-smt-local-run" => {
+            if args.len() != 7 {
+                return Err(
+                    "usage: poa-cli continue-smt-local-run <run-dir> <current-state.txt> <deltas.csv> <new-state-root> <next-state.txt>"
+                        .to_string(),
+                );
+            }
+            let _run_dir = Path::new(&args[2]);
+            let old_state = SmtState::from_stored(&read_smt_state(Path::new(&args[3]))?)?;
+            let deltas = read_delta_csv(Path::new(&args[4]))?;
+            let blind_delta = hash_to_scalar("smt-update-blind", args[5].as_bytes());
+            let witness = smt::update::build_update_witness(&old_state, &deltas, blind_delta)?;
+            let result = smt::update::apply_update_with_witness(&old_state, &args[5], &witness)?;
+            write_smt_state(Path::new(&args[6]), &result.next_state.to_stored()?)?;
+            let proof_path = derive_companion_proof_path(Path::new(&args[6]))?;
+            write_smt_proof(&proof_path, &result.proof)?;
+            println!(
+                "continued smt local run: next_state={}, proof={}, m={}, aggregate_delta={}",
+                args[6],
+                proof_path.display(),
+                deltas.len(),
+                result.proof.aggregate_delta
+            );
+        }
+        "continue-smt-execute-run" => {
+            if args.len() != 7 {
+                return Err(
+                    "usage: poa-cli continue-smt-execute-run <run-dir> <current-state.txt> <deltas.csv> <new-state-root> <next-state.txt>"
+                        .to_string(),
+                );
+            }
+            let _run_dir = Path::new(&args[2]);
+            let old_state = SmtState::from_stored(&read_smt_state(Path::new(&args[3]))?)?;
+            let deltas = read_delta_csv(Path::new(&args[4]))?;
+            let blind_delta = hash_to_scalar("smt-update-blind", args[5].as_bytes());
+            let exec = build_and_execute_update(&old_state, &deltas, &args[5], blind_delta)?;
+            write_smt_state(Path::new(&args[6]), &exec.next_state.to_stored()?)?;
+            println!(
+                "continued smt execute run: next_state={}, m={}",
+                args[6],
+                deltas.len()
+            );
+            println!("update_execute_instructions={}", exec.instruction_count);
+            println!("aggregate_delta={}", exec.public_values.aggregate_delta);
+            println!("new_balance_total={}", exec.public_values.new_balance_total);
+        }
         _ => print_usage(),
     }
 
@@ -837,7 +1102,6 @@ fn load_srs(path: &Path) -> Result<Srs, String> {
     let (max_degree, tau_g1_powers, tau_g2_powers) = read_srs(path)?;
     Ok(Srs {
         max_degree,
-        tau: common::crypto::hash_to_scalar("unused-srs-tau-placeholder", b"loaded-from-file"),
         tau_g1_powers,
         tau_g2_powers,
     })
@@ -847,17 +1111,16 @@ fn load_srs_g1_prefix(path: &Path, needed_g1_len: usize) -> Result<Srs, String> 
     let (max_degree, tau_g1_powers) = read_srs_g1_prefix(path, needed_g1_len)?;
     Ok(Srs {
         max_degree,
-        tau: common::crypto::hash_to_scalar("unused-srs-tau-placeholder", b"loaded-from-file"),
         tau_g1_powers,
         tau_g2_powers: Vec::new(),
     })
 }
 
 fn load_srs_prefix(path: &Path, needed_g1_len: usize, needed_g2_len: usize) -> Result<Srs, String> {
-    let (max_degree, tau_g1_powers, tau_g2_powers) = read_srs_prefix(path, needed_g1_len, needed_g2_len)?;
+    let (max_degree, tau_g1_powers, tau_g2_powers) =
+        read_srs_prefix(path, needed_g1_len, needed_g2_len)?;
     Ok(Srs {
         max_degree,
-        tau: common::crypto::hash_to_scalar("unused-srs-tau-placeholder", b"loaded-from-file"),
         tau_g1_powers,
         tau_g2_powers,
     })
@@ -867,6 +1130,142 @@ fn load_srs_for_update(path: &Path, state: &StoredState, modified: usize) -> Res
     let needed_g1_len = state.masked_polynomial_coeffs.len();
     let needed_g2_len = modified + 1;
     load_srs_prefix(path, needed_g1_len, needed_g2_len)
+}
+
+#[derive(Debug)]
+struct UpdateBenchmarkResult {
+    prover_micros: Vec<u128>,
+    verifier_micros: Vec<u128>,
+    aggregate_delta: i128,
+    gate_count: usize,
+    proof_artifact_binary_bytes: usize,
+}
+
+fn run_update_benchmark(
+    srs: &Srs,
+    state: &StoredState,
+    deltas: &[Delta],
+    iterations: usize,
+    warmup: usize,
+    label: &str,
+) -> Result<UpdateBenchmarkResult, String> {
+    if iterations == 0 {
+        return Err("benchmark iterations must be greater than zero".to_string());
+    }
+
+    for index in 0..warmup {
+        eprintln!("phase=warmup iteration={}", index + 1);
+        let new_root = format!("{label}-warmup-root-{index}");
+        let updated = apply_update(srs, state, deltas, &new_root)?;
+        verify_update(
+            srs,
+            &state.public_state(),
+            deltas,
+            &updated.next_state.public_state(),
+            &updated.proof,
+        )?;
+    }
+
+    let mut prover_micros = Vec::with_capacity(iterations);
+    let mut verifier_micros = Vec::with_capacity(iterations);
+    let mut aggregate_delta = 0i128;
+    let mut gate_count = 0usize;
+    let mut proof_artifact_binary_bytes = 0usize;
+    for index in 0..iterations {
+        let new_root = format!("{label}-measured-root-{index}");
+        let prover_start = Instant::now();
+        let updated = apply_update(srs, state, deltas, &new_root)?;
+        let prover_elapsed = prover_start.elapsed();
+
+        let verifier_start = Instant::now();
+        verify_update(
+            srs,
+            &state.public_state(),
+            deltas,
+            &updated.next_state.public_state(),
+            &updated.proof,
+        )?;
+        let verifier_elapsed = verifier_start.elapsed();
+
+        let prover_sample = prover_elapsed.as_micros();
+        let verifier_sample = verifier_elapsed.as_micros();
+        eprintln!(
+            "phase=measure iteration={} prover_micros={} verifier_micros={}",
+            index + 1,
+            prover_sample,
+            verifier_sample
+        );
+        prover_micros.push(prover_sample);
+        verifier_micros.push(verifier_sample);
+        aggregate_delta = updated.aggregate_delta;
+        gate_count = updated.proof.gate_count;
+        proof_artifact_binary_bytes = common::io::encode_proof_binary(&updated.proof)?.len();
+    }
+
+    Ok(UpdateBenchmarkResult {
+        prover_micros,
+        verifier_micros,
+        aggregate_delta,
+        gate_count,
+        proof_artifact_binary_bytes,
+    })
+}
+
+fn print_update_benchmark_result(result: &UpdateBenchmarkResult) {
+    let prover = summarize_samples(&result.prover_micros);
+    let verifier = summarize_samples(&result.verifier_micros);
+    println!("prover_min_micros={}", prover.min);
+    println!("prover_median_micros={}", prover.median);
+    println!("prover_p95_micros={}", prover.p95);
+    println!("prover_mean_micros={}", prover.mean);
+    println!("verifier_min_micros={}", verifier.min);
+    println!("verifier_median_micros={}", verifier.median);
+    println!("verifier_p95_micros={}", verifier.p95);
+    println!("verifier_mean_micros={}", verifier.mean);
+    println!(
+        "proof_artifact_binary_bytes={}",
+        result.proof_artifact_binary_bytes
+    );
+    println!("aggregate_delta={}", result.aggregate_delta);
+    println!("gate_count={}", result.gate_count);
+}
+
+#[derive(Debug)]
+struct SampleSummary {
+    min: u128,
+    median: u128,
+    p95: u128,
+    mean: u128,
+}
+
+fn summarize_samples(samples: &[u128]) -> SampleSummary {
+    let mut sorted = samples.to_vec();
+    sorted.sort_unstable();
+    let p95_index = ((sorted.len() * 95).div_ceil(100)).saturating_sub(1);
+    SampleSummary {
+        min: sorted[0],
+        median: sorted[(sorted.len() - 1) / 2],
+        p95: sorted[p95_index],
+        mean: sorted.iter().sum::<u128>() / sorted.len() as u128,
+    }
+}
+
+fn parse_bench_count(value: Option<&String>, name: &str, default: usize) -> Result<usize, String> {
+    value
+        .map(|raw| {
+            raw.parse::<usize>()
+                .map_err(|err| format!("invalid {name}: {err}"))
+        })
+        .transpose()
+        .map(|parsed| parsed.unwrap_or(default))
+}
+
+fn warn_debug_benchmark() {
+    if cfg!(debug_assertions) {
+        eprintln!(
+            "warning: benchmark is running without compiler optimizations; use `cargo run --release`"
+        );
+    }
 }
 
 fn load_srs_for_parallel_state(
@@ -891,7 +1290,11 @@ fn load_srs_for_verify(path: &Path, modified: usize) -> Result<Srs, String> {
 }
 
 fn load_srs_for_init_verify(path: &Path, state: &StoredState) -> Result<Srs, String> {
-    load_srs_prefix(path, state.masked_polynomial_coeffs.len(), state.masked_polynomial_coeffs.len())
+    load_srs_prefix(
+        path,
+        state.masked_polynomial_coeffs.len(),
+        state.masked_polynomial_coeffs.len(),
+    )
 }
 
 fn flatten_parallel_state(state: &StoredParallelState) -> StoredState {
@@ -934,22 +1337,32 @@ fn print_usage() {
     println!("  poa-cli verify <srs.bin> <old-state.txt> <deltas.csv> <new-state.txt> <proof.txt> <init-proof.txt>");
     println!("  poa-cli mock-gen <out-dir> <num-accounts> <num-reserves> <num-blocks> <txs-per-block> <seed>");
     println!("  poa-cli mock-bench <srs.bin> <manifest.txt> <report.txt>");
-    println!("  poa-cli synthetic-update-bench <srs.bin> <degree> <modified-addresses>");
+    println!("  poa-cli synthetic-update-bench <srs.bin> <degree> <modified-addresses> [iterations] [warmup]");
+    println!("  poa-cli update-bench <srs.bin> <state.txt> <deltas.csv> [iterations] [warmup]");
     println!("  poa-cli parallel-synthetic-update-bench <srs.bin> <degree> <modified-addresses> <shards>");
     println!("  poa-cli smt-init <depth> <reserves.csv> <state-root> <state.txt>");
     println!("  poa-cli smt-update <state.txt> <deltas.csv> <new-state-root> <next-state.txt> <proof.txt>");
+    println!("  poa-cli smt-update-local <state.txt> <deltas.csv> <new-state-root> <next-state.txt> <proof.txt>");
+    println!(
+        "  poa-cli smt-update-execute <state.txt> <deltas.csv> <new-state-root> <next-state.txt>"
+    );
     println!("  poa-cli smt-insert <state.txt> <address> <balance> <new-state-root> <next-state.txt> <proof.txt>");
     println!("  poa-cli smt-verify <old-state.txt> <new-state.txt> <proof.txt> <mode>");
     println!("  poa-cli prepare-smt-run <run-dir> <depth> <reserves.csv> <state-root> <state.txt>");
     println!("  poa-cli smt-synthetic-bench <depth> <num-reserves> <modified-addresses>");
     println!("  poa-cli smt-synthetic-execute <depth> <num-reserves> <modified-addresses>");
     println!("  poa-cli continue-smt-run <run-dir> <current-state.txt> <deltas.csv> <new-state-root> <next-state.txt>");
+    println!("  poa-cli continue-smt-local-run <run-dir> <current-state.txt> <deltas.csv> <new-state-root> <next-state.txt>");
+    println!("  poa-cli continue-smt-execute-run <run-dir> <current-state.txt> <deltas.csv> <new-state-root> <next-state.txt>");
 }
 
 fn build_synthetic_state(srs: &Srs, degree: usize) -> Result<StoredState, String> {
     let mut coeffs = Vec::with_capacity(degree + 1);
     for index in 0..degree {
-        coeffs.push(hash_to_scalar("synthetic-poly", &(index as u64).to_le_bytes()));
+        coeffs.push(hash_to_scalar(
+            "synthetic-poly",
+            &(index as u64).to_le_bytes(),
+        ));
     }
     let leading = {
         let scalar = hash_to_scalar("synthetic-poly-leading", &(degree as u64).to_le_bytes());
@@ -995,7 +1408,10 @@ fn build_parallel_synthetic_state(
         let mut coeffs = Vec::with_capacity(shard_degree + 1);
         for index in 0..shard_degree {
             let payload = format!("{shard_id}:{index}");
-            coeffs.push(hash_to_scalar("parallel-synthetic-poly", payload.as_bytes()));
+            coeffs.push(hash_to_scalar(
+                "parallel-synthetic-poly",
+                payload.as_bytes(),
+            ));
         }
         let leading = {
             let payload = format!("{shard_id}:{shard_degree}");
@@ -1048,6 +1464,28 @@ fn derive_companion_proof_path(state_path: &Path) -> Result<std::path::PathBuf, 
     Ok(state_path.with_file_name(proof_name))
 }
 
+fn public_state_path(state_path: &Path) -> std::path::PathBuf {
+    let mut name = state_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("state")
+        .to_string();
+    name.push_str(".public");
+    state_path.with_file_name(name)
+}
+
+fn read_public_state_or_derive(
+    state_path: &Path,
+    prover_state: &StoredState,
+) -> Result<common::types::PublicState, String> {
+    let public_path = public_state_path(state_path);
+    if public_path.exists() {
+        read_public_state(&public_path)
+    } else {
+        Ok(prover_state.public_state())
+    }
+}
+
 fn build_synthetic_deltas(m: usize) -> Vec<Delta> {
     (0..m)
         .map(|index| Delta {
@@ -1065,18 +1503,18 @@ fn build_smt_state_from_reserves(
     let mut leaves = Vec::with_capacity(reserves.len());
     for reserve in reserves {
         let salt = SmtState::fresh_salt("smt-init-salt", &reserve.address, reserve.balance);
-        leaves.push(Leaf::new(
-            reserve.address.clone(),
-            reserve.balance,
-            salt,
-        )?);
+        leaves.push(Leaf::new(reserve.address.clone(), reserve.balance, salt)?);
     }
     leaves.sort_by(|a, b| a.address.cmp(&b.address));
     let blind = hash_to_scalar("smt-init-blind", state_root.as_bytes());
     SmtState::new(state_root.to_string(), depth, leaves, blind)
 }
 
-fn build_synthetic_smt_state(depth: usize, num_reserves: usize, state_root: &str) -> Result<SmtState, String> {
+fn build_synthetic_smt_state(
+    depth: usize,
+    num_reserves: usize,
+    state_root: &str,
+) -> Result<SmtState, String> {
     let mut leaves = Vec::with_capacity(num_reserves);
     for index in 0..num_reserves {
         let address = format!("0x{:040x}", index + 1);

@@ -6,9 +6,7 @@ use common::types::StoredSmtProof;
 use crate::leaf::Leaf;
 use crate::proof::{AddressProof, NonMembershipProof};
 use crate::state::{hex_string, parse_hash_hex, SmtState};
-use crate::update::{
-    verify_collision_non_membership_proof, verify_default_non_membership_proof,
-};
+use crate::update::{verify_collision_non_membership_proof, verify_default_non_membership_proof};
 use crate::{key::key_for_address, proof::CollisionNonMembershipProof};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -77,7 +75,10 @@ pub fn apply_insert_in_place(
     if !witness.ownership_proof.starts_with("dummy-ownership:") {
         return Err("ownership proof rejected".to_string());
     }
-    if !witness.chain_proof.ends_with(&format!(":{}" , witness.balance)) {
+    if !witness
+        .chain_proof
+        .ends_with(&format!(":{}", witness.balance))
+    {
         return Err("chain proof rejected".to_string());
     }
 
@@ -97,7 +98,8 @@ pub fn apply_insert_in_place(
     state.state_root = new_state_root.to_string();
 
     let new_commitment = state.balance_commitment();
-    let expected_commitment = old_commitment + commit_balance(witness.balance, witness.balance_blind_delta);
+    let expected_commitment =
+        old_commitment + commit_balance(witness.balance, witness.balance_blind_delta);
     if new_commitment != expected_commitment {
         return Err("insert commitment transition mismatch".to_string());
     }
@@ -134,7 +136,11 @@ pub fn apply_insert_in_place(
     })
 }
 
-pub fn verify_insert(old_state: &SmtState, new_state: &SmtState, proof: &StoredSmtProof) -> Result<(), String> {
+pub fn verify_insert(
+    old_state: &SmtState,
+    new_state: &SmtState,
+    proof: &StoredSmtProof,
+) -> Result<(), String> {
     let witness = deserialize_insert_witness(&proof.witness_hex)?;
     let replay = apply_insert_with_witness(old_state, &new_state.state_root, &witness)?;
     if replay.next_state != *new_state {
@@ -214,7 +220,8 @@ pub fn serialize_insert_witness(witness: &InsertWitness) -> Result<String, Strin
 
 pub fn deserialize_insert_witness(encoded: &str) -> Result<InsertWitness, String> {
     let raw = common::crypto::hex_decode(encoded)?;
-    let text = String::from_utf8(raw).map_err(|err| format!("invalid insert witness utf8: {err}"))?;
+    let text =
+        String::from_utf8(raw).map_err(|err| format!("invalid insert witness utf8: {err}"))?;
     let mut address = None;
     let mut balance = None;
     let mut salt = None;
@@ -232,7 +239,11 @@ pub fn deserialize_insert_witness(encoded: &str) -> Result<InsertWitness, String
         if let Some(value) = line.strip_prefix("address=") {
             address = Some(value.to_string());
         } else if let Some(value) = line.strip_prefix("balance=") {
-            balance = Some(value.parse::<i128>().map_err(|err| format!("invalid balance: {err}"))?);
+            balance = Some(
+                value
+                    .parse::<i128>()
+                    .map_err(|err| format!("invalid balance: {err}"))?,
+            );
         } else if let Some(value) = line.strip_prefix("salt=") {
             salt = Some(parse_hash_hex(value)?);
         } else if let Some(value) = line.strip_prefix("ownership=") {
@@ -244,18 +255,29 @@ pub fn deserialize_insert_witness(encoded: &str) -> Result<InsertWitness, String
         } else if let Some(value) = line.strip_prefix("kind=") {
             kind = Some(value.to_string());
         } else if let Some(value) = line.strip_prefix("default_depth=") {
-            default_depth = Some(value.parse::<usize>().map_err(|err| format!("invalid depth: {err}"))?);
+            default_depth = Some(
+                value
+                    .parse::<usize>()
+                    .map_err(|err| format!("invalid depth: {err}"))?,
+            );
         } else if let Some(value) = line.strip_prefix("collision_address=") {
             collision_address = Some(value.to_string());
         } else if let Some(value) = line.strip_prefix("collision_balance=") {
-            collision_balance = Some(value.parse::<i128>().map_err(|err| format!("invalid collision balance: {err}"))?);
+            collision_balance = Some(
+                value
+                    .parse::<i128>()
+                    .map_err(|err| format!("invalid collision balance: {err}"))?,
+            );
         } else if let Some(value) = line.strip_prefix("collision_salt=") {
             collision_salt = Some(parse_hash_hex(value)?);
         } else if let Some(value) = line.strip_prefix("siblings=") {
             siblings = if value.is_empty() {
                 Vec::new()
             } else {
-                value.split(',').map(parse_hash_hex).collect::<Result<Vec<_>, _>>()?
+                value
+                    .split(',')
+                    .map(parse_hash_hex)
+                    .collect::<Result<Vec<_>, _>>()?
             };
         }
     }
@@ -265,12 +287,17 @@ pub fn deserialize_insert_witness(encoded: &str) -> Result<InsertWitness, String
             default_depth: default_depth.ok_or_else(|| "missing default depth".to_string())?,
             siblings,
         }),
-        Some("collision") => NonMembershipProof::Collision(crate::proof::CollisionNonMembershipProof {
-            collision_address: collision_address.ok_or_else(|| "missing collision address".to_string())?,
-            collision_balance: collision_balance.ok_or_else(|| "missing collision balance".to_string())?,
-            collision_salt: collision_salt.ok_or_else(|| "missing collision salt".to_string())?,
-            siblings,
-        }),
+        Some("collision") => {
+            NonMembershipProof::Collision(crate::proof::CollisionNonMembershipProof {
+                collision_address: collision_address
+                    .ok_or_else(|| "missing collision address".to_string())?,
+                collision_balance: collision_balance
+                    .ok_or_else(|| "missing collision balance".to_string())?,
+                collision_salt: collision_salt
+                    .ok_or_else(|| "missing collision salt".to_string())?,
+                siblings,
+            })
+        }
         Some(other) => return Err(format!("unknown non-membership kind {other}")),
         None => return Err("missing non-membership kind".to_string()),
     };

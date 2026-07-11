@@ -65,7 +65,8 @@ fn poseidon_digest(inputs: Vec<SP1Field>) -> Hash {
 }
 
 fn bytes_to_fields(bytes: &[u8; 32]) -> Vec<SP1Field> {
-    bytes.chunks(4)
+    bytes
+        .chunks(4)
         .map(|chunk| {
             let mut word = [0u8; 4];
             word.copy_from_slice(chunk);

@@ -12,8 +12,8 @@ use super::{
 
 use crate::errors::R1CSError;
 use crate::generators::{BulletproofGens, PedersenGens};
-use crate::inner_types::*;
 use crate::inner_product_proof::InnerProductProof;
+use crate::inner_types::*;
 use crate::r1cs::Metrics;
 use crate::transcript::TranscriptProtocol;
 
@@ -67,6 +67,38 @@ struct Secrets {
 /// the callback provided to `specify_randomized_constraints`.
 pub struct RandomizingProver<'g, T: BorrowMut<Transcript>> {
     prover: Prover<'g, T>,
+}
+
+/// Secret opening of the first-phase wire commitment `A_I1`.
+///
+/// This is intended for composing an R1CS proof with a vector-opening
+/// argument. It is never part of the serialized R1CS proof.
+pub struct PhaseOneWitnessCommitmentOpening {
+    a_l: Vec<Scalar>,
+    a_r: Vec<Scalar>,
+    blinding: Scalar,
+}
+
+impl PhaseOneWitnessCommitmentOpening {
+    pub fn a_l(&self) -> &[Scalar] {
+        &self.a_l
+    }
+
+    pub fn a_r(&self) -> &[Scalar] {
+        &self.a_r
+    }
+
+    pub fn blinding(&self) -> Scalar {
+        self.blinding
+    }
+}
+
+impl Drop for PhaseOneWitnessCommitmentOpening {
+    fn drop(&mut self) {
+        self.a_l.zeroize();
+        self.a_r.zeroize();
+        self.blinding.zeroize();
+    }
 }
 
 /// Overwrite secrets with null bytes when they go out of scope.
@@ -397,11 +429,29 @@ impl<'g, T: BorrowMut<Transcript>> Prover<'g, T> {
             .map(|(proof, _transcript)| proof)
     }
 
+    /// Consume this constraint system and return the proof together with the
+    /// secret opening of its first-phase input-wire commitment.
+    pub fn prove_with_phase_one_opening(
+        self,
+        bp_gens: &BulletproofGens,
+    ) -> Result<(R1CSProof, PhaseOneWitnessCommitmentOpening), R1CSError> {
+        self.prove_internal(bp_gens)
+            .map(|(proof, _transcript, opening)| (proof, opening))
+    }
+
     /// Consume this `ConstraintSystem` to produce a proof. Returns the proof and the transcript passed in `Prover::new`.
     pub fn prove_and_return_transcript(
-        mut self,
+        self,
         bp_gens: &BulletproofGens,
     ) -> Result<(R1CSProof, T), R1CSError> {
+        self.prove_internal(bp_gens)
+            .map(|(proof, transcript, _opening)| (proof, transcript))
+    }
+
+    fn prove_internal(
+        mut self,
+        bp_gens: &BulletproofGens,
+    ) -> Result<(R1CSProof, T, PhaseOneWitnessCommitmentOpening), R1CSError> {
         use crate::util;
         use std::iter;
 
@@ -732,6 +782,11 @@ impl<'g, T: BorrowMut<Transcript>> Prover<'g, T> {
             e_blinding,
             ipp_proof,
         };
-        Ok((proof, self.transcript))
+        let phase_one_opening = PhaseOneWitnessCommitmentOpening {
+            a_l: self.secrets.a_L[..n1].to_vec(),
+            a_r: self.secrets.a_R[..n1].to_vec(),
+            blinding: i_blinding1,
+        };
+        Ok((proof, self.transcript, phase_one_opening))
     }
 }

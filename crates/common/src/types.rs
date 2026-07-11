@@ -43,7 +43,9 @@ pub enum OwnershipWitnessInput {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ChainBalanceProofInput {
-    Mock { proof_label: String },
+    Mock {
+        proof_label: String,
+    },
     EthereumAccountProof {
         chain_id: String,
         block_number: u64,
@@ -85,6 +87,15 @@ pub struct Delta {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SyncProof {
+    pub scheme: String,
+    pub old_state_root: String,
+    pub new_state_root: String,
+    pub delta_list_commitment_hex: String,
+    pub proof_hex: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RealSrsMeta {
     pub max_degree: usize,
 }
@@ -103,6 +114,29 @@ pub struct StoredState {
     pub balance_commitment_hex: String,
 }
 
+pub type ProverState = StoredState;
+
+impl StoredState {
+    pub fn public_state(&self) -> PublicState {
+        PublicState {
+            state_root: self.state_root.clone(),
+            srs_max_degree: self.srs_max_degree,
+            reserve_count: self.reserve_addresses.len(),
+            accumulator_hex: self.accumulator_hex.clone(),
+            balance_commitment_hex: self.balance_commitment_hex.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PublicState {
+    pub state_root: String,
+    pub srs_max_degree: usize,
+    pub reserve_count: usize,
+    pub accumulator_hex: String,
+    pub balance_commitment_hex: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StoredInitProof {
     pub scheme: String,
@@ -112,6 +146,8 @@ pub struct StoredInitProof {
     pub session_id: String,
     pub accumulator_hex: String,
     pub balance_commitment_hex: String,
+    pub c_shape_hex: String,
+    pub c_y_hex: String,
     pub init_salt: Fr,
     pub init_digest_hex: String,
     pub ownership_artifact_digest_hex: String,
@@ -120,8 +156,14 @@ pub struct StoredInitProof {
     pub zeta: Fr,
     pub p_zeta: Fr,
     pub product_zeta: Fr,
+    pub r_shape: Fr,
+    pub r_y: Fr,
     pub balance_total: i128,
     pub balance_blind: Fr,
+    pub kzg_opening_proof_hex: String,
+    pub sp1_proof_hex: String,
+    pub sp1_vk_hex: String,
+    pub sp1_public_values_hex: String,
     pub chain_proof_hex: String,
     pub alg_proof_hex: String,
     pub transcript_hex: String,
@@ -132,24 +174,26 @@ pub struct StoredInitProof {
 pub struct StoredProof {
     pub old_state_root: String,
     pub new_state_root: String,
+    pub delta_list_commitment_hex: String,
     pub c_u_hex: String,
     pub c_y_hex: String,
     pub c_d_hex: String,
     pub eval_proof_hex: String,
-    pub d_value: i128,
-    pub r_u: Fr,
-    pub rho_y: Fr,
-    pub r_d: Fr,
-    pub y_values: Vec<Fr>,
-    pub u_values: Vec<u8>,
-    pub z_values: Vec<Fr>,
-    pub w_values: Vec<Fr>,
+    pub c_v_hex: String,
+    pub theta: Fr,
+    pub theta_opening_proof_hex: String,
     pub gate_count: usize,
     pub transcript_hex: String,
     pub bp_proof_hex: String,
-    pub bp_commitments_hex: String,
-    pub link_proof_hex: String,
+    pub witness_vector_commitment_hex: String,
+    pub rho_bp_commitment_hex: String,
+    pub v_bp_commitment_hex: String,
+    pub witness_link_ipa_proof: Vec<u8>,
+    pub v_link_proof: Vec<u8>,
+    pub projection_ipa_proof: Vec<u8>,
 }
+
+pub type PublicUpdateProof = StoredProof;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StoredParallelShardState {
@@ -199,9 +243,7 @@ pub struct StoredParallelProof {
     pub d_value: i128,
     pub r_u: Fr,
     pub r_d: Fr,
-    pub projection_bp_proof_hex: String,
-    pub projection_bp_commitments_hex: String,
-    pub projection_link_proof_hex: String,
+    pub projection_ipa_proof: Vec<u8>,
     pub transcript_hex: String,
 }
 
@@ -223,6 +265,13 @@ pub struct SmtLeafRecord {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SmtNodeRecord {
+    pub level: usize,
+    pub index: u128,
+    pub hash_hex: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StoredSmtState {
     pub state_root: String,
     pub smt_root_hex: String,
@@ -231,6 +280,8 @@ pub struct StoredSmtState {
     pub balance_blind: Fr,
     pub balance_commitment_hex: String,
     pub leaves: Vec<SmtLeafRecord>,
+    pub nodes: Vec<SmtNodeRecord>,
+    pub nodes_path: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

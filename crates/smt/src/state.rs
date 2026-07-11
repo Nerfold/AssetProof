@@ -1,9 +1,10 @@
 use ark_bls12_381::{Fr, G1Projective};
+use std::collections::BTreeMap;
 
 use common::crypto::{commit_balance, hash_bytes, point_g1_to_hex};
-use common::types::{SmtLeafRecord, StoredSmtState};
+use common::types::{SmtLeafRecord, SmtNodeRecord, StoredSmtState};
 
-use crate::hash::{Hash, default_hashes};
+use crate::hash::{default_hashes, Hash};
 use crate::leaf::Leaf;
 use crate::tree::SparseMerkleTree;
 
@@ -75,6 +76,16 @@ impl SmtState {
                 salt_hex: hex_string(&leaf.salt),
             })
             .collect();
+        let nodes = self
+            .tree
+            .layer_records()
+            .iter()
+            .map(|(level, index, hash)| SmtNodeRecord {
+                level: *level,
+                index: *index,
+                hash_hex: hex_string(hash),
+            })
+            .collect();
         Ok(StoredSmtState {
             state_root: self.state_root.clone(),
             smt_root_hex: hex_string(&self.smt_root()),
@@ -83,6 +94,8 @@ impl SmtState {
             balance_blind: self.balance_blind,
             balance_commitment_hex: point_g1_to_hex(&self.balance_commitment())?,
             leaves,
+            nodes,
+            nodes_path: String::new(),
         })
     }
 
@@ -95,12 +108,23 @@ impl SmtState {
                 parse_hash_hex(&record.salt_hex)?,
             )?);
         }
-        let state = Self::new(
-            stored.state_root.clone(),
-            stored.depth,
-            leaves,
-            stored.balance_blind,
-        )?;
+        let state = if stored.nodes.is_empty() {
+            Self::new(
+                stored.state_root.clone(),
+                stored.depth,
+                leaves,
+                stored.balance_blind,
+            )?
+        } else {
+            let layers = restore_layers(stored.depth, &stored.nodes)?;
+            let tree = SparseMerkleTree::from_leaves_and_layers(stored.depth, leaves, layers)?;
+            Self::from_tree_with_total(
+                stored.state_root.clone(),
+                tree,
+                stored.balance_total,
+                stored.balance_blind,
+            )?
+        };
         let root = state.smt_root();
         if hex_string(&root) != stored.smt_root_hex {
             return Err("stored SMT root mismatch".to_string());
@@ -113,10 +137,7 @@ impl SmtState {
     }
 
     pub fn fresh_salt(label: &str, address: &str, balance: i128) -> Hash {
-        hash_bytes(
-            label,
-            &[address.as_bytes(), &balance.to_le_bytes()],
-        )
+        hash_bytes(label, &[address.as_bytes(), &balance.to_le_bytes()])
     }
 
     pub fn _default_hashes(&self) -> Vec<Hash> {
@@ -152,6 +173,23 @@ impl SmtState {
             tree,
         })
     }
+}
+
+fn restore_layers(
+    depth: usize,
+    nodes: &[SmtNodeRecord],
+) -> Result<Vec<BTreeMap<u128, Hash>>, String> {
+    let mut layers = vec![BTreeMap::<u128, Hash>::new(); depth + 1];
+    for node in nodes {
+        if node.level > depth {
+            return Err(format!(
+                "stored SMT node level {} exceeds depth {}",
+                node.level, depth
+            ));
+        }
+        layers[node.level].insert(node.index, parse_hash_hex(&node.hash_hex)?);
+    }
+    Ok(layers)
 }
 
 pub fn hex_string(hash: &Hash) -> String {

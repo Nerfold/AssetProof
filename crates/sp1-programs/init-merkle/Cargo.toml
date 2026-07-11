@@ -5,4 +5,5 @@ edition = "2021"
 
 [dependencies]
 sp1-programs-common = { path = "../common" }
+sp1-zkvm = { version = "6.2.2" }
 smt = { path = "../../smt" }

@@ -4,11 +4,11 @@
 #![allow(non_snake_case)]
 #![deny(missing_docs)]
 
-use super::HASH_DST;
 use super::inner_types::*;
+use super::HASH_DST;
 use alloc::vec::Vec;
-use group::Curve;
 use digest::{ExtendableOutput, Update, XofReader};
+use group::Curve;
 use sha3::{Shake256, Shake256Reader};
 
 /// Represents a pair of base points for Pedersen commitments.
@@ -64,7 +64,7 @@ impl GeneratorsChain {
         shake.update(label);
 
         GeneratorsChain {
-            reader: shake.finalize_xof()
+            reader: shake.finalize_xof(),
         }
     }
 
@@ -281,7 +281,7 @@ impl<'a> BulletproofGensShare<'a> {
     }
 
     /// Return an iterator over this party's H generators with given size `n`.
-    pub(crate) fn H(&self, n: usize) -> impl Iterator<Item = &'a G1Projective> {
+    pub fn H(&self, n: usize) -> impl Iterator<Item = &'a G1Projective> {
         self.gens.H_vec[self.share].iter().take(n)
     }
 }

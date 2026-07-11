@@ -1,10 +1,15 @@
-pub mod commitment;
 pub mod bp;
+pub mod commitment;
+pub mod external;
 pub mod init;
 pub mod init_proof;
+pub mod insert;
 pub mod kzg;
 pub mod parallel;
 pub mod polynomial;
+pub mod range;
+pub mod threshold;
 pub mod update;
 pub mod verifier;
 pub mod witness;
+pub mod zkopen;

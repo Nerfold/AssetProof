@@ -9,7 +9,6 @@ use crate::polynomial::Polynomial;
 #[derive(Clone, Debug)]
 pub struct Srs {
     pub max_degree: usize,
-    pub tau: Fr,
     pub tau_g1_powers: Vec<G1Affine>,
     pub tau_g2_powers: Vec<G2Affine>,
 }
@@ -32,7 +31,6 @@ impl Srs {
 
         Self {
             max_degree,
-            tau,
             tau_g1_powers,
             tau_g2_powers,
         }
@@ -76,6 +74,31 @@ pub fn verify_batch(
     let lhs = Bls12_381::pairing((*accumulator - *c_y).into_affine(), G2Affine::generator());
     let rhs = Bls12_381::pairing(eval_proof.into_affine(), z_commit_g2.into_affine());
     lhs == rhs
+}
+
+pub fn open(srs: &Srs, poly: &Polynomial, point: Fr, value: Fr) -> Result<G1Projective, String> {
+    let divisor = Polynomial::from_coeffs(vec![-point, Fr::from(1u64)]);
+    let quotient = poly.sub(&Polynomial::constant(value)).div_exact(&divisor)?;
+    commit_g1(srs, &quotient)
+}
+
+pub fn verify_open(
+    srs: &Srs,
+    commitment: &G1Projective,
+    point: Fr,
+    value: Fr,
+    proof: &G1Projective,
+) -> Result<bool, String> {
+    if srs.tau_g2_powers.len() < 2 {
+        return Err("SRS must contain tau^1 G2 power for KZG opening".to_string());
+    }
+    let value_g1 = G1Projective::generator().mul_bigint(value.into_bigint());
+    let tau_minus_point = G2Projective::from(srs.tau_g2_powers[1])
+        - G2Projective::generator().mul_bigint(point.into_bigint());
+    Ok(Bls12_381::pairing(
+        (*commitment - value_g1).into_affine(),
+        G2Affine::generator(),
+    ) == Bls12_381::pairing(proof.into_affine(), tau_minus_point.into_affine()))
 }
 
 pub fn verify_batch_many(

@@ -34,19 +34,17 @@ fn expand_compact_address_proof(
         CompactAddressProof::Membership(proof) => Ok(AddressProof::Membership(MembershipProof {
             siblings: expand_membership_siblings(&proof.siblings, &defaults, frontier_hashes)?,
         })),
-        CompactAddressProof::NonMembership(CompactNonMembershipProof::Default(proof)) => {
-            Ok(AddressProof::NonMembership(NonMembershipProof::Default(
-                DefaultNonMembershipProof {
-                    default_depth: proof.default_depth,
-                    siblings: expand_default_siblings(
-                        proof.default_depth,
-                        &proof.siblings,
-                        &defaults,
-                        frontier_hashes,
-                    )?,
-                },
-            )))
-        }
+        CompactAddressProof::NonMembership(CompactNonMembershipProof::Default(proof)) => Ok(
+            AddressProof::NonMembership(NonMembershipProof::Default(DefaultNonMembershipProof {
+                default_depth: proof.default_depth,
+                siblings: expand_default_siblings(
+                    proof.default_depth,
+                    &proof.siblings,
+                    &defaults,
+                    frontier_hashes,
+                )?,
+            })),
+        ),
         CompactAddressProof::NonMembership(CompactNonMembershipProof::Collision(proof)) => {
             Ok(AddressProof::NonMembership(NonMembershipProof::Collision(
                 CollisionNonMembershipProof {

@@ -5,19 +5,21 @@ use std::path::Path;
 use ark_bls12_381::{Fr, G1Affine, G2Affine};
 
 use crate::crypto::{
-    read_scalar_vec_csv, read_srs_binary, read_srs_g1_prefix_binary, read_srs_prefix_binary, read_u8_vec_csv,
-    scalar_from_hex, scalar_to_hex,
-    write_scalar_vec_csv, write_srs_binary, write_string_vec_csv, write_u8_vec_csv,
+    hex_decode, hex_encode, read_scalar_vec_csv, read_srs_binary, read_srs_g1_prefix_binary,
+    read_srs_prefix_binary, read_u8_vec_csv, scalar_from_hex, scalar_to_hex, write_scalar_vec_csv,
+    write_srs_binary, write_string_vec_csv, write_u8_vec_csv,
 };
 use crate::encoding::normalize_address;
 use crate::types::{
-    Delta, InitReserveWitness, ReserveEntry, SmtLeafRecord, StoredInitProof, StoredProof, StoredSmtProof,
-    StoredParallelInitProof, StoredParallelProof, StoredParallelShardProof, StoredParallelShardState,
-    StoredParallelState, StoredSmtState, StoredState,
+    Delta, InitReserveWitness, PublicState, ReserveEntry, SmtLeafRecord, SmtNodeRecord,
+    StoredInitProof, StoredParallelInitProof, StoredParallelProof, StoredParallelShardProof,
+    StoredParallelShardState, StoredParallelState, StoredProof, StoredSmtProof, StoredSmtState,
+    StoredState,
 };
 
 pub fn read_reserve_csv(path: &Path) -> Result<Vec<ReserveEntry>, String> {
-    let input = fs::read_to_string(path).map_err(|err| format!("read {}: {err}", path.display()))?;
+    let input =
+        fs::read_to_string(path).map_err(|err| format!("read {}: {err}", path.display()))?;
     let mut entries = Vec::new();
     for (line_no, raw_line) in input.lines().enumerate() {
         let line = raw_line.trim();
@@ -38,7 +40,8 @@ pub fn read_reserve_csv(path: &Path) -> Result<Vec<ReserveEntry>, String> {
 }
 
 pub fn read_init_witness_csv(path: &Path) -> Result<Vec<InitReserveWitness>, String> {
-    let input = fs::read_to_string(path).map_err(|err| format!("read {}: {err}", path.display()))?;
+    let input =
+        fs::read_to_string(path).map_err(|err| format!("read {}: {err}", path.display()))?;
     let mut entries = Vec::new();
     for (line_no, raw_line) in input.lines().enumerate() {
         let line = raw_line.trim();
@@ -66,7 +69,8 @@ pub fn read_init_witness_csv(path: &Path) -> Result<Vec<InitReserveWitness>, Str
 }
 
 pub fn read_delta_csv(path: &Path) -> Result<Vec<Delta>, String> {
-    let input = fs::read_to_string(path).map_err(|err| format!("read {}: {err}", path.display()))?;
+    let input =
+        fs::read_to_string(path).map_err(|err| format!("read {}: {err}", path.display()))?;
     let mut merged = BTreeMap::<String, i128>::new();
     for (line_no, raw_line) in input.lines().enumerate() {
         let line = raw_line.trim();
@@ -104,7 +108,8 @@ pub fn write_state(path: &Path, state: &StoredState) -> Result<(), String> {
     ));
     lines.push(format!(
         "reserve_balances={}",
-        state.reserve_balances
+        state
+            .reserve_balances
             .iter()
             .map(ToString::to_string)
             .collect::<Vec<_>>()
@@ -116,8 +121,14 @@ pub fn write_state(path: &Path, state: &StoredState) -> Result<(), String> {
     ));
     lines.push(format!("accumulator_hex={}", state.accumulator_hex));
     lines.push(format!("balance_total={}", state.balance_total));
-    lines.push(format!("balance_blind={}", scalar_to_hex(&state.balance_blind)?));
-    lines.push(format!("balance_commitment_hex={}", state.balance_commitment_hex));
+    lines.push(format!(
+        "balance_blind={}",
+        scalar_to_hex(&state.balance_blind)?
+    ));
+    lines.push(format!(
+        "balance_commitment_hex={}",
+        state.balance_commitment_hex
+    ));
     fs::write(path, lines.join("\n")).map_err(|err| format!("write {}: {err}", path.display()))
 }
 
@@ -152,28 +163,33 @@ pub fn read_state(path: &Path) -> Result<StoredState, String> {
     })
 }
 
-pub fn write_proof(path: &Path, proof: &StoredProof) -> Result<(), String> {
+pub fn write_public_state(path: &Path, state: &PublicState) -> Result<(), String> {
     let mut lines = Vec::new();
-    lines.push(format!("old_state_root={}", proof.old_state_root));
-    lines.push(format!("new_state_root={}", proof.new_state_root));
-    lines.push(format!("c_u_hex={}", proof.c_u_hex));
-    lines.push(format!("c_y_hex={}", proof.c_y_hex));
-    lines.push(format!("c_d_hex={}", proof.c_d_hex));
-    lines.push(format!("eval_proof_hex={}", proof.eval_proof_hex));
-    lines.push(format!("d_value={}", proof.d_value));
-    lines.push(format!("r_u={}", scalar_to_hex(&proof.r_u)?));
-    lines.push(format!("rho_y={}", scalar_to_hex(&proof.rho_y)?));
-    lines.push(format!("r_d={}", scalar_to_hex(&proof.r_d)?));
-    lines.push(format!("y_values={}", write_scalar_vec_csv(&proof.y_values)?));
-    lines.push(format!("u_values={}", write_u8_vec_csv(&proof.u_values)));
-    lines.push(format!("z_values={}", write_scalar_vec_csv(&proof.z_values)?));
-    lines.push(format!("w_values={}", write_scalar_vec_csv(&proof.w_values)?));
-    lines.push(format!("gate_count={}", proof.gate_count));
-    lines.push(format!("transcript_hex={}", proof.transcript_hex));
-    lines.push(format!("bp_proof_hex={}", proof.bp_proof_hex));
-    lines.push(format!("bp_commitments_hex={}", proof.bp_commitments_hex));
-    lines.push(format!("link_proof_hex={}", proof.link_proof_hex));
+    lines.push(format!("state_root={}", state.state_root));
+    lines.push(format!("srs_max_degree={}", state.srs_max_degree));
+    lines.push(format!("reserve_count={}", state.reserve_count));
+    lines.push(format!("accumulator_hex={}", state.accumulator_hex));
+    lines.push(format!(
+        "balance_commitment_hex={}",
+        state.balance_commitment_hex
+    ));
     fs::write(path, lines.join("\n")).map_err(|err| format!("write {}: {err}", path.display()))
+}
+
+pub fn read_public_state(path: &Path) -> Result<PublicState, String> {
+    let kv = read_key_value_file(path)?;
+    Ok(PublicState {
+        state_root: req_string(&kv, "state_root")?,
+        srs_max_degree: req_usize(&kv, "srs_max_degree")?,
+        reserve_count: req_usize(&kv, "reserve_count")?,
+        accumulator_hex: req_string(&kv, "accumulator_hex")?,
+        balance_commitment_hex: req_string(&kv, "balance_commitment_hex")?,
+    })
+}
+
+pub fn write_proof(path: &Path, proof: &StoredProof) -> Result<(), String> {
+    let bytes = encode_proof_binary(proof)?;
+    fs::write(path, bytes).map_err(|err| format!("write {}: {err}", path.display()))
 }
 
 pub fn write_init_proof(path: &Path, proof: &StoredInitProof) -> Result<(), String> {
@@ -188,6 +204,8 @@ pub fn write_init_proof(path: &Path, proof: &StoredInitProof) -> Result<(), Stri
         "balance_commitment_hex={}",
         proof.balance_commitment_hex
     ));
+    lines.push(format!("c_shape_hex={}", proof.c_shape_hex));
+    lines.push(format!("c_y_hex={}", proof.c_y_hex));
     lines.push(format!("init_salt={}", scalar_to_hex(&proof.init_salt)?));
     lines.push(format!("init_digest_hex={}", proof.init_digest_hex));
     lines.push(format!(
@@ -205,10 +223,22 @@ pub fn write_init_proof(path: &Path, proof: &StoredInitProof) -> Result<(), Stri
         "product_zeta={}",
         scalar_to_hex(&proof.product_zeta)?
     ));
+    lines.push(format!("r_shape={}", scalar_to_hex(&proof.r_shape)?));
+    lines.push(format!("r_y={}", scalar_to_hex(&proof.r_y)?));
     lines.push(format!("balance_total={}", proof.balance_total));
     lines.push(format!(
         "balance_blind={}",
         scalar_to_hex(&proof.balance_blind)?
+    ));
+    lines.push(format!(
+        "kzg_opening_proof_hex={}",
+        proof.kzg_opening_proof_hex
+    ));
+    lines.push(format!("sp1_proof_hex={}", proof.sp1_proof_hex));
+    lines.push(format!("sp1_vk_hex={}", proof.sp1_vk_hex));
+    lines.push(format!(
+        "sp1_public_values_hex={}",
+        proof.sp1_public_values_hex
     ));
     lines.push(format!("chain_proof_hex={}", proof.chain_proof_hex));
     lines.push(format!("alg_proof_hex={}", proof.alg_proof_hex));
@@ -226,7 +256,10 @@ pub fn read_init_proof(path: &Path) -> Result<StoredInitProof, String> {
     Ok(StoredInitProof {
         scheme: req_string(&kv, "scheme")?,
         mode: req_string(&kv, "mode")?,
-        chain_id: kv.get("chain_id").cloned().unwrap_or_else(|| "mock-chain".to_string()),
+        chain_id: kv
+            .get("chain_id")
+            .cloned()
+            .unwrap_or_else(|| "mock-chain".to_string()),
         state_root: req_string(&kv, "state_root")?,
         session_id: kv
             .get("session_id")
@@ -234,6 +267,8 @@ pub fn read_init_proof(path: &Path) -> Result<StoredInitProof, String> {
             .unwrap_or_else(|| "legacy-init-session".to_string()),
         accumulator_hex: req_string(&kv, "accumulator_hex")?,
         balance_commitment_hex: req_string(&kv, "balance_commitment_hex")?,
+        c_shape_hex: kv.get("c_shape_hex").cloned().unwrap_or_default(),
+        c_y_hex: kv.get("c_y_hex").cloned().unwrap_or_default(),
         init_salt: req_scalar(&kv, "init_salt")?,
         init_digest_hex: req_string(&kv, "init_digest_hex")?,
         ownership_artifact_digest_hex: kv
@@ -248,8 +283,22 @@ pub fn read_init_proof(path: &Path) -> Result<StoredInitProof, String> {
         zeta: req_scalar(&kv, "zeta")?,
         p_zeta: req_scalar(&kv, "p_zeta")?,
         product_zeta: req_scalar(&kv, "product_zeta")?,
+        r_shape: kv
+            .get("r_shape")
+            .map(|value| scalar_from_hex(value))
+            .transpose()?
+            .unwrap_or_else(|| Fr::from(0u64)),
+        r_y: kv
+            .get("r_y")
+            .map(|value| scalar_from_hex(value))
+            .transpose()?
+            .unwrap_or_else(|| Fr::from(0u64)),
         balance_total: req_i128(&kv, "balance_total")?,
         balance_blind: req_scalar(&kv, "balance_blind")?,
+        kzg_opening_proof_hex: kv.get("kzg_opening_proof_hex").cloned().unwrap_or_default(),
+        sp1_proof_hex: kv.get("sp1_proof_hex").cloned().unwrap_or_default(),
+        sp1_vk_hex: kv.get("sp1_vk_hex").cloned().unwrap_or_default(),
+        sp1_public_values_hex: kv.get("sp1_public_values_hex").cloned().unwrap_or_default(),
         chain_proof_hex: kv.get("chain_proof_hex").cloned().unwrap_or_default(),
         alg_proof_hex: kv.get("alg_proof_hex").cloned().unwrap_or_default(),
         transcript_hex: req_string(&kv, "transcript_hex")?,
@@ -262,28 +311,200 @@ pub fn read_init(path: &Path) -> Result<StoredInitProof, String> {
 }
 
 pub fn read_proof(path: &Path) -> Result<StoredProof, String> {
-    let kv = read_key_value_file(path)?;
+    let bytes = fs::read(path).map_err(|err| format!("read {}: {err}", path.display()))?;
+    decode_proof_binary(&bytes)
+}
+
+const UPDATE_PROOF_MAGIC: &[u8; 8] = b"DPOAUPD3";
+
+pub fn encode_proof_binary(proof: &StoredProof) -> Result<Vec<u8>, String> {
+    let mut out = Vec::new();
+    out.extend_from_slice(UPDATE_PROOF_MAGIC);
+    put_bytes(&mut out, proof.old_state_root.as_bytes())?;
+    put_bytes(&mut out, proof.new_state_root.as_bytes())?;
+    put_hex(&mut out, &proof.delta_list_commitment_hex)?;
+    put_hex(&mut out, &proof.c_u_hex)?;
+    put_hex(&mut out, &proof.c_y_hex)?;
+    put_hex(&mut out, &proof.c_d_hex)?;
+    put_hex(&mut out, &proof.eval_proof_hex)?;
+    put_hex(&mut out, &proof.c_v_hex)?;
+    put_hex(&mut out, &scalar_to_hex(&proof.theta)?)?;
+    put_tagged_hex(&mut out, &proof.theta_opening_proof_hex, "zkopen", "v1", 5)?;
+    put_u64(&mut out, proof.gate_count as u64);
+    put_hex(&mut out, &proof.transcript_hex)?;
+    put_hex(&mut out, &proof.bp_proof_hex)?;
+    put_hex(&mut out, &proof.witness_vector_commitment_hex)?;
+    put_hex(&mut out, &proof.rho_bp_commitment_hex)?;
+    put_hex(&mut out, &proof.v_bp_commitment_hex)?;
+    put_bytes(&mut out, &proof.witness_link_ipa_proof)?;
+    put_bytes(&mut out, &proof.v_link_proof)?;
+    put_bytes(&mut out, &proof.projection_ipa_proof)?;
+    Ok(out)
+}
+
+fn decode_proof_binary(bytes: &[u8]) -> Result<StoredProof, String> {
+    if !bytes.starts_with(UPDATE_PROOF_MAGIC) {
+        return Err(
+            "unsupported update proof format; regenerate the proof with protocol v3".to_string(),
+        );
+    }
+    let mut input = BinaryReader::new(&bytes[UPDATE_PROOF_MAGIC.len()..]);
+    let old_state_root = input.string()?;
+    let new_state_root = input.string()?;
+    let delta_list_commitment_hex = input.hex()?;
+    let c_u_hex = input.hex()?;
+    let c_y_hex = input.hex()?;
+    let c_d_hex = input.hex()?;
+    let eval_proof_hex = input.hex()?;
+    let c_v_hex = input.hex()?;
+    let theta = scalar_from_hex(&input.hex()?)?;
+    let theta_opening_proof_hex = input.tagged_hex("zkopen", "v1", 5)?;
+    let gate_count = usize::try_from(input.u64()?)
+        .map_err(|_| "update proof gate count does not fit usize".to_string())?;
+    let transcript_hex = input.hex()?;
+    let bp_proof_hex = input.hex()?;
+    let witness_vector_commitment_hex = input.hex()?;
+    let rho_bp_commitment_hex = input.hex()?;
+    let v_bp_commitment_hex = input.hex()?;
+    let witness_link_ipa_proof = input.bytes()?.to_vec();
+    let v_link_proof = input.bytes()?.to_vec();
+    let projection_ipa_proof = input.bytes()?.to_vec();
+    input.finish()?;
     Ok(StoredProof {
-        old_state_root: req_string(&kv, "old_state_root")?,
-        new_state_root: req_string(&kv, "new_state_root")?,
-        c_u_hex: req_string(&kv, "c_u_hex")?,
-        c_y_hex: req_string(&kv, "c_y_hex")?,
-        c_d_hex: req_string(&kv, "c_d_hex")?,
-        eval_proof_hex: req_string(&kv, "eval_proof_hex")?,
-        d_value: req_i128(&kv, "d_value")?,
-        r_u: req_scalar(&kv, "r_u")?,
-        rho_y: req_scalar(&kv, "rho_y")?,
-        r_d: req_scalar(&kv, "r_d")?,
-        y_values: req_scalar_vec(&kv, "y_values")?,
-        u_values: req_u8_vec(&kv, "u_values")?,
-        z_values: req_scalar_vec(&kv, "z_values")?,
-        w_values: req_scalar_vec(&kv, "w_values")?,
-        gate_count: req_usize(&kv, "gate_count")?,
-        transcript_hex: req_string(&kv, "transcript_hex")?,
-        bp_proof_hex: req_string(&kv, "bp_proof_hex")?,
-        bp_commitments_hex: req_string(&kv, "bp_commitments_hex")?,
-        link_proof_hex: req_string(&kv, "link_proof_hex")?,
+        old_state_root,
+        new_state_root,
+        delta_list_commitment_hex,
+        c_u_hex,
+        c_y_hex,
+        c_d_hex,
+        eval_proof_hex,
+        c_v_hex,
+        theta,
+        theta_opening_proof_hex,
+        gate_count,
+        transcript_hex,
+        bp_proof_hex,
+        witness_vector_commitment_hex,
+        rho_bp_commitment_hex,
+        v_bp_commitment_hex,
+        witness_link_ipa_proof,
+        v_link_proof,
+        projection_ipa_proof,
     })
+}
+
+fn put_u32(out: &mut Vec<u8>, value: usize) -> Result<(), String> {
+    let value = u32::try_from(value).map_err(|_| "proof field exceeds u32 length".to_string())?;
+    out.extend_from_slice(&value.to_le_bytes());
+    Ok(())
+}
+
+fn put_u64(out: &mut Vec<u8>, value: u64) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn put_bytes(out: &mut Vec<u8>, value: &[u8]) -> Result<(), String> {
+    put_u32(out, value.len())?;
+    out.extend_from_slice(value);
+    Ok(())
+}
+
+fn put_hex(out: &mut Vec<u8>, value: &str) -> Result<(), String> {
+    put_bytes(out, &hex_decode(value)?)
+}
+
+fn put_tagged_hex(
+    out: &mut Vec<u8>,
+    value: &str,
+    tag: &str,
+    version: &str,
+    field_count: usize,
+) -> Result<(), String> {
+    let parts = value.split(':').collect::<Vec<_>>();
+    if parts.len() != field_count + 2 || parts[0] != tag || parts[1] != version {
+        return Err(format!("invalid {tag} {version} proof encoding"));
+    }
+    for part in &parts[2..] {
+        put_hex(out, part)?;
+    }
+    Ok(())
+}
+
+struct BinaryReader<'a> {
+    input: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> BinaryReader<'a> {
+    fn new(input: &'a [u8]) -> Self {
+        Self { input, offset: 0 }
+    }
+
+    fn take(&mut self, len: usize) -> Result<&'a [u8], String> {
+        let end = self
+            .offset
+            .checked_add(len)
+            .ok_or_else(|| "update proof length overflow".to_string())?;
+        let value = self
+            .input
+            .get(self.offset..end)
+            .ok_or_else(|| "truncated update proof".to_string())?;
+        self.offset = end;
+        Ok(value)
+    }
+
+    fn u32(&mut self) -> Result<usize, String> {
+        let bytes: [u8; 4] = self
+            .take(4)?
+            .try_into()
+            .map_err(|_| "invalid update proof u32".to_string())?;
+        Ok(u32::from_le_bytes(bytes) as usize)
+    }
+
+    fn u64(&mut self) -> Result<u64, String> {
+        let bytes: [u8; 8] = self
+            .take(8)?
+            .try_into()
+            .map_err(|_| "invalid update proof u64".to_string())?;
+        Ok(u64::from_le_bytes(bytes))
+    }
+
+    fn bytes(&mut self) -> Result<&'a [u8], String> {
+        let len = self.u32()?;
+        self.take(len)
+    }
+
+    fn string(&mut self) -> Result<String, String> {
+        String::from_utf8(self.bytes()?.to_vec())
+            .map_err(|_| "update proof contains invalid UTF-8".to_string())
+    }
+
+    fn hex(&mut self) -> Result<String, String> {
+        Ok(hex_encode(self.bytes()?))
+    }
+
+    fn tagged_hex(
+        &mut self,
+        tag: &str,
+        version: &str,
+        field_count: usize,
+    ) -> Result<String, String> {
+        let mut values = Vec::with_capacity(field_count + 2);
+        values.push(tag.to_string());
+        values.push(version.to_string());
+        for _ in 0..field_count {
+            values.push(self.hex()?);
+        }
+        Ok(values.join(":"))
+    }
+
+    fn finish(&self) -> Result<(), String> {
+        if self.offset == self.input.len() {
+            Ok(())
+        } else {
+            Err("trailing bytes in update proof".to_string())
+        }
+    }
 }
 
 pub fn write_parallel_state(path: &Path, state: &StoredParallelState) -> Result<(), String> {
@@ -302,7 +523,13 @@ pub fn write_parallel_state(path: &Path, state: &StoredParallelState) -> Result<
     ));
     lines.push(format!(
         "shard_alphas={}",
-        write_scalar_vec_csv(&state.shards.iter().map(|shard| shard.alpha).collect::<Vec<_>>())?
+        write_scalar_vec_csv(
+            &state
+                .shards
+                .iter()
+                .map(|shard| shard.alpha)
+                .collect::<Vec<_>>()
+        )?
     ));
     lines.push(format!(
         "shard_reserve_addresses={}",
@@ -358,7 +585,13 @@ pub fn write_parallel_state(path: &Path, state: &StoredParallelState) -> Result<
     ));
     lines.push(format!(
         "shard_balance_blinds={}",
-        write_scalar_vec_csv(&state.shards.iter().map(|shard| shard.balance_blind).collect::<Vec<_>>())?
+        write_scalar_vec_csv(
+            &state
+                .shards
+                .iter()
+                .map(|shard| shard.balance_blind)
+                .collect::<Vec<_>>()
+        )?
     ));
     lines.push(format!(
         "shard_balance_commitment_hexes={}",
@@ -370,8 +603,14 @@ pub fn write_parallel_state(path: &Path, state: &StoredParallelState) -> Result<
             .join(",")
     ));
     lines.push(format!("balance_total={}", state.balance_total));
-    lines.push(format!("balance_blind={}", scalar_to_hex(&state.balance_blind)?));
-    lines.push(format!("balance_commitment_hex={}", state.balance_commitment_hex));
+    lines.push(format!(
+        "balance_blind={}",
+        scalar_to_hex(&state.balance_blind)?
+    ));
+    lines.push(format!(
+        "balance_commitment_hex={}",
+        state.balance_commitment_hex
+    ));
     fs::write(path, lines.join("\n")).map_err(|err| format!("write {}: {err}", path.display()))
 }
 
@@ -406,7 +645,9 @@ pub fn read_parallel_state(path: &Path) -> Result<StoredParallelState, String> {
     let mut shards = Vec::with_capacity(shard_count);
     for index in 0..shard_count {
         if shard_addresses[index].len() != shard_balances[index].len() {
-            return Err(format!("parallel state shard {index} address/balance length mismatch"));
+            return Err(format!(
+                "parallel state shard {index} address/balance length mismatch"
+            ));
         }
         shards.push(StoredParallelShardState {
             shard_id: shard_ids[index],
@@ -431,10 +672,7 @@ pub fn read_parallel_state(path: &Path) -> Result<StoredParallelState, String> {
     })
 }
 
-pub fn write_parallel_init(
-    path: &Path,
-    proof: &StoredParallelInitProof,
-) -> Result<(), String> {
+pub fn write_parallel_init(path: &Path, proof: &StoredParallelInitProof) -> Result<(), String> {
     let mut lines = Vec::new();
     lines.push(format!("state_root={}", proof.state_root));
     lines.push(format!("shard_count={}", proof.shard_proofs.len()));
@@ -448,8 +686,14 @@ pub fn write_parallel_init(
             .join("||")
     ));
     lines.push(format!("balance_total={}", proof.balance_total));
-    lines.push(format!("balance_blind={}", scalar_to_hex(&proof.balance_blind)?));
-    lines.push(format!("balance_commitment_hex={}", proof.balance_commitment_hex));
+    lines.push(format!(
+        "balance_blind={}",
+        scalar_to_hex(&proof.balance_blind)?
+    ));
+    lines.push(format!(
+        "balance_commitment_hex={}",
+        proof.balance_commitment_hex
+    ));
     lines.push(format!("transcript_hex={}", proof.transcript_hex));
     fs::write(path, lines.join("\n")).map_err(|err| format!("write {}: {err}", path.display()))
 }
@@ -504,16 +748,8 @@ pub fn write_parallel_proof(path: &Path, proof: &StoredParallelProof) -> Result<
     lines.push(format!("r_u={}", scalar_to_hex(&proof.r_u)?));
     lines.push(format!("r_d={}", scalar_to_hex(&proof.r_d)?));
     lines.push(format!(
-        "projection_bp_proof_hex={}",
-        proof.projection_bp_proof_hex
-    ));
-    lines.push(format!(
-        "projection_bp_commitments_hex={}",
-        proof.projection_bp_commitments_hex
-    ));
-    lines.push(format!(
-        "projection_link_proof_hex={}",
-        proof.projection_link_proof_hex
+        "projection_ipa_proof_hex={}",
+        hex_encode(&proof.projection_ipa_proof)
     ));
     lines.push(format!("transcript_hex={}", proof.transcript_hex));
     fs::write(path, lines.join("\n")).map_err(|err| format!("write {}: {err}", path.display()))
@@ -545,9 +781,7 @@ pub fn read_parallel_proof(path: &Path) -> Result<StoredParallelProof, String> {
         d_value: req_i128(&kv, "d_value")?,
         r_u: req_scalar(&kv, "r_u")?,
         r_d: req_scalar(&kv, "r_d")?,
-        projection_bp_proof_hex: req_string(&kv, "projection_bp_proof_hex")?,
-        projection_bp_commitments_hex: req_string(&kv, "projection_bp_commitments_hex")?,
-        projection_link_proof_hex: req_string(&kv, "projection_link_proof_hex")?,
+        projection_ipa_proof: hex_decode(&req_string(&kv, "projection_ipa_proof_hex")?)?,
         transcript_hex: req_string(&kv, "transcript_hex")?,
     })
 }
@@ -558,8 +792,14 @@ pub fn write_smt_state(path: &Path, state: &StoredSmtState) -> Result<(), String
     lines.push(format!("smt_root_hex={}", state.smt_root_hex));
     lines.push(format!("depth={}", state.depth));
     lines.push(format!("balance_total={}", state.balance_total));
-    lines.push(format!("balance_blind={}", scalar_to_hex(&state.balance_blind)?));
-    lines.push(format!("balance_commitment_hex={}", state.balance_commitment_hex));
+    lines.push(format!(
+        "balance_blind={}",
+        scalar_to_hex(&state.balance_blind)?
+    ));
+    lines.push(format!(
+        "balance_commitment_hex={}",
+        state.balance_commitment_hex
+    ));
     let leaf_addresses = state
         .leaves
         .iter()
@@ -575,9 +815,24 @@ pub fn write_smt_state(path: &Path, state: &StoredSmtState) -> Result<(), String
         .iter()
         .map(|leaf| leaf.salt_hex.clone())
         .collect::<Vec<_>>();
-    lines.push(format!("leaf_addresses={}", write_string_vec_csv(&leaf_addresses)));
+    lines.push(format!(
+        "leaf_addresses={}",
+        write_string_vec_csv(&leaf_addresses)
+    ));
     lines.push(format!("leaf_balances={}", leaf_balances.join(",")));
     lines.push(format!("leaf_salts={}", leaf_salts.join(",")));
+    if !state.nodes.is_empty() {
+        let nodes_path = path.with_extension("nodes.bin");
+        write_smt_nodes_file(&nodes_path, &state.nodes)?;
+        lines.push(format!("node_count={}", state.nodes.len()));
+        lines.push(format!(
+            "nodes_path={}",
+            nodes_path
+                .file_name()
+                .and_then(|v| v.to_str())
+                .unwrap_or("state.nodes.bin")
+        ));
+    }
     fs::write(path, lines.join("\n")).map_err(|err| format!("write {}: {err}", path.display()))
 }
 
@@ -598,6 +853,32 @@ pub fn read_smt_state(path: &Path) -> Result<StoredSmtState, String> {
             salt_hex,
         });
     }
+    let (nodes, nodes_path) = if let Some(raw_path) = kv.get("nodes_path") {
+        let nodes_path = path.with_extension("nodes.bin");
+        let nodes = read_smt_nodes_file(&nodes_path)?;
+        if let Some(expected) = kv.get("node_count") {
+            let expected = expected
+                .parse::<usize>()
+                .map_err(|err| format!("invalid node_count: {err}"))?;
+            if expected != nodes.len() {
+                return Err("SMT node_count does not match nodes_path".to_string());
+            }
+        }
+        (nodes, raw_path.clone())
+    } else if let Some(raw) = kv.get("nodes_hex") {
+        let nodes = decode_smt_nodes(raw)?;
+        if let Some(expected) = kv.get("node_count") {
+            let expected = expected
+                .parse::<usize>()
+                .map_err(|err| format!("invalid node_count: {err}"))?;
+            if expected != nodes.len() {
+                return Err("SMT node_count does not match nodes_hex".to_string());
+            }
+        }
+        (nodes, String::new())
+    } else {
+        (Vec::new(), String::new())
+    };
 
     Ok(StoredSmtState {
         state_root: req_string(&kv, "state_root")?,
@@ -607,6 +888,8 @@ pub fn read_smt_state(path: &Path) -> Result<StoredSmtState, String> {
         balance_blind: req_scalar(&kv, "balance_blind")?,
         balance_commitment_hex: req_string(&kv, "balance_commitment_hex")?,
         leaves,
+        nodes,
+        nodes_path,
     })
 }
 
@@ -669,10 +952,7 @@ pub fn read_smt_proof(path: &Path) -> Result<StoredSmtProof, String> {
         membership_flags: req_u8_vec(&kv, "membership_flags")?,
         sp1_proof_hex: kv.get("sp1_proof_hex").cloned().unwrap_or_default(),
         sp1_vk_hex: kv.get("sp1_vk_hex").cloned().unwrap_or_default(),
-        sp1_public_values_hex: kv
-            .get("sp1_public_values_hex")
-            .cloned()
-            .unwrap_or_default(),
+        sp1_public_values_hex: kv.get("sp1_public_values_hex").cloned().unwrap_or_default(),
     })
 }
 
@@ -682,7 +962,8 @@ pub fn write_srs(
     tau_g1_powers: &[G1Affine],
     tau_g2_powers: &[G2Affine],
 ) -> Result<(), String> {
-    let mut file = fs::File::create(path).map_err(|err| format!("create {}: {err}", path.display()))?;
+    let mut file =
+        fs::File::create(path).map_err(|err| format!("create {}: {err}", path.display()))?;
     write_srs_binary(&mut file, max_degree, tau_g1_powers, tau_g2_powers)
 }
 
@@ -691,7 +972,10 @@ pub fn read_srs(path: &Path) -> Result<(usize, Vec<G1Affine>, Vec<G2Affine>), St
     read_srs_binary(&mut file)
 }
 
-pub fn read_srs_g1_prefix(path: &Path, needed_g1_len: usize) -> Result<(usize, Vec<G1Affine>), String> {
+pub fn read_srs_g1_prefix(
+    path: &Path,
+    needed_g1_len: usize,
+) -> Result<(usize, Vec<G1Affine>), String> {
     let mut file = fs::File::open(path).map_err(|err| format!("open {}: {err}", path.display()))?;
     read_srs_g1_prefix_binary(&mut file, needed_g1_len)
 }
@@ -706,7 +990,8 @@ pub fn read_srs_prefix(
 }
 
 fn read_key_value_file(path: &Path) -> Result<BTreeMap<String, String>, String> {
-    let input = fs::read_to_string(path).map_err(|err| format!("read {}: {err}", path.display()))?;
+    let input =
+        fs::read_to_string(path).map_err(|err| format!("read {}: {err}", path.display()))?;
     let mut kv = BTreeMap::<String, String>::new();
     for (line_no, raw_line) in input.lines().enumerate() {
         let line = raw_line.trim();
@@ -714,7 +999,11 @@ fn read_key_value_file(path: &Path) -> Result<BTreeMap<String, String>, String> 
             continue;
         }
         let Some((key, value)) = line.split_once('=') else {
-            return Err(format!("invalid line {} in {}: {line}", line_no + 1, path.display()));
+            return Err(format!(
+                "invalid line {} in {}: {line}",
+                line_no + 1,
+                path.display()
+            ));
         };
         kv.insert(key.to_string(), value.to_string());
     }
@@ -754,7 +1043,10 @@ fn req_csv_i128(kv: &BTreeMap<String, String>, key: &str) -> Result<Vec<i128>, S
         Ok(Vec::new())
     } else {
         raw.split(',')
-            .map(|item| item.parse::<i128>().map_err(|err| format!("invalid {key}: {err}")))
+            .map(|item| {
+                item.parse::<i128>()
+                    .map_err(|err| format!("invalid {key}: {err}"))
+            })
             .collect()
     }
 }
@@ -765,12 +1057,18 @@ fn req_csv_usize(kv: &BTreeMap<String, String>, key: &str) -> Result<Vec<usize>,
         Ok(Vec::new())
     } else {
         raw.split(',')
-            .map(|item| item.parse::<usize>().map_err(|err| format!("invalid {key}: {err}")))
+            .map(|item| {
+                item.parse::<usize>()
+                    .map_err(|err| format!("invalid {key}: {err}"))
+            })
             .collect()
     }
 }
 
-fn req_sharded_strings(kv: &BTreeMap<String, String>, key: &str) -> Result<Vec<Vec<String>>, String> {
+fn req_sharded_strings(
+    kv: &BTreeMap<String, String>,
+    key: &str,
+) -> Result<Vec<Vec<String>>, String> {
     let raw = req_string(kv, key)?;
     if raw.is_empty() {
         return Ok(Vec::new());
@@ -798,7 +1096,10 @@ fn req_sharded_i128(kv: &BTreeMap<String, String>, key: &str) -> Result<Vec<Vec<
             } else {
                 chunk
                     .split(',')
-                    .map(|item| item.parse::<i128>().map_err(|err| format!("invalid {key}: {err}")))
+                    .map(|item| {
+                        item.parse::<i128>()
+                            .map_err(|err| format!("invalid {key}: {err}"))
+                    })
                     .collect()
             }
         })
@@ -821,6 +1122,82 @@ fn split_shards(raw: &str) -> Vec<String> {
     } else {
         raw.split("||").map(|value| value.to_string()).collect()
     }
+}
+
+fn decode_smt_nodes(raw: &str) -> Result<Vec<SmtNodeRecord>, String> {
+    let bytes = hex_decode(raw)?;
+    decode_smt_nodes_bytes(&bytes)
+}
+
+fn write_smt_nodes_file(path: &Path, nodes: &[SmtNodeRecord]) -> Result<(), String> {
+    let bytes = encode_smt_nodes_bytes(nodes)?;
+    fs::write(path, bytes).map_err(|err| format!("write {}: {err}", path.display()))
+}
+
+fn read_smt_nodes_file(path: &Path) -> Result<Vec<SmtNodeRecord>, String> {
+    let bytes = fs::read(path).map_err(|err| format!("read {}: {err}", path.display()))?;
+    decode_smt_nodes_bytes(&bytes)
+}
+
+fn encode_smt_nodes_bytes(nodes: &[SmtNodeRecord]) -> Result<Vec<u8>, String> {
+    let mut bytes = Vec::with_capacity(8 + nodes.len() * 50);
+    bytes.extend_from_slice(&(nodes.len() as u64).to_le_bytes());
+    for node in nodes {
+        if node.level > u16::MAX as usize {
+            return Err(format!("SMT node level {} exceeds u16", node.level));
+        }
+        let hash = hex_decode(&node.hash_hex)?;
+        if hash.len() != 32 {
+            return Err(format!(
+                "SMT node hash must be 32 bytes, got {}",
+                hash.len()
+            ));
+        }
+        bytes.extend_from_slice(&(node.level as u16).to_le_bytes());
+        bytes.extend_from_slice(&node.index.to_le_bytes());
+        bytes.extend_from_slice(&hash);
+    }
+    Ok(bytes)
+}
+
+fn decode_smt_nodes_bytes(bytes: &[u8]) -> Result<Vec<SmtNodeRecord>, String> {
+    if bytes.len() < 8 {
+        return Err("SMT nodes payload too short".to_string());
+    }
+    let mut cursor = 0usize;
+    let mut count_bytes = [0u8; 8];
+    count_bytes.copy_from_slice(&bytes[cursor..cursor + 8]);
+    cursor += 8;
+    let count = u64::from_le_bytes(count_bytes) as usize;
+    let expected = 8 + count * 50;
+    if bytes.len() != expected {
+        return Err(format!(
+            "SMT nodes payload length mismatch: expected {expected}, got {}",
+            bytes.len()
+        ));
+    }
+
+    let mut nodes = Vec::with_capacity(count);
+    for _ in 0..count {
+        let mut level_bytes = [0u8; 2];
+        level_bytes.copy_from_slice(&bytes[cursor..cursor + 2]);
+        cursor += 2;
+        let level = u16::from_le_bytes(level_bytes) as usize;
+
+        let mut index_bytes = [0u8; 16];
+        index_bytes.copy_from_slice(&bytes[cursor..cursor + 16]);
+        cursor += 16;
+        let index = u128::from_le_bytes(index_bytes);
+
+        let hash_hex = hex_encode(&bytes[cursor..cursor + 32]);
+        cursor += 32;
+        nodes.push(SmtNodeRecord {
+            level,
+            index,
+            hash_hex,
+        });
+    }
+    Ok(nodes)
 }
 
 fn encode_parallel_shard_proof(proof: &StoredParallelShardProof) -> Result<String, String> {
@@ -846,7 +1223,9 @@ fn decode_parallel_shard_proof(raw: &str) -> Result<StoredParallelShardProof, St
             continue;
         }
         let Some((key, value)) = item.split_once('=') else {
-            return Err(format!("invalid encoded parallel shard proof segment: {item}"));
+            return Err(format!(
+                "invalid encoded parallel shard proof segment: {item}"
+            ));
         };
         kv.insert(key.to_string(), value.to_string());
     }
@@ -873,7 +1252,12 @@ fn encode_stored_init_proof(proof: &StoredInitProof) -> Result<String, String> {
     lines.push(format!("state_root={}", proof.state_root));
     lines.push(format!("session_id={}", proof.session_id));
     lines.push(format!("accumulator_hex={}", proof.accumulator_hex));
-    lines.push(format!("balance_commitment_hex={}", proof.balance_commitment_hex));
+    lines.push(format!(
+        "balance_commitment_hex={}",
+        proof.balance_commitment_hex
+    ));
+    lines.push(format!("c_shape_hex={}", proof.c_shape_hex));
+    lines.push(format!("c_y_hex={}", proof.c_y_hex));
     lines.push(format!("init_salt={}", scalar_to_hex(&proof.init_salt)?));
     lines.push(format!("init_digest_hex={}", proof.init_digest_hex));
     lines.push(format!(
@@ -887,9 +1271,27 @@ fn encode_stored_init_proof(proof: &StoredInitProof) -> Result<String, String> {
     lines.push(format!("reserve_count={}", proof.reserve_count));
     lines.push(format!("zeta={}", scalar_to_hex(&proof.zeta)?));
     lines.push(format!("p_zeta={}", scalar_to_hex(&proof.p_zeta)?));
-    lines.push(format!("product_zeta={}", scalar_to_hex(&proof.product_zeta)?));
+    lines.push(format!(
+        "product_zeta={}",
+        scalar_to_hex(&proof.product_zeta)?
+    ));
+    lines.push(format!("r_shape={}", scalar_to_hex(&proof.r_shape)?));
+    lines.push(format!("r_y={}", scalar_to_hex(&proof.r_y)?));
     lines.push(format!("balance_total={}", proof.balance_total));
-    lines.push(format!("balance_blind={}", scalar_to_hex(&proof.balance_blind)?));
+    lines.push(format!(
+        "balance_blind={}",
+        scalar_to_hex(&proof.balance_blind)?
+    ));
+    lines.push(format!(
+        "kzg_opening_proof_hex={}",
+        proof.kzg_opening_proof_hex
+    ));
+    lines.push(format!("sp1_proof_hex={}", proof.sp1_proof_hex));
+    lines.push(format!("sp1_vk_hex={}", proof.sp1_vk_hex));
+    lines.push(format!(
+        "sp1_public_values_hex={}",
+        proof.sp1_public_values_hex
+    ));
     lines.push(format!("chain_proof_hex={}", proof.chain_proof_hex));
     lines.push(format!("alg_proof_hex={}", proof.alg_proof_hex));
     lines.push(format!("transcript_hex={}", proof.transcript_hex));
@@ -917,6 +1319,8 @@ fn decode_stored_init_proof(raw: &str) -> Result<StoredInitProof, String> {
         session_id: req_string(&kv, "session_id")?,
         accumulator_hex: req_string(&kv, "accumulator_hex")?,
         balance_commitment_hex: req_string(&kv, "balance_commitment_hex")?,
+        c_shape_hex: kv.get("c_shape_hex").cloned().unwrap_or_default(),
+        c_y_hex: kv.get("c_y_hex").cloned().unwrap_or_default(),
         init_salt: req_scalar(&kv, "init_salt")?,
         init_digest_hex: req_string(&kv, "init_digest_hex")?,
         ownership_artifact_digest_hex: req_string(&kv, "ownership_artifact_digest_hex")?,
@@ -925,8 +1329,22 @@ fn decode_stored_init_proof(raw: &str) -> Result<StoredInitProof, String> {
         zeta: req_scalar(&kv, "zeta")?,
         p_zeta: req_scalar(&kv, "p_zeta")?,
         product_zeta: req_scalar(&kv, "product_zeta")?,
+        r_shape: kv
+            .get("r_shape")
+            .map(|value| scalar_from_hex(value))
+            .transpose()?
+            .unwrap_or_else(|| Fr::from(0u64)),
+        r_y: kv
+            .get("r_y")
+            .map(|value| scalar_from_hex(value))
+            .transpose()?
+            .unwrap_or_else(|| Fr::from(0u64)),
         balance_total: req_i128(&kv, "balance_total")?,
         balance_blind: req_scalar(&kv, "balance_blind")?,
+        kzg_opening_proof_hex: kv.get("kzg_opening_proof_hex").cloned().unwrap_or_default(),
+        sp1_proof_hex: kv.get("sp1_proof_hex").cloned().unwrap_or_default(),
+        sp1_vk_hex: kv.get("sp1_vk_hex").cloned().unwrap_or_default(),
+        sp1_public_values_hex: kv.get("sp1_public_values_hex").cloned().unwrap_or_default(),
         chain_proof_hex: kv.get("chain_proof_hex").cloned().unwrap_or_default(),
         alg_proof_hex: kv.get("alg_proof_hex").cloned().unwrap_or_default(),
         transcript_hex: req_string(&kv, "transcript_hex")?,

@@ -116,9 +116,11 @@ pub fn generate_scenario(
 }
 
 pub fn write_scenario(output_dir: &Path, scenario: &MockScenario) -> Result<PathBuf, String> {
-    fs::create_dir_all(output_dir).map_err(|err| format!("create {}: {err}", output_dir.display()))?;
+    fs::create_dir_all(output_dir)
+        .map_err(|err| format!("create {}: {err}", output_dir.display()))?;
     let windows_dir = output_dir.join("windows");
-    fs::create_dir_all(&windows_dir).map_err(|err| format!("create {}: {err}", windows_dir.display()))?;
+    fs::create_dir_all(&windows_dir)
+        .map_err(|err| format!("create {}: {err}", windows_dir.display()))?;
 
     write_reserves_csv(&output_dir.join("reserves.csv"), &scenario.reserves)?;
     for window in &scenario.windows {
@@ -127,7 +129,10 @@ pub fn write_scenario(output_dir: &Path, scenario: &MockScenario) -> Result<Path
         let meta_path = windows_dir.join(format!("window_{:04}.meta", window.index));
         fs::write(
             &meta_path,
-            format!("old_root={}\nnew_root={}\n", window.old_root, window.new_root),
+            format!(
+                "old_root={}\nnew_root={}\n",
+                window.old_root, window.new_root
+            ),
         )
         .map_err(|err| format!("write {}: {err}", meta_path.display()))?;
     }
@@ -165,17 +170,32 @@ pub fn load_manifest(manifest_path: &Path) -> Result<MockScenario, String> {
         match key {
             "seed" => seed = Some(value.parse::<u64>().map_err(|err| format!("seed: {err}"))?),
             "num_accounts" => {
-                num_accounts = Some(value.parse::<usize>().map_err(|err| format!("num_accounts: {err}"))?)
+                num_accounts = Some(
+                    value
+                        .parse::<usize>()
+                        .map_err(|err| format!("num_accounts: {err}"))?,
+                )
             }
             "num_reserves" => {
-                num_reserves = Some(value.parse::<usize>().map_err(|err| format!("num_reserves: {err}"))?)
+                num_reserves = Some(
+                    value
+                        .parse::<usize>()
+                        .map_err(|err| format!("num_reserves: {err}"))?,
+                )
             }
             "num_blocks" => {
-                num_blocks = Some(value.parse::<usize>().map_err(|err| format!("num_blocks: {err}"))?)
+                num_blocks = Some(
+                    value
+                        .parse::<usize>()
+                        .map_err(|err| format!("num_blocks: {err}"))?,
+                )
             }
             "txs_per_block" => {
-                txs_per_block =
-                    Some(value.parse::<usize>().map_err(|err| format!("txs_per_block: {err}"))?)
+                txs_per_block = Some(
+                    value
+                        .parse::<usize>()
+                        .map_err(|err| format!("txs_per_block: {err}"))?,
+                )
             }
             "initial_root" => initial_root = Some(value.to_string()),
             _ => {}
@@ -196,7 +216,8 @@ pub fn load_manifest(manifest_path: &Path) -> Result<MockScenario, String> {
             break;
         }
         let deltas = common::io::read_delta_csv(&csv_path)?;
-        let meta = fs::read_to_string(&meta_path).map_err(|err| format!("read {}: {err}", meta_path.display()))?;
+        let meta = fs::read_to_string(&meta_path)
+            .map_err(|err| format!("read {}: {err}", meta_path.display()))?;
         let mut old_root = String::new();
         let mut new_root = String::new();
         for line in meta.lines() {

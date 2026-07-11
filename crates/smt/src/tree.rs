@@ -4,9 +4,10 @@ use crate::hash::{default_hashes, internal_hash, Hash};
 use crate::key::{common_prefix_len, key_bit, key_for_address};
 use crate::leaf::Leaf;
 use crate::proof::{
-    AddressProof, CollisionNonMembershipProof, CompactAddressProof, CompactCollisionNonMembershipProof,
-    CompactDefaultNonMembershipProof, CompactMembershipProof, CompactMultiproof, CompactNonMembershipProof,
-    CompactProofEntry, DefaultNonMembershipProof, MembershipProof, NonMembershipProof, SiblingRef,
+    AddressProof, CollisionNonMembershipProof, CompactAddressProof,
+    CompactCollisionNonMembershipProof, CompactDefaultNonMembershipProof, CompactMembershipProof,
+    CompactMultiproof, CompactNonMembershipProof, CompactProofEntry, DefaultNonMembershipProof,
+    MembershipProof, NonMembershipProof, SiblingRef,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -39,6 +40,40 @@ impl SparseMerkleTree {
         }
     }
 
+    pub fn from_leaves_and_layers(
+        depth: usize,
+        leaves: Vec<Leaf>,
+        layers: Vec<BTreeMap<u128, Hash>>,
+    ) -> Result<Self, String> {
+        if layers.len() != depth + 1 {
+            return Err(format!(
+                "SMT layer count mismatch: expected {}, got {}",
+                depth + 1,
+                layers.len()
+            ));
+        }
+        let mut map = BTreeMap::new();
+        for leaf in leaves {
+            if map.insert(leaf.address.clone(), leaf).is_some() {
+                return Err("duplicate SMT leaf in stored state".to_string());
+            }
+        }
+        let defaults = default_hashes(depth);
+        let root = layers
+            .last()
+            .and_then(|layer| layer.get(&0).copied())
+            .unwrap_or(defaults[depth]);
+        let tree = Self {
+            depth,
+            leaves: map,
+            layers,
+            root,
+            defaults,
+        };
+        tree.validate_snapshot_shape()?;
+        Ok(tree)
+    }
+
     pub fn root(&self) -> Hash {
         self.root
     }
@@ -49,6 +84,16 @@ impl SparseMerkleTree {
 
     pub fn leaf_records(&self) -> Vec<Leaf> {
         self.leaves.values().cloned().collect()
+    }
+
+    pub fn layer_records(&self) -> Vec<(usize, u128, Hash)> {
+        let mut records = Vec::new();
+        for (level, layer) in self.layers.iter().enumerate() {
+            for (index, hash) in layer {
+                records.push((level, *index, *hash));
+            }
+        }
+        records
     }
 
     pub fn upsert(&mut self, leaf: Leaf) {
@@ -124,8 +169,12 @@ impl SparseMerkleTree {
         let mut total_sibling_hashes = 0usize;
         let mut entries = Vec::with_capacity(addresses.len());
         for (address, proof) in addresses.iter().zip(proofs.into_iter()) {
-            let compact_proof =
-                compact_address_proof(proof, &self.defaults, &mut frontier_index, &mut frontier_hashes);
+            let compact_proof = compact_address_proof(
+                proof,
+                &self.defaults,
+                &mut frontier_index,
+                &mut frontier_hashes,
+            );
             total_sibling_hashes += compact_sibling_len(&compact_proof);
             entries.push(CompactProofEntry {
                 address: address.clone(),
@@ -146,7 +195,8 @@ impl SparseMerkleTree {
         for (distance, layer) in self.layers.iter().take(self.depth).enumerate() {
             let sibling_index = sibling_index(index);
             out.push(
-                layer.get(&sibling_index)
+                layer
+                    .get(&sibling_index)
                     .copied()
                     .unwrap_or(self.defaults[distance]),
             );
@@ -197,6 +247,37 @@ impl SparseMerkleTree {
         } else {
             (self.deepest_non_default_prefix(key) + 1).min(self.depth)
         }
+    }
+
+    fn validate_snapshot_shape(&self) -> Result<(), String> {
+        for (level, layer) in self.layers.iter().enumerate() {
+            let width_bits = self.depth.saturating_sub(level);
+            if width_bits < 128 {
+                let max_width = 1u128 << width_bits;
+                for index in layer.keys() {
+                    if *index >= max_width {
+                        return Err(format!(
+                            "stored SMT node index out of range at level {level}"
+                        ));
+                    }
+                }
+            }
+        }
+
+        for leaf in self.leaves.values() {
+            let index = prefix_index(&leaf.key, self.depth);
+            let stored = self.layers[0]
+                .get(&index)
+                .ok_or_else(|| format!("missing stored leaf node for {}", leaf.address))?;
+            if *stored != leaf.hash() {
+                return Err(format!("stored leaf hash mismatch for {}", leaf.address));
+            }
+        }
+
+        if !self.layers[self.depth].contains_key(&0) && self.root != self.defaults[self.depth] {
+            return Err("stored SMT root layer is missing root node".to_string());
+        }
+        Ok(())
     }
 }
 

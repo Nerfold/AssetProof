@@ -2,8 +2,8 @@
 //! Definition of the proof struct.
 
 use crate::errors::R1CSError;
-use crate::inner_types::*;
 use crate::inner_product_proof::InnerProductProof;
+use crate::inner_types::*;
 use crate::util;
 use crate::CtOptionOps;
 
@@ -66,6 +66,11 @@ pub struct R1CSProof {
 }
 
 impl R1CSProof {
+    /// Return the first-phase input-wire vector commitment `A_I1`.
+    pub fn phase_one_input_commitment(&self) -> G1Projective {
+        self.A_I1
+    }
+
     /// Serializes the proof into a byte array of 1 version byte + \\((13 or 16) + 2k\\) 32-byte elements,
     /// where \\(k=\lceil \log_2(n) \rceil\\) and \\(n\\) is the number of multiplication gates.
     ///

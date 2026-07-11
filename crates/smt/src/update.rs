@@ -39,14 +39,24 @@ struct PreparedMemberUpdate {
     new_leaf: Leaf,
 }
 
-pub fn build_update_multiproof(state: &SmtState, deltas: &[Delta]) -> Result<CompactMultiproof, String> {
+pub fn build_update_multiproof(
+    state: &SmtState,
+    deltas: &[Delta],
+) -> Result<CompactMultiproof, String> {
     ensure_canonical_deltas(deltas)?;
     let tree = state.tree();
-    let addresses = deltas.iter().map(|delta| delta.address.clone()).collect::<Vec<_>>();
+    let addresses = deltas
+        .iter()
+        .map(|delta| delta.address.clone())
+        .collect::<Vec<_>>();
     tree.compact_multiproof(&addresses)
 }
 
-pub fn build_update_witness(state: &SmtState, deltas: &[Delta], balance_blind_delta: Fr) -> Result<UpdateWitness, String> {
+pub fn build_update_witness(
+    state: &SmtState,
+    deltas: &[Delta],
+    balance_blind_delta: Fr,
+) -> Result<UpdateWitness, String> {
     ensure_canonical_deltas(deltas)?;
     let tree = state.tree();
     let mut entries = Vec::with_capacity(deltas.len());
@@ -125,7 +135,8 @@ pub fn apply_update_in_place(
     state.state_root = new_state_root.to_string();
 
     let new_commitment = state.balance_commitment();
-    let expected_commitment = old_commitment + commit_balance(aggregate_delta, witness.balance_blind_delta);
+    let expected_commitment =
+        old_commitment + commit_balance(aggregate_delta, witness.balance_blind_delta);
     if new_commitment != expected_commitment {
         return Err("balance commitment transition mismatch".to_string());
     }
@@ -155,7 +166,11 @@ pub fn apply_update_in_place(
         new_balance_commitment_hex: point_g1_to_hex(&new_commitment)?,
         proof_digest_hex: common::crypto::hex_encode(&proof_digest),
         witness_hex,
-        touched_addresses: witness.entries.iter().map(|entry| entry.address.clone()).collect(),
+        touched_addresses: witness
+            .entries
+            .iter()
+            .map(|entry| entry.address.clone())
+            .collect(),
         membership_flags: flags,
         sp1_proof_hex: String::new(),
         sp1_vk_hex: String::new(),
@@ -171,7 +186,8 @@ pub fn verify_update(
     if proof.scheme != "smt+snarks" {
         return Err("unexpected proof scheme".to_string());
     }
-    if proof.old_state_root != old_state.state_root || proof.new_state_root != new_state.state_root {
+    if proof.old_state_root != old_state.state_root || proof.new_state_root != new_state.state_root
+    {
         return Err("state root labels mismatch".to_string());
     }
     if proof.old_smt_root_hex != hex_string(&old_state.smt_root()) {
@@ -226,14 +242,25 @@ fn verify_witness_shape(witness: &UpdateWitness) -> Result<(), String> {
     Ok(())
 }
 
-fn verify_address_proof(tree: &SparseMerkleTree, address: &str, proof: &AddressProof) -> Result<(), String> {
+fn verify_address_proof(
+    tree: &SparseMerkleTree,
+    address: &str,
+    proof: &AddressProof,
+) -> Result<(), String> {
     let key = key_for_address(address)?;
     match proof {
         AddressProof::Membership(MembershipProof { siblings }) => {
             let leaf = tree
                 .get(address)
                 .ok_or_else(|| format!("missing leaf for member proof {address}"))?;
-            verify_membership_proof(tree.depth, tree.root(), &key, leaf.balance, &leaf.salt, siblings)
+            verify_membership_proof(
+                tree.depth,
+                tree.root(),
+                &key,
+                leaf.balance,
+                &leaf.salt,
+                siblings,
+            )
         }
         AddressProof::NonMembership(NonMembershipProof::Default(default)) => {
             verify_default_non_membership_proof(tree.depth, tree.root(), &key, default)
@@ -329,10 +356,12 @@ fn key_bit_at(key: &Hash, depth: usize) -> bool {
     ((byte >> offset) & 1) == 1
 }
 
-
 pub fn serialize_update_witness(witness: &UpdateWitness) -> Result<String, String> {
     let mut lines = Vec::new();
-    lines.push(format!("blind={}", scalar_to_hex(&witness.balance_blind_delta)?));
+    lines.push(format!(
+        "blind={}",
+        scalar_to_hex(&witness.balance_blind_delta)?
+    ));
     for entry in &witness.entries {
         lines.push(format!("entry.address={}", entry.address));
         lines.push(format!("entry.delta={}", entry.delta));
@@ -348,10 +377,22 @@ pub fn serialize_update_witness(witness: &UpdateWitness) -> Result<String, Strin
             }
             AddressProof::NonMembership(NonMembershipProof::Collision(collision)) => {
                 lines.push("entry.kind=nonmember-collision".to_string());
-                lines.push(format!("entry.collision_address={}", collision.collision_address));
-                lines.push(format!("entry.collision_balance={}", collision.collision_balance));
-                lines.push(format!("entry.collision_salt={}", hex_string(&collision.collision_salt)));
-                lines.push(format!("entry.siblings={}", hashes_csv(&collision.siblings)));
+                lines.push(format!(
+                    "entry.collision_address={}",
+                    collision.collision_address
+                ));
+                lines.push(format!(
+                    "entry.collision_balance={}",
+                    collision.collision_balance
+                ));
+                lines.push(format!(
+                    "entry.collision_salt={}",
+                    hex_string(&collision.collision_salt)
+                ));
+                lines.push(format!(
+                    "entry.siblings={}",
+                    hashes_csv(&collision.siblings)
+                ));
             }
         }
     }
@@ -360,7 +401,8 @@ pub fn serialize_update_witness(witness: &UpdateWitness) -> Result<String, Strin
 
 pub fn deserialize_update_witness(encoded: &str) -> Result<UpdateWitness, String> {
     let raw = common::crypto::hex_decode(encoded)?;
-    let text = String::from_utf8(raw).map_err(|err| format!("invalid update witness utf8: {err}"))?;
+    let text =
+        String::from_utf8(raw).map_err(|err| format!("invalid update witness utf8: {err}"))?;
     let mut lines = text.lines();
     let blind_line = lines
         .next()
@@ -399,17 +441,29 @@ fn parse_entry_block(lines: &[String]) -> Result<UpdateWitnessEntry, String> {
         if let Some(value) = line.strip_prefix("entry.address=") {
             address = Some(value.to_string());
         } else if let Some(value) = line.strip_prefix("entry.delta=") {
-            delta = Some(value.parse::<i128>().map_err(|err| format!("invalid delta: {err}"))?);
+            delta = Some(
+                value
+                    .parse::<i128>()
+                    .map_err(|err| format!("invalid delta: {err}"))?,
+            );
         } else if let Some(value) = line.strip_prefix("entry.kind=") {
             kind = Some(value.to_string());
         } else if let Some(value) = line.strip_prefix("entry.siblings=") {
             siblings = Some(parse_hashes_csv(value)?);
         } else if let Some(value) = line.strip_prefix("entry.default_depth=") {
-            default_depth = Some(value.parse::<usize>().map_err(|err| format!("invalid depth: {err}"))?);
+            default_depth = Some(
+                value
+                    .parse::<usize>()
+                    .map_err(|err| format!("invalid depth: {err}"))?,
+            );
         } else if let Some(value) = line.strip_prefix("entry.collision_address=") {
             collision_address = Some(value.to_string());
         } else if let Some(value) = line.strip_prefix("entry.collision_balance=") {
-            collision_balance = Some(value.parse::<i128>().map_err(|err| format!("invalid collision balance: {err}"))?);
+            collision_balance = Some(
+                value
+                    .parse::<i128>()
+                    .map_err(|err| format!("invalid collision balance: {err}"))?,
+            );
         } else if let Some(value) = line.strip_prefix("entry.collision_salt=") {
             collision_salt = Some(parse_hash_hex(value)?);
         }
@@ -442,7 +496,11 @@ fn parse_entry_block(lines: &[String]) -> Result<UpdateWitnessEntry, String> {
         _ => return Err(format!("unknown witness kind {kind}")),
     };
 
-    Ok(UpdateWitnessEntry { address, delta, proof })
+    Ok(UpdateWitnessEntry {
+        address,
+        delta,
+        proof,
+    })
 }
 
 fn hashes_csv(values: &[[u8; 32]]) -> String {

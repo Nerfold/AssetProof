@@ -101,3 +101,44 @@ pub struct Sp1InsertPublicValues {
     pub old_balance_total: i128,
     pub new_balance_total: i128,
 }
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Sp1InitReserveEntry {
+    pub address: String,
+    pub encoded_address_le: [u8; 32],
+    pub balance: i128,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Sp1InitStdin {
+    pub chain_id: String,
+    pub state_root: String,
+    pub session_id: String,
+    pub reserve_count: usize,
+    pub init_salt_le: [u8; 32],
+    pub alpha_le: [u8; 32],
+    pub zeta_le: [u8; 32],
+    pub p_zeta_le: [u8; 32],
+    pub product_zeta_le: [u8; 32],
+    pub balance_total: i128,
+    pub init_digest_hex: String,
+    pub ownership_artifact_digest_hex: String,
+    pub chain_balance_artifact_digest_hex: String,
+    pub reserves: Vec<Sp1InitReserveEntry>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Sp1InitPublicValues {
+    pub chain_id: String,
+    pub state_root: String,
+    pub session_id: String,
+    pub reserve_count: usize,
+    pub init_digest_hex: String,
+    pub ownership_artifact_digest_hex: String,
+    pub chain_balance_artifact_digest_hex: String,
+    pub alpha_le: [u8; 32],
+    pub zeta_le: [u8; 32],
+    pub p_zeta_le: [u8; 32],
+    pub product_zeta_le: [u8; 32],
+    pub balance_total: i128,
+}

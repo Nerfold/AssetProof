@@ -8,6 +8,8 @@ use ark_ff::PrimeField;
 use common::crypto::{g1_mul_generator, hash_to_scalar};
 
 pub fn derive_generator(label: &str, index: usize) -> G1Projective {
+    // Demo CRS derivation. Production deployments must replace this with
+    // independently generated CRS points whose discrete-log relations are unknown.
     let scalar = hash_to_scalar(label, index.to_string().as_bytes());
     g1_mul_generator(&scalar)
 }
@@ -45,5 +47,6 @@ pub fn commit_balance(value: i128, blind: Fr) -> G1Projective {
 }
 
 pub fn acc_balance(value: i128, v: G1Projective, blind: Fr, h: G1Projective) -> G1Projective {
-    v.mul_bigint(common::crypto::scalar_from_i128(value).into_bigint()) + h.mul_bigint(blind.into_bigint())
+    v.mul_bigint(common::crypto::scalar_from_i128(value).into_bigint())
+        + h.mul_bigint(blind.into_bigint())
 }

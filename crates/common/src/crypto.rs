@@ -120,7 +120,10 @@ pub fn read_u8_vec_csv(raw: &str) -> Result<Vec<u8>, String> {
         return Ok(Vec::new());
     }
     raw.split(',')
-        .map(|item| item.parse::<u8>().map_err(|err| format!("invalid u8: {err}")))
+        .map(|item| {
+            item.parse::<u8>()
+                .map_err(|err| format!("invalid u8: {err}"))
+        })
         .collect()
 }
 

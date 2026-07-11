@@ -10,6 +10,7 @@ use sp1_sdk::SP1VerifyingKey;
 
 const UPDATE_ELF_NAME: &str = "smt-update";
 const INSERT_ELF_NAME: &str = "smt-insert";
+const INIT_ELF_NAME: &str = "init";
 
 #[derive(Clone, Serialize, Deserialize)]
 struct StoredSp1Setup {
@@ -22,9 +23,15 @@ pub fn default_setup_dir() -> PathBuf {
     PathBuf::from(".sp1-setup")
 }
 
-pub fn ensure_all_setups(setup_dir: &Path, update_elf: Elf, insert_elf: Elf) -> Result<(), String> {
+pub fn ensure_all_setups(
+    setup_dir: &Path,
+    update_elf: Elf,
+    insert_elf: Elf,
+    init_elf: Elf,
+) -> Result<(), String> {
     ensure_setup_file(setup_dir, UPDATE_ELF_NAME, update_elf)?;
     ensure_setup_file(setup_dir, INSERT_ELF_NAME, insert_elf)?;
+    ensure_setup_file(setup_dir, INIT_ELF_NAME, init_elf)?;
     Ok(())
 }
 
@@ -34,6 +41,10 @@ pub fn load_update_vk(setup_dir: &Path, update_elf: Elf) -> Result<SP1VerifyingK
 
 pub fn load_insert_vk(setup_dir: &Path, insert_elf: Elf) -> Result<SP1VerifyingKey, String> {
     load_setup_file(setup_dir, INSERT_ELF_NAME, insert_elf)
+}
+
+pub fn load_init_vk(setup_dir: &Path, init_elf: Elf) -> Result<SP1VerifyingKey, String> {
+    load_setup_file(setup_dir, INIT_ELF_NAME, init_elf)
 }
 
 fn ensure_setup_file(setup_dir: &Path, elf_name: &str, elf: Elf) -> Result<(), String> {
@@ -97,7 +108,7 @@ fn read_setup_file(path: &Path) -> Result<StoredSp1Setup, String> {
 }
 
 fn write_setup_file(path: &Path, stored: &StoredSp1Setup) -> Result<(), String> {
-    let bytes = bincode::serialize(stored)
-        .map_err(|err| format!("serialize {}: {err}", path.display()))?;
+    let bytes =
+        bincode::serialize(stored).map_err(|err| format!("serialize {}: {err}", path.display()))?;
     fs::write(path, bytes).map_err(|err| format!("write {}: {err}", path.display()))
 }

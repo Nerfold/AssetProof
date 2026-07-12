@@ -2,4 +2,5 @@
 
 extern crate alloc;
 
+pub mod ethereum_mpt;
 pub mod io;

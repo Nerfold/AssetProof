@@ -58,6 +58,11 @@ pub enum ChainBalanceProofInput {
         proof_payload_hex: String,
         public_inputs_hex: String,
     },
+    BinaryMerkleV1 {
+        chain_id: String,
+        leaf_index: u64,
+        siblings_hex: Vec<String>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

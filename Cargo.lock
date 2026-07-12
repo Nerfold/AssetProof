@@ -1265,6 +1265,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "eth-sync"
+version = "0.1.0"
+dependencies = [
+ "common",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "eventsource-stream"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2892,6 +2901,7 @@ dependencies = [
  "ark-bls12-381",
  "ark-ff",
  "common",
+ "eth-sync",
  "mock-chain",
  "nizk-fixed-set",
  "smt",
@@ -4447,6 +4457,7 @@ name = "sp1-host"
 version = "0.1.0"
 dependencies = [
  "ark-bls12-381",
+ "ark-ec",
  "ark-ff",
  "bincode",
  "common",
@@ -4510,6 +4521,9 @@ dependencies = [
 name = "sp1-init-merkle"
 version = "0.1.0"
 dependencies = [
+ "blake3",
+ "k256",
+ "sha3",
  "smt",
  "sp1-programs-common",
  "sp1-zkvm",
@@ -4530,6 +4544,19 @@ dependencies = [
  "sp1-primitives",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "sp1-kzg-insert"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "k256",
+ "num",
+ "sha3",
+ "sp1-curves",
+ "sp1-programs-common",
+ "sp1-zkvm",
 ]
 
 [[package]]
@@ -4572,6 +4599,7 @@ name = "sp1-programs-common"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "sha3",
  "slop-algebra",
  "sp1-primitives",
 ]

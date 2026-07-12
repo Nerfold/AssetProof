@@ -7,6 +7,7 @@ edition = "2021"
 ark-bls12-381 = "0.6"
 ark-ff = "0.6"
 common = { path = "../common" }
+eth-sync = { path = "../eth-sync" }
 mock-chain = { path = "../mock-chain" }
 nizk-fixed-set = { path = "../nizk" }
 smt = { path = "../smt" }

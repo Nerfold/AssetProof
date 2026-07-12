@@ -4,17 +4,22 @@ use std::sync::{Arc, Mutex, OnceLock};
 use ark_bls12_381::Fr;
 use ark_ff::{BigInteger, PrimeField};
 use common::crypto::{hex_decode, hex_encode};
-use common::types::StoredInitProof;
+use common::types::{
+    ChainBalanceProofInput, InitReserveWitness, OwnershipWitnessInput, StoredInitProof,
+};
+use sp1_programs_common::io::{Sp1ChainBalanceProof, Sp1OwnershipWitness};
 use sp1_programs_common::io::{Sp1InitPublicValues, Sp1InitReserveEntry, Sp1InitStdin};
 use sp1_sdk::blocking::{ProveRequest, Prover as BlockingProver, ProverClient};
 use sp1_sdk::include_elf;
 use sp1_sdk::{ProvingKey, SP1ProofWithPublicValues, SP1Stdin};
 
+use crate::proof_mode::{configured_proof_mode, ensure_trusted_vk, ConfiguredProofMode};
 use crate::setup::{default_setup_dir, ensure_all_setups, load_init_vk};
 
 const INIT_ELF: sp1_sdk::Elf = include_elf!("sp1-init-merkle");
 const SMT_UPDATE_ELF: sp1_sdk::Elf = include_elf!("sp1-smt-update");
 const SMT_INSERT_ELF: sp1_sdk::Elf = include_elf!("sp1-smt-insert");
+const KZG_INSERT_ELF: sp1_sdk::Elf = include_elf!("sp1-kzg-insert");
 
 #[derive(Clone)]
 struct Sp1InitContext {
@@ -25,7 +30,13 @@ struct Sp1InitContext {
 static SP1_INIT_CONTEXT: OnceLock<Mutex<Option<Sp1InitContext>>> = OnceLock::new();
 
 pub fn ensure_sp1_setup(setup_dir: &Path) -> Result<(), String> {
-    ensure_all_setups(setup_dir, SMT_UPDATE_ELF, SMT_INSERT_ELF, INIT_ELF)
+    ensure_all_setups(
+        setup_dir,
+        SMT_UPDATE_ELF,
+        SMT_INSERT_ELF,
+        INIT_ELF,
+        KZG_INSERT_ELF,
+    )
 }
 
 pub fn prove_init(
@@ -53,9 +64,14 @@ pub fn verify_init_proof(proof: &StoredInitProof) -> Result<Sp1InitPublicValues,
     {
         return Err("stored SP1 init public values do not match proof bundle".to_string());
     }
-    let vk = deserialize_sp1_vk(&proof.sp1_vk_hex)?;
+    ensure_trusted_vk(
+        &proof.sp1_vk_hex,
+        ctx.pk.verifying_key(),
+        hex_decode,
+        "init",
+    )?;
     ctx.prover
-        .verify(&bundle, &vk, None)
+        .verify(&bundle, ctx.pk.verifying_key(), None)
         .map_err(|err| format!("sp1 init verify failed: {err}"))?;
     Ok(decode_public_values(&bundle))
 }
@@ -76,20 +92,29 @@ pub fn build_init_stdin(
     addresses: &[String],
     encoded_addresses: &[Fr],
     balances: &[i128],
+    witnesses: &[InitReserveWitness],
 ) -> Result<Sp1InitStdin, String> {
-    if addresses.len() != encoded_addresses.len() || addresses.len() != balances.len() {
+    if addresses.len() != encoded_addresses.len()
+        || addresses.len() != balances.len()
+        || addresses.len() != witnesses.len()
+    {
         return Err("init SP1 stdin vector length mismatch".to_string());
     }
     let reserves = addresses
         .iter()
         .zip(encoded_addresses.iter())
         .zip(balances.iter())
-        .map(|((address, encoded), balance)| Sp1InitReserveEntry {
-            address: address.clone(),
-            encoded_address_le: fr_to_le_bytes(*encoded),
-            balance: *balance,
+        .zip(witnesses.iter())
+        .map(|(((address, encoded), balance), witness)| {
+            Ok(Sp1InitReserveEntry {
+                address: address.clone(),
+                encoded_address_le: fr_to_le_bytes(*encoded),
+                balance: *balance,
+                ownership: convert_ownership(&witness.ownership)?,
+                chain_balance_proof: convert_chain_proof(&witness.chain_balance_proof)?,
+            })
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, String>>()?;
     Ok(Sp1InitStdin {
         chain_id: chain_id.to_string(),
         state_root: state_root.to_string(),
@@ -106,6 +131,70 @@ pub fn build_init_stdin(
         chain_balance_artifact_digest_hex: chain_balance_artifact_digest_hex.to_string(),
         reserves,
     })
+}
+
+pub(crate) fn convert_ownership(
+    value: &OwnershipWitnessInput,
+) -> Result<Sp1OwnershipWitness, String> {
+    match value {
+        OwnershipWitnessInput::MockPrivateKey { mock_private_key } => {
+            Ok(Sp1OwnershipWitness::MockPrivateKey {
+                private_key: mock_private_key.clone(),
+            })
+        }
+        OwnershipWitnessInput::EthereumEoaPrivateKeyHex { private_key_hex } => {
+            let bytes = hex_decode(private_key_hex)?;
+            let private_key: [u8; 32] = bytes
+                .try_into()
+                .map_err(|_| "Ethereum private key must contain 32 bytes".to_string())?;
+            Ok(Sp1OwnershipWitness::EthereumEoaPrivateKey { private_key })
+        }
+        OwnershipWitnessInput::ExternalOwnershipProof { scheme, .. } => {
+            Ok(Sp1OwnershipWitness::UnsupportedExternal {
+                scheme: scheme.clone(),
+            })
+        }
+    }
+}
+
+pub(crate) fn convert_chain_proof(
+    value: &ChainBalanceProofInput,
+) -> Result<Sp1ChainBalanceProof, String> {
+    match value {
+        ChainBalanceProofInput::Mock { proof_label } => Ok(Sp1ChainBalanceProof::MockBinding {
+            proof_label: proof_label.clone(),
+        }),
+        ChainBalanceProofInput::BinaryMerkleV1 {
+            leaf_index,
+            siblings_hex,
+            ..
+        } => Ok(Sp1ChainBalanceProof::BinaryMerkleV1 {
+            leaf_index: *leaf_index,
+            siblings: siblings_hex
+                .iter()
+                .map(|value| {
+                    let bytes = hex_decode(value)?;
+                    bytes
+                        .try_into()
+                        .map_err(|_| "Merkle sibling must contain 32 bytes".to_string())
+                })
+                .collect::<Result<Vec<_>, String>>()?,
+        }),
+        ChainBalanceProofInput::EthereumAccountProof {
+            account_proof_rlp_hex,
+            ..
+        } => Ok(Sp1ChainBalanceProof::EthereumAccountProof {
+            nodes: account_proof_rlp_hex
+                .iter()
+                .map(|node| hex_decode(node))
+                .collect::<Result<Vec<_>, _>>()?,
+        }),
+        ChainBalanceProofInput::GenericMerkleProof { proof_system, .. } => {
+            Ok(Sp1ChainBalanceProof::UnsupportedGeneric {
+                proof_system: proof_system.clone(),
+            })
+        }
+    }
 }
 
 fn sp1_context() -> Result<Sp1InitContext, String> {
@@ -134,11 +223,13 @@ fn run_sp1_proof(
 ) -> Result<SP1ProofWithPublicValues, String> {
     let mut stdin = SP1Stdin::new();
     stdin.write(stdin_value);
-    ctx.prover
-        .prove(&ctx.pk, stdin)
-        .compressed()
-        .run()
-        .map_err(|err| format!("sp1 init prove failed: {err}"))
+    let request = ctx.prover.prove(&ctx.pk, stdin);
+    let result = match configured_proof_mode()? {
+        ConfiguredProofMode::Groth16 => request.groth16().run(),
+        ConfiguredProofMode::Plonk => request.plonk().run(),
+        ConfiguredProofMode::Compressed => request.compressed().run(),
+    };
+    result.map_err(|err| format!("sp1 init prove failed: {err}"))
 }
 
 fn decode_public_values(bundle: &SP1ProofWithPublicValues) -> Sp1InitPublicValues {
@@ -161,11 +252,6 @@ fn serialize_sp1_vk(ctx: &Sp1InitContext) -> Result<String, String> {
     let bytes = bincode::serialize(ctx.pk.verifying_key())
         .map_err(|err| format!("serialize sp1 init vk: {err}"))?;
     Ok(hex_encode(&bytes))
-}
-
-fn deserialize_sp1_vk(value: &str) -> Result<sp1_sdk::SP1VerifyingKey, String> {
-    let bytes = hex_decode(value)?;
-    bincode::deserialize(&bytes).map_err(|err| format!("deserialize sp1 init vk: {err}"))
 }
 
 fn fr_to_le_bytes(value: Fr) -> [u8; 32] {

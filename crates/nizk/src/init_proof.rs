@@ -38,6 +38,9 @@ pub fn initialize_from_witnesses_with_adapter(
     if reserve_witnesses.is_empty() {
         return Err("reserve set must not be empty".to_string());
     }
+    for witness in reserve_witnesses {
+        validate_chain_id(&ctx.chain_id, &witness.chain_balance_proof)?;
+    }
 
     let prepared = reserve_witnesses
         .iter()
@@ -50,7 +53,7 @@ pub fn initialize_from_witnesses_with_adapter(
             balance: witness.balance,
         })
         .collect::<Vec<_>>();
-    initialize_core(ctx, &reserve_entries, &prepared, srs)
+    initialize_core(ctx, &reserve_entries, reserve_witnesses, &prepared, srs)
 }
 
 pub fn initialize_with_proof(
@@ -89,27 +92,38 @@ pub fn initialize_with_proof_and_adapter(
         .iter()
         .map(|witness| external.prepare_init_witness(&ctx, witness))
         .collect::<Result<Vec<_>, _>>()?;
-    initialize_core(&ctx, reserve_entries, &prepared, srs)
+    initialize_core(&ctx, reserve_entries, &reserve_witnesses, &prepared, srs)
 }
 
 fn initialize_core(
     ctx: &InitProvingContext,
     reserve_entries: &[ReserveEntry],
+    reserve_witnesses: &[InitReserveWitness],
     prepared_witnesses: &[PreparedInitReserveWitness],
     srs: &Srs,
 ) -> Result<InitProofResult, String> {
     if reserve_entries.is_empty() {
         return Err("reserve set must not be empty".to_string());
     }
-    if reserve_entries.len() != prepared_witnesses.len() {
-        return Err("reserve entries and prepared witnesses length mismatch".to_string());
+    if reserve_entries.len() != prepared_witnesses.len()
+        || reserve_entries.len() != reserve_witnesses.len()
+    {
+        return Err("reserve entries and init witnesses length mismatch".to_string());
     }
 
     let mut canonical_entries = Vec::with_capacity(reserve_entries.len());
-    for (entry, prepared) in reserve_entries.iter().zip(prepared_witnesses.iter()) {
+    for ((entry, witness), prepared) in reserve_entries
+        .iter()
+        .zip(reserve_witnesses.iter())
+        .zip(prepared_witnesses.iter())
+    {
+        if prepared.address != entry.address || prepared.balance != entry.balance {
+            return Err("external adapter changed the reserve address or balance".to_string());
+        }
         canonical_entries.push((
             common::encoding::encode_address(&entry.address)?,
             entry.clone(),
+            witness.clone(),
             prepared.clone(),
         ));
     }
@@ -118,11 +132,13 @@ fn initialize_core(
     let mut reserve_addresses = Vec::with_capacity(reserve_entries.len());
     let mut reserve_balances = Vec::with_capacity(reserve_entries.len());
     let mut roots = Vec::with_capacity(reserve_entries.len());
+    let mut canonical_witnesses = Vec::with_capacity(reserve_witnesses.len());
     let mut canonical_prepared = Vec::with_capacity(prepared_witnesses.len());
-    for (root, entry, prepared) in canonical_entries {
+    for (root, entry, witness, prepared) in canonical_entries {
         roots.push(root);
         reserve_addresses.push(entry.address);
         reserve_balances.push(entry.balance);
+        canonical_witnesses.push(witness);
         canonical_prepared.push(prepared);
     }
     if !is_strictly_ordered(&roots) {
@@ -164,7 +180,10 @@ fn initialize_core(
     let f_s = product_from_roots(&roots);
     let p_s = f_s.mul_scalar(alpha);
     let accumulator = commit_g1(srs, &p_s)?;
-    let balance_total: i128 = reserve_balances.iter().sum();
+    let balance_total = reserve_balances.iter().try_fold(0i128, |sum, balance| {
+        sum.checked_add(*balance)
+            .ok_or_else(|| "reserve balance total overflow".to_string())
+    })?;
     let balance_blind = derive_balance_blind(balance_total, reserve_entries.len());
     let balance_commitment = commit_balance(balance_total, balance_blind);
     let r_shape = derive_shape_blind(&roots, alpha);
@@ -237,6 +256,7 @@ fn initialize_core(
         &reserve_addresses,
         &roots,
         &reserve_balances,
+        &canonical_witnesses,
     )?;
     let (sp1_proof_hex, sp1_vk_hex, sp1_public_values_hex, _) =
         sp1_host::init::prove_init(sp1_stdin)?;
@@ -287,6 +307,24 @@ fn initialize_core(
     };
 
     Ok(InitProofResult { state, proof })
+}
+
+fn validate_chain_id(
+    expected: &str,
+    proof: &common::types::ChainBalanceProofInput,
+) -> Result<(), String> {
+    let actual = match proof {
+        common::types::ChainBalanceProofInput::Mock { .. } => return Ok(()),
+        common::types::ChainBalanceProofInput::EthereumAccountProof { chain_id, .. }
+        | common::types::ChainBalanceProofInput::GenericMerkleProof { chain_id, .. }
+        | common::types::ChainBalanceProofInput::BinaryMerkleV1 { chain_id, .. } => chain_id,
+    };
+    if actual != expected {
+        return Err(format!(
+            "chain proof chain_id mismatch: expected {expected}, got {actual}"
+        ));
+    }
+    Ok(())
 }
 
 pub fn verify_init_proof(
@@ -499,6 +537,11 @@ pub fn verify_init_public_proof(
         || sp1_public.balance_total != proof.balance_total
     {
         return Err("init SP1 public values mismatch".to_string());
+    }
+
+    let expected_balance_commitment = commit_balance(proof.balance_total, proof.balance_blind);
+    if point_g1_to_hex(&expected_balance_commitment)? != proof.balance_commitment_hex {
+        return Err("init balance commitment opening mismatch".to_string());
     }
 
     let expected_transcript = build_transcript_hex(

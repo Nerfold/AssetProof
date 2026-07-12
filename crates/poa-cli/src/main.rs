@@ -50,6 +50,37 @@ fn real_main() -> Result<(), String> {
     }
 
     match args[1].as_str() {
+        "eth-sync" => {
+            if args.len() != 5 {
+                return Err(
+                    "usage: poa-cli eth-sync <transition.json> <deltas.csv> <sync-output.json>"
+                        .to_string(),
+                );
+            }
+            let input =
+                fs::read_to_string(&args[2]).map_err(|err| format!("read {}: {err}", args[2]))?;
+            let output = eth_sync::synchronize_json(&input)?;
+            let csv = output.to_delta_csv();
+            fs::write(
+                &args[3],
+                if csv.is_empty() {
+                    csv
+                } else {
+                    format!("{csv}\n")
+                },
+            )
+            .map_err(|err| format!("write {}: {err}", args[3]))?;
+            fs::write(&args[4], output.to_pretty_json()?)
+                .map_err(|err| format!("write {}: {err}", args[4]))?;
+            println!(
+                "ethereum sync complete: block={}, old_root={}, new_root={}, touched={}, commitment={}",
+                output.block_hash,
+                output.old_state_root,
+                output.new_state_root,
+                output.addresses.len(),
+                output.delta_list_commitment_hex
+            );
+        }
         "sp1-setup" => {
             let setup_dir = if args.len() == 3 {
                 Path::new(&args[2]).to_path_buf()
@@ -1320,6 +1351,7 @@ fn flatten_parallel_state(state: &StoredParallelState) -> StoredState {
 
 fn print_usage() {
     println!("usage:");
+    println!("  poa-cli eth-sync <transition.json> <deltas.csv> <sync-output.json>");
     println!("  poa-cli sp1-setup [setup-dir]");
     println!("  poa-cli gen-srs <max-degree> <srs.bin>");
     println!("  poa-cli init <srs.bin> <reserves.csv> <state-root> <state.txt> <init-proof.txt>");

@@ -1,12 +1,13 @@
 [package]
-name = "sp1-init-merkle"
+name = "sp1-kzg-insert"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
 blake3 = { version = "1.8", default-features = false }
 k256 = { version = "0.13", default-features = false, features = ["arithmetic"] }
+num = { version = "0.4", default-features = false }
 sha3 = { version = "0.10", default-features = false }
+sp1-curves = "6.2.4"
 sp1-programs-common = { path = "../common" }
 sp1-zkvm = { version = "6.2.2" }
-smt = { path = "../../smt" }

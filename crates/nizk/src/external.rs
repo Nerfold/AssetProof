@@ -260,6 +260,31 @@ fn prepare_chain_balance(
                 ],
             ),
         },
+        ChainBalanceProofInput::BinaryMerkleV1 {
+            chain_id,
+            leaf_index,
+            siblings_hex,
+        } => {
+            let mut path = Vec::new();
+            for sibling in siblings_hex {
+                path.extend_from_slice(sibling.as_bytes());
+                path.push(b'|');
+            }
+            PreparedChainBalanceWitness {
+                scheme: "binary-merkle-v1".to_string(),
+                proof_digest_hex: hex_hash(
+                    "binary-merkle-v1",
+                    &[
+                        chain_id.as_bytes(),
+                        ctx.state_root.as_bytes(),
+                        witness.address.as_bytes(),
+                        &witness.balance.to_le_bytes(),
+                        &leaf_index.to_le_bytes(),
+                        &path,
+                    ],
+                ),
+            }
+        }
     })
 }
 

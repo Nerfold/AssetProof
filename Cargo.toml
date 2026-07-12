@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/common",
+    "crates/eth-sync",
     "crates/mock-chain",
     "crates/nizk",
     "crates/smt",
@@ -9,6 +10,7 @@ members = [
     "crates/sp1-programs/init-merkle",
     "crates/sp1-programs/smt-update",
     "crates/sp1-programs/smt-insert",
+    "crates/sp1-programs/kzg-insert",
     "crates/sp1-host",
     "crates/poa-cli",
 ]

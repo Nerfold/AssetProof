@@ -3,10 +3,11 @@ use ark_ff::{BigInteger, Field, One, PrimeField, Zero};
 
 use common::crypto::{hash_to_scalar, point_g1_from_hex, point_g1_to_hex, scalar_to_hex};
 use common::encoding::encode_address;
-use common::types::{PublicState, StoredState};
+use common::types::{ChainBalanceProofInput, OwnershipWitnessInput, PublicState, StoredState};
 
 use crate::bp::{prove_insert_relation_logic, verify_insert_relation_logic};
 use crate::commitment::commit_balance;
+use crate::commitment::derive_generator;
 use crate::external::{ExternalProofAdapter, ExternalProofArtifact, MockExternalProofAdapter};
 use crate::kzg::{commit_g1, Srs};
 use crate::polynomial::Polynomial;
@@ -14,8 +15,11 @@ use crate::zkopen::{eval_commit, prove_committed_opening, verify_committed_openi
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KzgInsertWitness {
+    pub chain_id: String,
     pub address: String,
     pub balance: i128,
+    pub ownership: OwnershipWitnessInput,
+    pub chain_balance_proof: ChainBalanceProofInput,
     pub ownership_artifact: ExternalProofArtifact,
     pub chain_balance_artifact: ExternalProofArtifact,
 }
@@ -28,6 +32,13 @@ impl KzgInsertWitness {
         chain_balance_witness: String,
     ) -> Self {
         Self {
+            chain_id: "mock-chain".to_string(),
+            ownership: OwnershipWitnessInput::MockPrivateKey {
+                mock_private_key: ownership_witness.clone(),
+            },
+            chain_balance_proof: ChainBalanceProofInput::Mock {
+                proof_label: chain_balance_witness.clone(),
+            },
             address,
             balance,
             ownership_artifact: ExternalProofArtifact::mock(ownership_witness),
@@ -64,6 +75,9 @@ pub struct KzgInsertProof {
     pub ownership_artifact_digest_hex: String,
     pub chain_balance_artifact_digest_hex: String,
     pub transcript_hex: String,
+    pub sp1_proof_hex: String,
+    pub sp1_vk_hex: String,
+    pub sp1_public_values_hex: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -99,6 +113,7 @@ pub fn apply_insert_with_adapter(
     if witness.balance < 0 {
         return Err("inserted balance must be non-negative".to_string());
     }
+    validate_insert_chain_id(witness)?;
     let ownership_artifact = external.verify_insert_ownership(
         &state.state_root,
         &witness.address,
@@ -279,6 +294,40 @@ pub fn apply_insert_with_adapter(
         &ownership_artifact.proof_digest_hex,
         &chain_balance_artifact.proof_digest_hex,
     )?;
+    let sp1_stdin = sp1_host::kzg_insert::build_stdin(
+        &witness.chain_id,
+        &state.state_root,
+        &witness.address,
+        witness.balance,
+        &witness.ownership,
+        &witness.chain_balance_proof,
+        x,
+        r_x,
+        r_ins,
+        &derive_generator("eval-v", 0),
+        &derive_generator("eval-h", 0),
+        &derive_generator("balance-v", 0),
+        &derive_generator("balance-h", 0),
+        &c_x,
+        &c_insert_balance,
+        &old_accumulator_hex,
+        &new_accumulator_hex,
+        &old_balance_commitment_hex,
+        &new_balance_commitment_hex,
+        state.reserve_addresses.len(),
+        state.reserve_addresses.len() + 1,
+        &transcript_hex,
+    )?;
+    let (sp1_proof_hex, sp1_vk_hex, sp1_public_values_hex, sp1_public) =
+        sp1_host::kzg_insert::prove(sp1_stdin)?;
+    if sp1_public.chain_id != witness.chain_id
+        || sp1_public.state_root != state.state_root
+        || !sp1_host::kzg_insert::point_matches(&sp1_public.c_x, &c_x)
+        || !sp1_host::kzg_insert::point_matches(&sp1_public.c_balance_delta, &c_insert_balance)
+        || sp1_public.transcript_hex != transcript_hex
+    {
+        return Err("SP1 KZG insert public values do not bind the insertion".to_string());
+    }
 
     let mut reserve_addresses = state.reserve_addresses.clone();
     reserve_addresses.push(witness.address.clone());
@@ -292,7 +341,10 @@ pub fn apply_insert_with_adapter(
         reserve_balances,
         masked_polynomial_coeffs: new_p.coeffs,
         accumulator_hex: new_accumulator_hex.clone(),
-        balance_total: state.balance_total + witness.balance,
+        balance_total: state
+            .balance_total
+            .checked_add(witness.balance)
+            .ok_or_else(|| "inserted balance total overflow".to_string())?,
         balance_blind: state.balance_blind + r_ins,
         balance_commitment_hex: new_balance_commitment_hex.clone(),
     };
@@ -324,9 +376,28 @@ pub fn apply_insert_with_adapter(
         ownership_artifact_digest_hex: ownership_artifact.proof_digest_hex,
         chain_balance_artifact_digest_hex: chain_balance_artifact.proof_digest_hex,
         transcript_hex,
+        sp1_proof_hex,
+        sp1_vk_hex,
+        sp1_public_values_hex,
     };
 
     Ok(KzgInsertResult { next_state, proof })
+}
+
+fn validate_insert_chain_id(witness: &KzgInsertWitness) -> Result<(), String> {
+    let actual = match &witness.chain_balance_proof {
+        ChainBalanceProofInput::Mock { .. } => return Ok(()),
+        ChainBalanceProofInput::EthereumAccountProof { chain_id, .. }
+        | ChainBalanceProofInput::GenericMerkleProof { chain_id, .. }
+        | ChainBalanceProofInput::BinaryMerkleV1 { chain_id, .. } => chain_id,
+    };
+    if actual != &witness.chain_id {
+        return Err(format!(
+            "insert chain proof chain_id mismatch: expected {}, got {}",
+            witness.chain_id, actual
+        ));
+    }
+    Ok(())
 }
 
 pub fn verify_insert(
@@ -350,6 +421,28 @@ pub fn verify_insert_with_srs(
     }
     if proof.scheme != "kzg-nizk-insert" {
         return Err("insert proof is not a production ZK proof".to_string());
+    }
+    let sp1_public = sp1_host::kzg_insert::verify(
+        &proof.sp1_proof_hex,
+        &proof.sp1_vk_hex,
+        &proof.sp1_public_values_hex,
+    )?;
+    let old_balance = point_g1_from_hex(&proof.old_balance_commitment_hex)?;
+    let new_balance = point_g1_from_hex(&proof.new_balance_commitment_hex)?;
+    let c_balance_delta = new_balance - old_balance;
+    let c_x = point_g1_from_hex(&proof.c_x_hex)?;
+    if sp1_public.state_root != proof.old_state_root
+        || !sp1_host::kzg_insert::point_matches(&sp1_public.c_x, &c_x)
+        || !sp1_host::kzg_insert::point_matches(&sp1_public.c_balance_delta, &c_balance_delta)
+        || sp1_public.old_accumulator_hex != proof.old_accumulator_hex
+        || sp1_public.new_accumulator_hex != proof.new_accumulator_hex
+        || sp1_public.old_balance_commitment_hex != proof.old_balance_commitment_hex
+        || sp1_public.new_balance_commitment_hex != proof.new_balance_commitment_hex
+        || sp1_public.reserve_count_before != proof.reserve_count_before
+        || sp1_public.reserve_count_after != proof.reserve_count_after
+        || sp1_public.transcript_hex != proof.transcript_hex
+    {
+        return Err("SP1 KZG insert public statement mismatch".to_string());
     }
     verify_committed_opening(
         srs,

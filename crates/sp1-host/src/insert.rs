@@ -17,6 +17,7 @@ use sp1_sdk::blocking::{ProveRequest, Prover as BlockingProver, ProverClient};
 use sp1_sdk::include_elf;
 use sp1_sdk::{ProvingKey, SP1ProofWithPublicValues, SP1Stdin};
 
+use crate::proof_mode::{configured_proof_mode, ensure_trusted_vk, ConfiguredProofMode};
 use crate::setup::{default_setup_dir, load_insert_vk};
 
 const SMT_INSERT_ELF: sp1_sdk::Elf = include_elf!("sp1-smt-insert");
@@ -170,9 +171,14 @@ pub fn verify_insert_proof(
 
     let ctx = sp1_insert_context()?;
     let bundle = deserialize_sp1_proof(&proof.sp1_proof_hex)?;
-    let vk = deserialize_sp1_vk(&proof.sp1_vk_hex)?;
+    ensure_trusted_vk(
+        &proof.sp1_vk_hex,
+        ctx.pk.verifying_key(),
+        hex_decode,
+        "insert",
+    )?;
     ctx.prover
-        .verify(&bundle, &vk, None)
+        .verify(&bundle, ctx.pk.verifying_key(), None)
         .map_err(|err| format!("sp1 insert verify failed: {err}"))?;
 
     let public_values = decode_insert_public_values(&bundle)?;
@@ -253,12 +259,13 @@ fn run_sp1_insert_proof(
 ) -> Result<SP1ProofWithPublicValues, String> {
     let mut stdin = SP1Stdin::new();
     stdin.write(stdin_value);
-    let proof = ctx
-        .prover
-        .prove(&ctx.pk, stdin)
-        .compressed()
-        .run()
-        .map_err(|err| format!("sp1 insert prove failed: {err}"))?;
+    let request = ctx.prover.prove(&ctx.pk, stdin);
+    let proof = match configured_proof_mode()? {
+        ConfiguredProofMode::Groth16 => request.groth16().run(),
+        ConfiguredProofMode::Plonk => request.plonk().run(),
+        ConfiguredProofMode::Compressed => request.compressed().run(),
+    }
+    .map_err(|err| format!("sp1 insert prove failed: {err}"))?;
     Ok(proof)
 }
 
@@ -302,9 +309,4 @@ fn serialize_sp1_vk(ctx: &Sp1InsertContext) -> Result<String, String> {
     let bytes = bincode::serialize(ctx.pk.verifying_key())
         .map_err(|err| format!("serialize sp1 insert vk: {err}"))?;
     Ok(hex_encode(&bytes))
-}
-
-fn deserialize_sp1_vk(value: &str) -> Result<sp1_sdk::SP1VerifyingKey, String> {
-    let bytes = hex_decode(value)?;
-    bincode::deserialize(&bytes).map_err(|err| format!("deserialize sp1 insert vk: {err}"))
 }

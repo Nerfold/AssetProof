@@ -11,6 +11,7 @@ use sp1_sdk::SP1VerifyingKey;
 const UPDATE_ELF_NAME: &str = "smt-update";
 const INSERT_ELF_NAME: &str = "smt-insert";
 const INIT_ELF_NAME: &str = "init";
+const KZG_INSERT_ELF_NAME: &str = "kzg-insert";
 
 #[derive(Clone, Serialize, Deserialize)]
 struct StoredSp1Setup {
@@ -28,11 +29,17 @@ pub fn ensure_all_setups(
     update_elf: Elf,
     insert_elf: Elf,
     init_elf: Elf,
+    kzg_insert_elf: Elf,
 ) -> Result<(), String> {
     ensure_setup_file(setup_dir, UPDATE_ELF_NAME, update_elf)?;
     ensure_setup_file(setup_dir, INSERT_ELF_NAME, insert_elf)?;
     ensure_setup_file(setup_dir, INIT_ELF_NAME, init_elf)?;
+    ensure_setup_file(setup_dir, KZG_INSERT_ELF_NAME, kzg_insert_elf)?;
     Ok(())
+}
+
+pub fn load_kzg_insert_vk(setup_dir: &Path, elf: Elf) -> Result<SP1VerifyingKey, String> {
+    load_setup_file(setup_dir, KZG_INSERT_ELF_NAME, elf)
 }
 
 pub fn load_update_vk(setup_dir: &Path, update_elf: Elf) -> Result<SP1VerifyingKey, String> {

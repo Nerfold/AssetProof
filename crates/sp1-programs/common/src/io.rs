@@ -5,6 +5,12 @@ use serde::{Deserialize, Serialize};
 pub type Hash = [u8; 32];
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Sp1G1Affine {
+    pub x_be: Vec<u8>,
+    pub y_be: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Sp1SiblingRef {
     Default,
     Frontier(usize),
@@ -107,6 +113,32 @@ pub struct Sp1InitReserveEntry {
     pub address: String,
     pub encoded_address_le: [u8; 32],
     pub balance: i128,
+    pub ownership: Sp1OwnershipWitness,
+    pub chain_balance_proof: Sp1ChainBalanceProof,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Sp1OwnershipWitness {
+    MockPrivateKey { private_key: String },
+    EthereumEoaPrivateKey { private_key: [u8; 32] },
+    UnsupportedExternal { scheme: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Sp1ChainBalanceProof {
+    MockBinding {
+        proof_label: String,
+    },
+    BinaryMerkleV1 {
+        leaf_index: u64,
+        siblings: Vec<Hash>,
+    },
+    EthereumAccountProof {
+        nodes: Vec<Vec<u8>>,
+    },
+    UnsupportedGeneric {
+        proof_system: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -141,4 +173,45 @@ pub struct Sp1InitPublicValues {
     pub p_zeta_le: [u8; 32],
     pub product_zeta_le: [u8; 32],
     pub balance_total: i128,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Sp1KzgInsertStdin {
+    pub chain_id: String,
+    pub state_root: String,
+    pub address: String,
+    pub balance: i128,
+    pub ownership: Sp1OwnershipWitness,
+    pub chain_balance_proof: Sp1ChainBalanceProof,
+    pub encoded_address_le: [u8; 32],
+    pub encoded_address_blind_le: [u8; 32],
+    pub balance_blind_delta_le: [u8; 32],
+    pub eval_value_base: Sp1G1Affine,
+    pub eval_blind_base: Sp1G1Affine,
+    pub balance_value_base: Sp1G1Affine,
+    pub balance_blind_base: Sp1G1Affine,
+    pub c_x: Sp1G1Affine,
+    pub c_balance_delta: Sp1G1Affine,
+    pub old_accumulator_hex: String,
+    pub new_accumulator_hex: String,
+    pub old_balance_commitment_hex: String,
+    pub new_balance_commitment_hex: String,
+    pub reserve_count_before: usize,
+    pub reserve_count_after: usize,
+    pub transcript_hex: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Sp1KzgInsertPublicValues {
+    pub chain_id: String,
+    pub state_root: String,
+    pub c_x: Sp1G1Affine,
+    pub c_balance_delta: Sp1G1Affine,
+    pub old_accumulator_hex: String,
+    pub new_accumulator_hex: String,
+    pub old_balance_commitment_hex: String,
+    pub new_balance_commitment_hex: String,
+    pub reserve_count_before: usize,
+    pub reserve_count_after: usize,
+    pub transcript_hex: String,
 }

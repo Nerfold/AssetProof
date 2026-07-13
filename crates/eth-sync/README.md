@@ -32,13 +32,15 @@ and fee-recipient balance changes.
 }
 ```
 
-Run:
+Run with the repository defaults:
 
 ```sh
-poa-cli eth-sync transition.json deltas.csv sync-output.json
+cargo run -p poa-cli -- eth-sync data/ethereum/transition.json
 ```
 
-`deltas.csv` can be passed directly to the existing `update` command.
-`sync-output.json` contains `addresses`, `deltas`, block/root metadata, the same
+This writes `artifacts/deltas/ethereum.csv` and
+`artifacts/test-runs/ethereum-sync.json`. Explicit output paths remain supported.
+The delta CSV can be passed directly to `prove-update`. The JSON output contains
+`addresses`, `deltas`, block/root metadata, the same
 canonical delta-list commitment used by the NIZK verifier, and a transition
 commitment that binds the vectors to the finalized Ethereum transition.

@@ -1,7 +1,23 @@
 /target/
 /.DS_Store
-/examples/
 /paper/
+
+# Generated mock scenarios and large local fixtures.
+/data/mock/generated/**
+!/data/mock/generated/README.md
+/data/mock/bench/**
+!/data/mock/bench/README.md
+
+# Runtime proofs, states, reports and test output.
+/artifacts/**
+!/artifacts/README.md
+
+# Locally generated KZG material. Documentation remains versioned.
+/params/srs/**
+!/params/srs/README.md
+
+# Legacy directories from the pre-layout CLI should stay empty.
+/examples/
 /inputs/
 /outputs/
 /vendor/bulletproofs-bls/.cargo-ok

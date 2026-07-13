@@ -9,6 +9,9 @@ use crate::bp::{prove_insert_relation_logic, verify_insert_relation_logic};
 use crate::commitment::commit_balance;
 use crate::commitment::derive_generator;
 use crate::external::{ExternalProofAdapter, ExternalProofArtifact, MockExternalProofAdapter};
+use crate::hpoly::{
+    commit_hiding_polynomial, prove_hiding_committed_opening, verify_hiding_committed_opening,
+};
 use crate::kzg::{commit_g1, Srs};
 use crate::polynomial::Polynomial;
 use crate::zkopen::{eval_commit, prove_committed_opening, verify_committed_opening};
@@ -162,7 +165,9 @@ pub fn apply_insert_with_adapter(
     let new_balance_commitment = old_balance_commitment + c_insert_balance;
 
     let q_poly = old_p.sub(&Polynomial::constant(y_x)).div_exact(&linear)?;
-    let c_q_h = commit_g1(srs, &q_poly)?;
+    let quotient_degree_bound = state.reserve_addresses.len().saturating_sub(1);
+    let hiding_q = commit_hiding_polynomial(srs, &q_poly, quotient_degree_bound)?;
+    let c_q_h = hiding_q.commitment;
 
     let old_accumulator_hex = point_g1_to_hex(&old_accumulator)?;
     let new_accumulator_hex = point_g1_to_hex(&new_accumulator)?;
@@ -213,12 +218,8 @@ pub fn apply_insert_with_adapter(
     let new_opening_poly = new_p
         .sub(&Polynomial::constant(y_prime))
         .div_exact(&Polynomial::from_coeffs(vec![-zeta, Fr::one()]))?;
-    let quotient_opening_poly = q_poly
-        .sub(&Polynomial::constant(q_zeta))
-        .div_exact(&Polynomial::from_coeffs(vec![-zeta, Fr::one()]))?;
     let old_eval_opening = commit_g1(srs, &old_opening_poly)?;
     let new_eval_opening = commit_g1(srs, &new_opening_poly)?;
-    let quotient_eval_opening = commit_g1(srs, &quotient_opening_poly)?;
     let old_eval_opening_proof_hex = prove_committed_opening(
         srs,
         &old_accumulator_hex,
@@ -239,14 +240,15 @@ pub fn apply_insert_with_adapter(
         &new_eval_opening,
         "dynamic-poa-insert-new-eval-zkopen",
     )?;
-    let quotient_eval_opening_proof_hex = prove_committed_opening(
+    let quotient_eval_opening_proof_hex = prove_hiding_committed_opening(
         srs,
         &c_q_h_hex,
         zeta,
         &c_q_hex,
         q_zeta,
         r_q,
-        &quotient_eval_opening,
+        &q_poly,
+        &hiding_q,
         "dynamic-poa-insert-quotient-eval-hzkopen",
     )?;
     let relation_proof = prove_insert_relation_logic(
@@ -350,7 +352,7 @@ pub fn apply_insert_with_adapter(
     };
 
     let proof = KzgInsertProof {
-        scheme: "kzg-nizk-insert".to_string(),
+        scheme: "kzg-nizk-insert-v2-hpoly".to_string(),
         old_state_root: state.state_root.clone(),
         new_state_root: state.state_root.clone(),
         old_accumulator_hex,
@@ -419,7 +421,7 @@ pub fn verify_insert_with_srs(
     if old_state.srs_max_degree != srs.max_degree || new_state.srs_max_degree != srs.max_degree {
         return Err("insert state SRS degree does not match provided SRS".to_string());
     }
-    if proof.scheme != "kzg-nizk-insert" {
+    if proof.scheme != "kzg-nizk-insert-v2-hpoly" {
         return Err("insert proof is not a production ZK proof".to_string());
     }
     let sp1_public = sp1_host::kzg_insert::verify(
@@ -460,11 +462,12 @@ pub fn verify_insert_with_srs(
         &proof.new_eval_opening_proof_hex,
         "dynamic-poa-insert-new-eval-zkopen",
     )?;
-    verify_committed_opening(
+    verify_hiding_committed_opening(
         srs,
         &proof.c_q_h_hex,
         proof.zeta,
         &proof.c_q_hex,
+        proof.reserve_count_before.saturating_sub(1),
         &proof.quotient_eval_opening_proof_hex,
         "dynamic-poa-insert-quotient-eval-hzkopen",
     )?;

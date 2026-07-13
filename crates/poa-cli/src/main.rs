@@ -1,6 +1,6 @@
 use std::env;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use ark_bls12_381::Fr;
@@ -35,6 +35,13 @@ use sp1_host::update::{
     verify_update_proof as verify_smt_update_proof,
 };
 
+const DEFAULT_SRS_PATH: &str = "params/srs/dev.srs.bin";
+const DEFAULT_MOCK_RESERVES_PATH: &str = "data/mock/reserves.csv";
+const DEFAULT_INIT_STATE_PATH: &str = "artifacts/states/init-state.txt";
+const DEFAULT_INIT_PROOF_PATH: &str = "artifacts/proofs/init-proof.txt";
+const DEFAULT_ETH_DELTAS_PATH: &str = "artifacts/deltas/ethereum.csv";
+const DEFAULT_ETH_SYNC_PATH: &str = "artifacts/test-runs/ethereum-sync.json";
+
 fn main() {
     if let Err(err) = real_main() {
         eprintln!("error: {err}");
@@ -50,35 +57,53 @@ fn real_main() -> Result<(), String> {
     }
 
     match args[1].as_str() {
+        "help" | "--help" | "-h" => print_usage(),
+        "help-advanced" => print_advanced_usage(),
+        "setup" => quick_setup(&args)?,
+        "mock-data" => quick_mock_data(&args)?,
+        "prove-init" => quick_prove_init(&args)?,
+        "prove-update" => quick_prove_update(&args)?,
+        "check-update" => quick_check_update(&args)?,
         "eth-sync" => {
-            if args.len() != 5 {
+            if args.len() != 3 && args.len() != 5 {
                 return Err(
-                    "usage: poa-cli eth-sync <transition.json> <deltas.csv> <sync-output.json>"
+                    "usage: poa-cli eth-sync <transition.json> [deltas.csv sync-output.json]"
                         .to_string(),
                 );
             }
+            ensure_project_layout()?;
+            let deltas_path = args
+                .get(3)
+                .map(String::as_str)
+                .unwrap_or(DEFAULT_ETH_DELTAS_PATH);
+            let sync_path = args
+                .get(4)
+                .map(String::as_str)
+                .unwrap_or(DEFAULT_ETH_SYNC_PATH);
             let input =
                 fs::read_to_string(&args[2]).map_err(|err| format!("read {}: {err}", args[2]))?;
             let output = eth_sync::synchronize_json(&input)?;
             let csv = output.to_delta_csv();
             fs::write(
-                &args[3],
+                deltas_path,
                 if csv.is_empty() {
                     csv
                 } else {
                     format!("{csv}\n")
                 },
             )
-            .map_err(|err| format!("write {}: {err}", args[3]))?;
-            fs::write(&args[4], output.to_pretty_json()?)
-                .map_err(|err| format!("write {}: {err}", args[4]))?;
+            .map_err(|err| format!("write {deltas_path}: {err}"))?;
+            fs::write(sync_path, output.to_pretty_json()?)
+                .map_err(|err| format!("write {sync_path}: {err}"))?;
             println!(
-                "ethereum sync complete: block={}, old_root={}, new_root={}, touched={}, commitment={}",
+                "ethereum sync complete: block={}, old_root={}, new_root={}, touched={}, commitment={}, deltas={}, metadata={}",
                 output.block_hash,
                 output.old_state_root,
                 output.new_state_root,
                 output.addresses.len(),
-                output.delta_list_commitment_hex
+                output.delta_list_commitment_hex,
+                deltas_path,
+                sync_path
             );
         }
         "sp1-setup" => {
@@ -105,6 +130,7 @@ fn real_main() -> Result<(), String> {
                 srs.max_degree,
                 &srs.tau_g1_powers,
                 &srs.tau_g2_powers,
+                &srs.hiding_tau_g1_powers,
             )?;
             println!("wrote SRS with max_degree={} to {}", max_degree, args[3]);
         }
@@ -179,6 +205,7 @@ fn real_main() -> Result<(), String> {
                     srs.max_degree,
                     &srs.tau_g1_powers,
                     &srs.tau_g2_powers,
+                    &srs.hiding_tau_g1_powers,
                 )?;
                 println!("generated srs at {}", srs_path.display());
             } else {
@@ -221,6 +248,7 @@ fn real_main() -> Result<(), String> {
                     srs.max_degree,
                     &srs.tau_g1_powers,
                     &srs.tau_g2_powers,
+                    &srs.hiding_tau_g1_powers,
                 )?;
                 println!("generated srs at {}", srs_path.display());
             } else {
@@ -1130,12 +1158,212 @@ fn real_main() -> Result<(), String> {
 }
 
 fn load_srs(path: &Path) -> Result<Srs, String> {
-    let (max_degree, tau_g1_powers, tau_g2_powers) = read_srs(path)?;
+    let (max_degree, tau_g1_powers, tau_g2_powers, hiding_tau_g1_powers) = read_srs(path)?;
     Ok(Srs {
         max_degree,
         tau_g1_powers,
         tau_g2_powers,
+        hiding_tau_g1_powers,
     })
+}
+
+fn ensure_project_layout() -> Result<(), String> {
+    for dir in [
+        "data/mock/generated",
+        "data/ethereum",
+        "params/srs",
+        "params/crs",
+        "params/sp1",
+        "artifacts/states",
+        "artifacts/proofs",
+        "artifacts/deltas",
+        "artifacts/reports",
+        "artifacts/benchmarks",
+        "artifacts/test-runs",
+    ] {
+        fs::create_dir_all(dir).map_err(|err| format!("create {dir}: {err}"))?;
+    }
+    Ok(())
+}
+
+fn quick_setup(args: &[String]) -> Result<(), String> {
+    if args.len() > 3 {
+        return Err("usage: poa-cli setup [max-degree]".to_string());
+    }
+    ensure_project_layout()?;
+    let requested_degree = args
+        .get(2)
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .map_err(|err| format!("max-degree: {err}"))
+        })
+        .transpose()?
+        .unwrap_or(256);
+    let mut generation_degree = requested_degree;
+    let path = Path::new(DEFAULT_SRS_PATH);
+    if path.exists() {
+        let srs = load_srs(path)?;
+        generation_degree = generation_degree.max(srs.max_degree);
+        let has_standard_powers = srs.tau_g1_powers.len() >= requested_degree + 1
+            && srs.tau_g2_powers.len() >= requested_degree + 1;
+        let has_hiding_powers = srs.hiding_tau_g1_powers.len() >= requested_degree + 1;
+        if srs.max_degree >= requested_degree && has_standard_powers && has_hiding_powers {
+            println!(
+                "layout ready; reusing {} (degree={})",
+                path.display(),
+                srs.max_degree
+            );
+            return Ok(());
+        }
+        if !has_hiding_powers {
+            println!(
+                "replacing legacy development SRS {} with the extended HPolyCom format (degree={})",
+                path.display(),
+                generation_degree
+            );
+        } else {
+            println!(
+                "upgrading {} from degree {} to {}",
+                path.display(),
+                srs.max_degree,
+                generation_degree
+            );
+        }
+    }
+    let srs = Srs::setup(generation_degree, b"dynamic-poa-srs");
+    write_srs(
+        path,
+        srs.max_degree,
+        &srs.tau_g1_powers,
+        &srs.tau_g2_powers,
+        &srs.hiding_tau_g1_powers,
+    )?;
+    println!(
+        "layout ready; generated {} (degree={generation_degree})",
+        path.display(),
+    );
+    Ok(())
+}
+
+fn quick_mock_data(args: &[String]) -> Result<(), String> {
+    if args.len() != 2 && args.len() != 7 {
+        return Err(
+            "usage: poa-cli mock-data [num-accounts num-reserves num-blocks txs-per-block seed]"
+                .to_string(),
+        );
+    }
+    ensure_project_layout()?;
+    let values = if args.len() == 2 {
+        (64usize, 8usize, 6usize, 20usize, 42u64)
+    } else {
+        (
+            args[2]
+                .parse()
+                .map_err(|err| format!("num-accounts: {err}"))?,
+            args[3]
+                .parse()
+                .map_err(|err| format!("num-reserves: {err}"))?,
+            args[4]
+                .parse()
+                .map_err(|err| format!("num-blocks: {err}"))?,
+            args[5]
+                .parse()
+                .map_err(|err| format!("txs-per-block: {err}"))?,
+            args[6].parse().map_err(|err| format!("seed: {err}"))?,
+        )
+    };
+    let scenario = generate_scenario(values.4, values.0, values.1, values.2, values.3)?;
+    let out = Path::new("data/mock/generated/latest");
+    let manifest = write_scenario(out, &scenario)?;
+    println!("mock data ready: {}", manifest.display());
+    Ok(())
+}
+
+fn quick_prove_init(args: &[String]) -> Result<(), String> {
+    if args.len() != 3 && args.len() != 4 {
+        return Err("usage: poa-cli prove-init <state-root> [reserves.csv]".to_string());
+    }
+    ensure_project_layout()?;
+    let srs = load_srs(Path::new(DEFAULT_SRS_PATH))
+        .map_err(|err| format!("{err}; run `cargo run -p poa-cli -- setup` first"))?;
+    let reserves_path = args
+        .get(3)
+        .map(String::as_str)
+        .unwrap_or(DEFAULT_MOCK_RESERVES_PATH);
+    let reserves = read_reserve_csv(Path::new(reserves_path))?;
+    let init = initialize_with_proof(&reserves, &args[2], &srs)?;
+    let state_path = Path::new(DEFAULT_INIT_STATE_PATH);
+    write_state(state_path, &init.state)?;
+    write_public_state(&public_state_path(state_path), &init.state.public_state())?;
+    write_init(Path::new(DEFAULT_INIT_PROOF_PATH), &init.proof)?;
+    println!(
+        "initialization proof ready: state={}, proof={}, n={}, balance_total={}",
+        state_path.display(),
+        DEFAULT_INIT_PROOF_PATH,
+        init.state.reserve_addresses.len(),
+        init.state.balance_total
+    );
+    Ok(())
+}
+
+fn quick_prove_update(args: &[String]) -> Result<(), String> {
+    if args.len() != 5 {
+        return Err(
+            "usage: poa-cli prove-update <state.txt> <deltas.csv> <new-state-root>".to_string(),
+        );
+    }
+    ensure_project_layout()?;
+    let state_path = Path::new(&args[2]);
+    let state = read_state(state_path)?;
+    let deltas = read_delta_csv(Path::new(&args[3]))?;
+    let srs = load_srs_for_update(Path::new(DEFAULT_SRS_PATH), &state, deltas.len())?;
+    let updated = apply_update(&srs, &state, &deltas, &args[4])?;
+    let stem = state_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("state");
+    let next_path = PathBuf::from(format!("artifacts/states/{stem}-next.txt"));
+    let proof_path = PathBuf::from(format!("artifacts/proofs/{stem}-update-proof.txt"));
+    write_state(&next_path, &updated.next_state)?;
+    write_public_state(
+        &public_state_path(&next_path),
+        &updated.next_state.public_state(),
+    )?;
+    write_proof(&proof_path, &updated.proof)?;
+    println!(
+        "update proof ready: state={}, proof={}, m={}, aggregate_delta={}",
+        next_path.display(),
+        proof_path.display(),
+        deltas.len(),
+        updated.aggregate_delta
+    );
+    Ok(())
+}
+
+fn quick_check_update(args: &[String]) -> Result<(), String> {
+    if args.len() != 6 {
+        return Err(
+            "usage: poa-cli check-update <old-state.txt> <deltas.csv> <new-state.txt> <proof.txt>"
+                .to_string(),
+        );
+    }
+    let old_path = Path::new(&args[2]);
+    let new_path = Path::new(&args[4]);
+    let old_state = read_state(old_path)?;
+    let new_state = read_state(new_path)?;
+    let deltas = read_delta_csv(Path::new(&args[3]))?;
+    let proof = read_proof(Path::new(&args[5]))?;
+    let srs = load_srs_for_verify(Path::new(DEFAULT_SRS_PATH), deltas.len())?;
+    let old_public = read_public_state_or_derive(old_path, &old_state)?;
+    let new_public = read_public_state_or_derive(new_path, &new_state)?;
+    verify_update_debug(&srs, &old_public, &deltas, &new_public, &proof)?;
+    println!(
+        "update proof valid: m={}, new_state_root={}",
+        deltas.len(),
+        new_public.state_root
+    );
+    Ok(())
 }
 
 fn load_srs_g1_prefix(path: &Path, needed_g1_len: usize) -> Result<Srs, String> {
@@ -1144,6 +1372,7 @@ fn load_srs_g1_prefix(path: &Path, needed_g1_len: usize) -> Result<Srs, String> 
         max_degree,
         tau_g1_powers,
         tau_g2_powers: Vec::new(),
+        hiding_tau_g1_powers: Vec::new(),
     })
 }
 
@@ -1154,6 +1383,7 @@ fn load_srs_prefix(path: &Path, needed_g1_len: usize, needed_g2_len: usize) -> R
         max_degree,
         tau_g1_powers,
         tau_g2_powers,
+        hiding_tau_g1_powers: Vec::new(),
     })
 }
 
@@ -1350,8 +1580,19 @@ fn flatten_parallel_state(state: &StoredParallelState) -> StoredState {
 }
 
 fn print_usage() {
-    println!("usage:");
-    println!("  poa-cli eth-sync <transition.json> <deltas.csv> <sync-output.json>");
+    println!("Dynamic PoA daily commands:");
+    println!("  ./poa setup [max-degree]");
+    println!("  ./poa mock-data [accounts reserves blocks txs-per-block seed]");
+    println!("  ./poa eth-sync <transition.json> [deltas.csv sync-output.json]");
+    println!("  ./poa prove-init <state-root> [reserves.csv]");
+    println!("  ./poa prove-update <state.txt> <deltas.csv> <new-state-root>");
+    println!("  ./poa check-update <old-state.txt> <deltas.csv> <new-state.txt> <proof.txt>");
+    println!();
+    println!("Run `./poa help-advanced` for explicit paths, SP1, SMT, and benchmarks.");
+}
+
+fn print_advanced_usage() {
+    println!("advanced commands:");
     println!("  poa-cli sp1-setup [setup-dir]");
     println!("  poa-cli gen-srs <max-degree> <srs.bin>");
     println!("  poa-cli init <srs.bin> <reserves.csv> <state-root> <state.txt> <init-proof.txt>");

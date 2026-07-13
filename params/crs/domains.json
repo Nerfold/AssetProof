@@ -1,0 +1,18 @@
+{
+  "curve": "BLS12-381 G1",
+  "status": "deterministically derived in code",
+  "baseLabels": [
+    "balance-v",
+    "balance-h",
+    "eval-v",
+    "eval-h",
+    "init-shape-w",
+    "init-shape-h"
+  ],
+  "zkOpenTranscriptDomains": [
+    "dynamic-poa-init-eval-zkopen",
+    "dynamic-poa-insert-old-eval-zkopen",
+    "dynamic-poa-insert-new-eval-zkopen",
+    "dynamic-poa-insert-quotient-eval-hzkopen"
+  ]
+}

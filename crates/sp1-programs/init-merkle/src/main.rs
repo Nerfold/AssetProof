@@ -2,11 +2,16 @@
 
 extern crate alloc;
 
+use alloc::vec::Vec;
 use k256::elliptic_curve::sec1::ToEncodedPoint;
+use num::BigUint;
 use sha3::{Digest, Keccak256};
+use sp1_curves::params::FieldParameters;
+use sp1_curves::weierstrass::bls12_381::{Bls12381, Bls12381BaseField};
+use sp1_curves::AffinePoint;
 use sp1_programs_common::io::{
-    Hash, Sp1ChainBalanceProof, Sp1InitPublicValues, Sp1InitReserveEntry, Sp1InitStdin,
-    Sp1OwnershipWitness,
+    Hash, Sp1ChainBalanceProof, Sp1G1Affine, Sp1InitPublicValues, Sp1InitReserveEntry,
+    Sp1InitStdin, Sp1OwnershipWitness,
 };
 use sp1_zkvm::entrypoint;
 
@@ -35,10 +40,14 @@ fn verify_init(input: Sp1InitStdin) -> Sp1InitPublicValues {
 
     let mut balance_total = 0i128;
     let mut product = scalar_from_le_bytes(input.alpha_le);
+    assert!(
+        product.iter().any(|limb| *limb != 0),
+        "alpha must be non-zero"
+    );
     let zeta = scalar_from_le_bytes(input.zeta_le);
     let claimed_product = scalar_from_le_bytes(input.product_zeta_le);
     let mut previous_x = None;
-    for (index, reserve) in input.reserves.iter().enumerate() {
+    for reserve in &input.reserves {
         assert!(reserve.balance >= 0, "negative reserve balance");
         verify_ownership(&input.chain_id, reserve);
         verify_chain_balance(&input.chain_id, &input.state_root, reserve);
@@ -70,21 +79,182 @@ fn verify_init(input: Sp1InitStdin) -> Sp1InitPublicValues {
         input.p_zeta_le, input.product_zeta_le,
         "p(zeta) and product(zeta) mismatch"
     );
+    verify_private_commitment_openings(&input);
 
     Sp1InitPublicValues {
         chain_id: input.chain_id,
         state_root: input.state_root,
         session_id: input.session_id,
         reserve_count: input.reserve_count,
-        init_digest_hex: input.init_digest_hex,
-        ownership_artifact_digest_hex: input.ownership_artifact_digest_hex,
-        chain_balance_artifact_digest_hex: input.chain_balance_artifact_digest_hex,
-        alpha_le: input.alpha_le,
         zeta_le: input.zeta_le,
-        p_zeta_le: input.p_zeta_le,
-        product_zeta_le: input.product_zeta_le,
-        balance_total: input.balance_total,
+        balance_commitment: input.balance_commitment,
+        shape_commitment: input.shape_commitment,
+        eval_commitment: input.eval_commitment,
+        commitment_params_digest_hex: input.commitment_params_digest_hex,
     }
+}
+
+fn verify_private_commitment_openings(input: &Sp1InitStdin) {
+    assert_eq!(
+        input.shape_value_bases.len(),
+        input.reserves.len() + 1,
+        "shape commitment base count mismatch"
+    );
+    let expected_params_digest = commitment_params_digest(
+        &input.balance_value_base,
+        &input.balance_blind_base,
+        &input.eval_value_base,
+        &input.eval_blind_base,
+        &input.shape_value_bases,
+        &input.shape_blind_base,
+    );
+    assert_eq!(
+        expected_params_digest, input.commitment_params_digest_hex,
+        "initialization commitment parameters mismatch"
+    );
+
+    let balance = commit_many(
+        &[input.balance_value_base.clone()],
+        &[BigUint::from(input.balance_total as u128)],
+        &input.balance_blind_base,
+        &BigUint::from_bytes_le(&input.balance_blind_le),
+    );
+    assert_eq!(
+        point_to_io(&balance),
+        input.balance_commitment,
+        "initial balance commitment opening mismatch"
+    );
+
+    let mut shape_values = Vec::with_capacity(input.reserves.len() + 1);
+    shape_values.push(BigUint::from_bytes_le(&input.alpha_le));
+    shape_values.extend(
+        input
+            .reserves
+            .iter()
+            .map(|reserve| BigUint::from_bytes_le(&reserve.encoded_address_le)),
+    );
+    let shape = commit_many(
+        &input.shape_value_bases,
+        &shape_values,
+        &input.shape_blind_base,
+        &BigUint::from_bytes_le(&input.shape_blind_le),
+    );
+    assert_eq!(
+        point_to_io(&shape),
+        input.shape_commitment,
+        "initial shape commitment opening mismatch"
+    );
+
+    let evaluation = commit_many(
+        &[input.eval_value_base.clone()],
+        &[BigUint::from_bytes_le(&input.p_zeta_le)],
+        &input.eval_blind_base,
+        &BigUint::from_bytes_le(&input.eval_blind_le),
+    );
+    assert_eq!(
+        point_to_io(&evaluation),
+        input.eval_commitment,
+        "initial evaluation commitment opening mismatch"
+    );
+}
+
+fn commit_many(
+    bases: &[Sp1G1Affine],
+    scalars: &[BigUint],
+    blind_base: &Sp1G1Affine,
+    blind: &BigUint,
+) -> AffinePoint<Bls12381> {
+    assert_eq!(bases.len(), scalars.len(), "commitment arity mismatch");
+    let mut terms = bases
+        .iter()
+        .zip(scalars.iter())
+        .filter(|(_, scalar)| !is_zero(scalar))
+        .map(|(base, scalar)| {
+            let base = point_from_io(base);
+            assert_on_curve(&base);
+            base.scalar_mul(scalar)
+        })
+        .collect::<Vec<_>>();
+    if !is_zero(blind) {
+        let base = point_from_io(blind_base);
+        assert_on_curve(&base);
+        terms.push(base.scalar_mul(blind));
+    }
+    let mut terms = terms.into_iter();
+    let mut result = terms.next().expect("commitment cannot be identity");
+    for term in terms {
+        result = &result + &term;
+    }
+    result
+}
+
+fn point_from_io(value: &Sp1G1Affine) -> AffinePoint<Bls12381> {
+    assert!(value.x_be.len() <= 48 && value.y_be.len() <= 48);
+    AffinePoint::new(
+        BigUint::from_bytes_be(&value.x_be),
+        BigUint::from_bytes_be(&value.y_be),
+    )
+}
+
+fn point_to_io(value: &AffinePoint<Bls12381>) -> Sp1G1Affine {
+    Sp1G1Affine {
+        x_be: fixed_be(&value.x, 48),
+        y_be: fixed_be(&value.y, 48),
+    }
+}
+
+fn assert_on_curve(point: &AffinePoint<Bls12381>) {
+    let modulus = Bls12381BaseField::modulus();
+    assert!(point.x < modulus && point.y < modulus);
+    let lhs = (&point.y * &point.y) % &modulus;
+    let rhs = ((&point.x * &point.x % &modulus) * &point.x + BigUint::from(4u32)) % &modulus;
+    assert_eq!(lhs, rhs, "point is not on BLS12-381 G1");
+}
+
+fn fixed_be(value: &BigUint, len: usize) -> Vec<u8> {
+    let raw = value.to_bytes_be();
+    assert!(raw.len() <= len);
+    let mut out = vec![0u8; len];
+    out[len - raw.len()..].copy_from_slice(&raw);
+    out
+}
+
+fn is_zero(value: &BigUint) -> bool {
+    value.to_bytes_le().iter().all(|byte| *byte == 0)
+}
+
+fn commitment_params_digest(
+    balance_value: &Sp1G1Affine,
+    balance_blind: &Sp1G1Affine,
+    eval_value: &Sp1G1Affine,
+    eval_blind: &Sp1G1Affine,
+    shape_values: &[Sp1G1Affine],
+    shape_blind: &Sp1G1Affine,
+) -> alloc::string::String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"dynamic-poa-init-commitment-params-v1");
+    for point in [balance_value, balance_blind, eval_value, eval_blind] {
+        hasher.update(&point.x_be);
+        hasher.update(&point.y_be);
+    }
+    hasher.update(&(shape_values.len() as u64).to_le_bytes());
+    for point in shape_values {
+        hasher.update(&point.x_be);
+        hasher.update(&point.y_be);
+    }
+    hasher.update(&shape_blind.x_be);
+    hasher.update(&shape_blind.y_be);
+    hex_hash(hasher.finalize().as_bytes())
+}
+
+fn hex_hash(bytes: &[u8]) -> alloc::string::String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = alloc::string::String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
 }
 
 fn encode_address(address: &str) -> [u8; 32] {

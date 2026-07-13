@@ -193,6 +193,29 @@ pub fn write_srs_binary<W: IoWrite>(
     Ok(())
 }
 
+pub fn write_srs_binary_with_hiding<W: IoWrite>(
+    writer: &mut W,
+    max_degree: usize,
+    tau_g1_powers: &[G1Affine],
+    tau_g2_powers: &[G2Affine],
+    hiding_tau_g1_powers: &[G1Affine],
+) -> Result<(), String> {
+    write_srs_binary(writer, max_degree, tau_g1_powers, tau_g2_powers)?;
+    writer
+        .write_all(&(hiding_tau_g1_powers.len() as u64).to_le_bytes())
+        .map_err(|err| format!("write hiding srs g1 len: {err}"))?;
+    for point in hiding_tau_g1_powers {
+        let mut bytes = Vec::new();
+        point
+            .serialize_compressed(&mut bytes)
+            .map_err(|err| format!("write hiding srs g1 point: {err}"))?;
+        writer
+            .write_all(&bytes)
+            .map_err(|err| format!("write hiding srs g1 bytes: {err}"))?;
+    }
+    Ok(())
+}
+
 pub fn read_srs_binary<R: Read>(
     reader: &mut R,
 ) -> Result<(usize, Vec<G1Affine>, Vec<G2Affine>), String> {
@@ -222,6 +245,43 @@ pub fn read_srs_binary<R: Read>(
         );
     }
     Ok((max_degree, tau_g1_powers, tau_g2_powers))
+}
+
+pub fn read_srs_binary_with_hiding<R: Read>(
+    reader: &mut R,
+) -> Result<(usize, Vec<G1Affine>, Vec<G2Affine>, Vec<G1Affine>), String> {
+    let (max_degree, tau_g1_powers, tau_g2_powers) = read_srs_binary(reader)?;
+    let mut len_bytes = [0u8; 8];
+    match reader
+        .read(&mut len_bytes[..1])
+        .map_err(|err| format!("read hiding srs marker: {err}"))?
+    {
+        0 => {
+            return Ok((max_degree, tau_g1_powers, tau_g2_powers, Vec::new()));
+        }
+        1 => reader
+            .read_exact(&mut len_bytes[1..])
+            .map_err(|err| format!("read hiding srs g1 len: {err}"))?,
+        _ => unreachable!(),
+    }
+    let len = u64::from_le_bytes(len_bytes) as usize;
+    let mut hiding_tau_g1_powers = Vec::with_capacity(len);
+    for _ in 0..len {
+        let mut bytes = vec![0u8; G1Affine::identity().compressed_size()];
+        reader
+            .read_exact(&mut bytes)
+            .map_err(|err| format!("read hiding srs g1 bytes: {err}"))?;
+        hiding_tau_g1_powers.push(
+            G1Affine::deserialize_compressed_unchecked(&bytes[..])
+                .map_err(|err| format!("read hiding srs g1 point: {err}"))?,
+        );
+    }
+    Ok((
+        max_degree,
+        tau_g1_powers,
+        tau_g2_powers,
+        hiding_tau_g1_powers,
+    ))
 }
 
 pub fn read_srs_g1_prefix_binary<R: Read + Seek>(
@@ -332,5 +392,35 @@ fn from_hex_nibble(byte: u8) -> Result<u8, String> {
         b'a'..=b'f' => Ok(byte - b'a' + 10),
         b'A'..=b'F' => Ok(byte - b'A' + 10),
         _ => Err(format!("invalid hex nibble: {}", byte as char)),
+    }
+}
+
+#[cfg(test)]
+mod srs_encoding_tests {
+    use std::io::Cursor;
+
+    use ark_bls12_381::{Fr, G1Projective, G2Projective};
+    use ark_ec::{CurveGroup, PrimeGroup};
+
+    use super::{read_srs_binary_with_hiding, write_srs_binary_with_hiding};
+
+    #[test]
+    fn extended_srs_roundtrip_preserves_hiding_powers() {
+        let g1 = vec![
+            G1Projective::generator().into_affine(),
+            (G1Projective::generator() * Fr::from(2u64)).into_affine(),
+        ];
+        let g2 = vec![
+            G2Projective::generator().into_affine(),
+            (G2Projective::generator() * Fr::from(2u64)).into_affine(),
+        ];
+        let hiding = vec![
+            (G1Projective::generator() * Fr::from(3u64)).into_affine(),
+            (G1Projective::generator() * Fr::from(6u64)).into_affine(),
+        ];
+        let mut encoded = Vec::new();
+        write_srs_binary_with_hiding(&mut encoded, 1, &g1, &g2, &hiding).unwrap();
+        let decoded = read_srs_binary_with_hiding(&mut Cursor::new(encoded)).unwrap();
+        assert_eq!(decoded, (1, g1, g2, hiding));
     }
 }

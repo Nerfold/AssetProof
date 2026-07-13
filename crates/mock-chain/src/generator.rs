@@ -121,6 +121,7 @@ pub fn write_scenario(output_dir: &Path, scenario: &MockScenario) -> Result<Path
     let windows_dir = output_dir.join("windows");
     fs::create_dir_all(&windows_dir)
         .map_err(|err| format!("create {}: {err}", windows_dir.display()))?;
+    clear_generated_windows(&windows_dir)?;
 
     write_reserves_csv(&output_dir.join("reserves.csv"), &scenario.reserves)?;
     for window in &scenario.windows {
@@ -152,6 +153,27 @@ pub fn write_scenario(output_dir: &Path, scenario: &MockScenario) -> Result<Path
     )
     .map_err(|err| format!("write {}: {err}", manifest_path.display()))?;
     Ok(manifest_path)
+}
+
+fn clear_generated_windows(windows_dir: &Path) -> Result<(), String> {
+    for entry in
+        fs::read_dir(windows_dir).map_err(|err| format!("read {}: {err}", windows_dir.display()))?
+    {
+        let entry = entry.map_err(|err| format!("read {} entry: {err}", windows_dir.display()))?;
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        let generated = name.starts_with("window_")
+            && matches!(
+                path.extension().and_then(|value| value.to_str()),
+                Some("csv" | "meta")
+            );
+        if generated {
+            fs::remove_file(&path).map_err(|err| format!("remove {}: {err}", path.display()))?;
+        }
+    }
+    Ok(())
 }
 
 pub fn load_manifest(manifest_path: &Path) -> Result<MockScenario, String> {
@@ -293,4 +315,35 @@ fn write_deltas_csv(path: &Path, deltas: &[Delta]) -> Result<(), String> {
         .collect::<Vec<_>>()
         .join("\n");
     fs::write(path, body).map_err(|err| format!("write {}: {err}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::{generate_scenario, write_scenario};
+
+    #[test]
+    fn rewriting_scenario_removes_stale_generated_windows_only() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("poa-mock-chain-{nonce}"));
+
+        let larger = generate_scenario(7, 8, 2, 3, 2).unwrap();
+        write_scenario(&dir, &larger).unwrap();
+        fs::write(dir.join("windows/keep.txt"), "keep").unwrap();
+
+        let smaller = generate_scenario(7, 8, 2, 1, 2).unwrap();
+        write_scenario(&dir, &smaller).unwrap();
+
+        assert!(dir.join("windows/window_0001.csv").exists());
+        assert!(!dir.join("windows/window_0002.csv").exists());
+        assert!(!dir.join("windows/window_0003.meta").exists());
+        assert!(dir.join("windows/keep.txt").exists());
+
+        fs::remove_dir_all(dir).unwrap();
+    }
 }

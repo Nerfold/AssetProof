@@ -144,7 +144,7 @@ fn context_with_setup_dir(setup_dir: &Path) -> Result<Context, String> {
     Ok(ctx)
 }
 
-fn point_to_io(point: &G1Projective) -> Sp1G1Affine {
+pub(crate) fn point_to_io(point: &G1Projective) -> Sp1G1Affine {
     let affine = point.into_affine();
     Sp1G1Affine {
         x_be: fixed_be(affine.x.into_bigint().to_bytes_be(), 48),

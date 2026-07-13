@@ -1,6 +1,6 @@
 use ark_bls12_381::Fr;
 use ark_ec::PrimeGroup;
-use ark_ff::{BigInteger, PrimeField, Zero};
+use ark_ff::{BigInteger, PrimeField, UniformRand, Zero};
 use common::crypto::{
     hash_bytes, hash_to_scalar, point_g1_from_hex, point_g1_to_hex, scalar_to_hex,
 };
@@ -10,10 +10,11 @@ use common::types::{
 };
 
 use crate::commitment::commit_balance;
-use crate::commitment::{commit_linear, derive_generator};
+use crate::commitment::{commit_linear, derive_generator, generator_window};
 use crate::external::{ExternalProofAdapter, MockExternalProofAdapter};
-use crate::kzg::{commit_g1, open as kzg_open, verify_open as verify_kzg_open, Srs};
+use crate::kzg::{commit_g1, open as kzg_open, Srs};
 use crate::polynomial::product_from_roots;
+use crate::zkopen::{prove_committed_opening, verify_committed_opening};
 
 #[derive(Clone, Debug)]
 pub struct InitProofResult {
@@ -124,7 +125,6 @@ fn initialize_core(
             common::encoding::encode_address(&entry.address)?,
             entry.clone(),
             witness.clone(),
-            prepared.clone(),
         ));
     }
     canonical_entries.sort_by(|left, right| left.0.into_bigint().cmp(&right.0.into_bigint()));
@@ -133,46 +133,21 @@ fn initialize_core(
     let mut reserve_balances = Vec::with_capacity(reserve_entries.len());
     let mut roots = Vec::with_capacity(reserve_entries.len());
     let mut canonical_witnesses = Vec::with_capacity(reserve_witnesses.len());
-    let mut canonical_prepared = Vec::with_capacity(prepared_witnesses.len());
-    for (root, entry, witness, prepared) in canonical_entries {
+    for (root, entry, witness) in canonical_entries {
         roots.push(root);
         reserve_addresses.push(entry.address);
         reserve_balances.push(entry.balance);
         canonical_witnesses.push(witness);
-        canonical_prepared.push(prepared);
     }
     if !is_strictly_ordered(&roots) {
         return Err("reserve addresses must be canonical and duplicate-free".to_string());
     }
 
-    let canonical_reserve_entries = reserve_addresses
-        .iter()
-        .zip(reserve_balances.iter())
-        .map(|(address, balance)| ReserveEntry {
-            address: address.clone(),
-            balance: *balance,
-        })
-        .collect::<Vec<_>>();
-    let init_salt = derive_init_salt(&ctx.state_root, &canonical_reserve_entries);
-    let init_digest = derive_init_digest(
-        &ctx.state_root,
-        &reserve_addresses,
-        &reserve_balances,
-        init_salt,
-    )?;
-    let ownership_artifact_digest_hex = derive_artifact_bundle_digest(
-        "ownership-artifacts",
-        canonical_prepared
-            .iter()
-            .map(|witness| witness.ownership.proof_digest_hex.as_str()),
-    );
-    let chain_balance_artifact_digest_hex = derive_artifact_bundle_digest(
-        "chain-balance-artifacts",
-        canonical_prepared
-            .iter()
-            .map(|witness| witness.chain_balance.proof_digest_hex.as_str()),
-    );
-    let alpha = derive_alpha(&roots);
+    let mut rng = rand::rngs::OsRng;
+    let mut alpha = Fr::rand(&mut rng);
+    while alpha.is_zero() {
+        alpha = Fr::rand(&mut rng);
+    }
     if alpha.is_zero() {
         return Err("derived alpha must be non-zero".to_string());
     }
@@ -184,14 +159,13 @@ fn initialize_core(
         sum.checked_add(*balance)
             .ok_or_else(|| "reserve balance total overflow".to_string())
     })?;
-    let balance_blind = derive_balance_blind(balance_total, reserve_entries.len());
+    let balance_blind = Fr::rand(&mut rng);
     let balance_commitment = commit_balance(balance_total, balance_blind);
-    let r_shape = derive_shape_blind(&roots, alpha);
+    let r_shape = Fr::rand(&mut rng);
     let c_shape = commit_shape(alpha, &roots, r_shape);
 
     let zeta = derive_zeta(
         &ctx.state_root,
-        &init_digest,
         reserve_entries.len(),
         &accumulator,
         &balance_commitment,
@@ -200,8 +174,18 @@ fn initialize_core(
     let p_zeta = p_s.evaluate(zeta);
     let product_zeta = roots.iter().fold(alpha, |acc, root| acc * (zeta - *root));
     let kzg_opening_proof = kzg_open(srs, &p_s, zeta, p_zeta)?;
-    let r_y = derive_eval_blind(p_zeta, zeta);
+    let r_y = Fr::rand(&mut rng);
     let c_y = commit_eval(p_zeta, r_y);
+    let kzg_opening_proof_hex = prove_committed_opening(
+        srs,
+        &point_g1_to_hex(&accumulator)?,
+        zeta,
+        &point_g1_to_hex(&c_y)?,
+        p_zeta,
+        r_y,
+        &kzg_opening_proof,
+        "dynamic-poa-init-eval-zkopen",
+    )?;
     let transcript_hex = build_transcript_hex(
         &ctx.chain_id,
         &ctx.state_root,
@@ -211,48 +195,39 @@ fn initialize_core(
         &point_g1_to_hex(&balance_commitment)?,
         &point_g1_to_hex(&c_shape)?,
         &point_g1_to_hex(&c_y)?,
-        &init_digest,
-        &ownership_artifact_digest_hex,
-        &chain_balance_artifact_digest_hex,
         zeta,
-        p_zeta,
-        product_zeta,
     );
     let srs_hash_hex = point_hash_srs(srs)?;
-    let init_digest_hex = common::crypto::hex_encode(&init_digest);
-    let chain_proof_hex = build_chain_proof_hex(
-        &ctx.chain_id,
-        &ctx.state_root,
-        &ctx.session_id,
-        &init_digest_hex,
-        &ownership_artifact_digest_hex,
-        &chain_balance_artifact_digest_hex,
-        reserve_entries.len(),
-        balance_total,
-    );
-    let alg_proof_hex = build_alg_proof_hex(
-        &ctx.state_root,
-        &point_g1_to_hex(&accumulator)?,
-        &point_g1_to_hex(&balance_commitment)?,
-        &init_digest_hex,
-        zeta,
-        p_zeta,
-        product_zeta,
-        &srs_hash_hex,
-    );
+    let balance_value_base = derive_generator("balance-v", 0);
+    let balance_blind_base = derive_generator("balance-h", 0);
+    let eval_value_base = derive_generator("eval-v", 0);
+    let eval_blind_base = derive_generator("eval-h", 0);
+    let shape_value_bases = generator_window("init-shape-w", roots.len() + 1)
+        .into_iter()
+        .map(Into::into)
+        .collect::<Vec<ark_bls12_381::G1Projective>>();
+    let shape_blind_base = derive_generator("init-shape-h", 0);
     let sp1_stdin = sp1_host::init::build_init_stdin(
         &ctx.chain_id,
         &ctx.state_root,
         &ctx.session_id,
-        init_salt,
         alpha,
         zeta,
         p_zeta,
         product_zeta,
         balance_total,
-        &init_digest_hex,
-        &ownership_artifact_digest_hex,
-        &chain_balance_artifact_digest_hex,
+        balance_blind,
+        r_shape,
+        r_y,
+        &balance_value_base,
+        &balance_blind_base,
+        &eval_value_base,
+        &eval_blind_base,
+        &shape_value_bases,
+        &shape_blind_base,
+        &balance_commitment,
+        &c_shape,
+        &c_y,
         &reserve_addresses,
         &roots,
         &reserve_balances,
@@ -262,7 +237,7 @@ fn initialize_core(
         sp1_host::init::prove_init(sp1_stdin)?;
 
     let proof = StoredInitProof {
-        scheme: "kzg-nizk-init".to_string(),
+        scheme: "kzg-nizk-init-v3-zkopen".to_string(),
         mode: "sp1".to_string(),
         chain_id: ctx.chain_id.clone(),
         state_root: ctx.state_root.clone(),
@@ -271,24 +246,12 @@ fn initialize_core(
         balance_commitment_hex: point_g1_to_hex(&balance_commitment)?,
         c_shape_hex: point_g1_to_hex(&c_shape)?,
         c_y_hex: point_g1_to_hex(&c_y)?,
-        init_salt,
-        init_digest_hex,
-        ownership_artifact_digest_hex,
-        chain_balance_artifact_digest_hex,
         reserve_count: reserve_entries.len(),
         zeta,
-        p_zeta,
-        product_zeta,
-        r_shape,
-        r_y,
-        balance_total,
-        balance_blind,
-        kzg_opening_proof_hex: point_g1_to_hex(&kzg_opening_proof)?,
+        kzg_opening_proof_hex,
         sp1_proof_hex,
         sp1_vk_hex,
         sp1_public_values_hex,
-        chain_proof_hex,
-        alg_proof_hex,
         transcript_hex,
         srs_hash_hex,
     };
@@ -332,48 +295,20 @@ pub fn verify_init_proof(
     state: &StoredState,
     proof: &StoredInitProof,
 ) -> Result<(), String> {
-    if proof.scheme != "mock-nizk-init-boundary" && proof.scheme != "kzg-nizk-init" {
-        return Err("unexpected init proof scheme".to_string());
-    }
-    if proof.mode != "mock-non-zk-native" && proof.mode != "sp1" {
-        return Err("unexpected init proof mode".to_string());
-    }
-    if proof.chain_id.is_empty() {
-        return Err("missing chain_id".to_string());
-    }
-    if proof.session_id.is_empty() {
-        return Err("missing session_id".to_string());
-    }
-    if proof.state_root != state.state_root {
-        return Err("init state_root mismatch".to_string());
-    }
-    if proof.reserve_count != state.reserve_addresses.len() {
-        return Err("reserve count mismatch".to_string());
-    }
-    if proof.accumulator_hex != state.accumulator_hex {
-        return Err("accumulator mismatch".to_string());
-    }
-    if proof.balance_commitment_hex != state.balance_commitment_hex {
-        return Err("balance commitment mismatch".to_string());
-    }
-    if proof.balance_total != state.balance_total || proof.balance_blind != state.balance_blind {
-        return Err("balance aggregate mismatch".to_string());
-    }
-    if proof.srs_hash_hex != point_hash_srs(srs)? {
-        return Err("SRS hash mismatch".to_string());
-    }
-
+    verify_init_public_proof(srs, &state.public_state(), proof)?;
     let roots = state
         .reserve_addresses
         .iter()
         .map(|address| common::encoding::encode_address(address))
         .collect::<Result<Vec<_>, _>>()?;
-    let alpha = derive_alpha(&roots);
-    if alpha != state.alpha {
-        return Err("alpha mismatch".to_string());
+    if state.alpha.is_zero() {
+        return Err("private initialization alpha is zero".to_string());
     }
     let f_s = product_from_roots(&roots);
-    let p_s = f_s.mul_scalar(alpha);
+    let p_s = f_s.mul_scalar(state.alpha);
+    if p_s.coeffs != state.masked_polynomial_coeffs {
+        return Err("private polynomial witness mismatch".to_string());
+    }
     let accumulator = commit_g1(srs, &p_s)?;
     if point_g1_to_hex(&accumulator)? != proof.accumulator_hex {
         return Err("recomputed accumulator mismatch".to_string());
@@ -381,95 +316,17 @@ pub fn verify_init_proof(
     if !is_strictly_ordered(&roots) {
         return Err("reserve address encodings are not duplicate-free strict order".to_string());
     }
-    let c_shape = commit_shape(alpha, &roots, proof.r_shape);
-    if point_g1_to_hex(&c_shape)? != proof.c_shape_hex {
-        return Err("shape commitment mismatch".to_string());
+    let balance_total = state
+        .reserve_balances
+        .iter()
+        .try_fold(0i128, |sum, balance| {
+            sum.checked_add(*balance)
+                .ok_or_else(|| "private reserve balance total overflow".to_string())
+        })?;
+    if balance_total != state.balance_total {
+        return Err("private balance total mismatch".to_string());
     }
-
-    let zeta = proof.zeta;
-    let expected_p_zeta = p_s.evaluate(zeta);
-    let expected_product_zeta = roots.iter().fold(alpha, |acc, root| acc * (zeta - *root));
-    if expected_p_zeta != proof.p_zeta || expected_product_zeta != proof.product_zeta {
-        return Err("random evaluation mismatch".to_string());
-    }
-    if proof.p_zeta != proof.product_zeta {
-        return Err("product identity check failed".to_string());
-    }
-    let c_y = commit_eval(proof.p_zeta, proof.r_y);
-    if point_g1_to_hex(&c_y)? != proof.c_y_hex {
-        return Err("evaluation commitment mismatch".to_string());
-    }
-    if !proof.kzg_opening_proof_hex.is_empty() {
-        let opening = point_g1_from_hex(&proof.kzg_opening_proof_hex)?;
-        if !verify_kzg_open(srs, &accumulator, proof.zeta, proof.p_zeta, &opening)? {
-            return Err("init KZG opening verification failed".to_string());
-        }
-    }
-
-    let expected_digest = derive_init_digest(
-        &state.state_root,
-        &state.reserve_addresses,
-        &state.reserve_balances,
-        proof.init_salt,
-    )?;
-    if common::crypto::hex_encode(&expected_digest) != proof.init_digest_hex {
-        return Err("init digest mismatch".to_string());
-    }
-    let expected_chain_proof = build_chain_proof_hex(
-        &proof.chain_id,
-        &state.state_root,
-        &proof.session_id,
-        &proof.init_digest_hex,
-        &proof.ownership_artifact_digest_hex,
-        &proof.chain_balance_artifact_digest_hex,
-        state.reserve_addresses.len(),
-        proof.balance_total,
-    );
-    if expected_chain_proof != proof.chain_proof_hex {
-        return Err("init chain proof mismatch".to_string());
-    }
-    let expected_transcript = build_transcript_hex(
-        &proof.chain_id,
-        &state.state_root,
-        &proof.session_id,
-        state.reserve_addresses.len(),
-        &state.accumulator_hex,
-        &state.balance_commitment_hex,
-        &proof.c_shape_hex,
-        &proof.c_y_hex,
-        &expected_digest,
-        &proof.ownership_artifact_digest_hex,
-        &proof.chain_balance_artifact_digest_hex,
-        zeta,
-        expected_p_zeta,
-        expected_product_zeta,
-    );
-    if expected_transcript != proof.transcript_hex {
-        return Err("init transcript mismatch".to_string());
-    }
-    let expected_alg_proof = build_alg_proof_hex(
-        &state.state_root,
-        &state.accumulator_hex,
-        &state.balance_commitment_hex,
-        &proof.init_digest_hex,
-        zeta,
-        expected_p_zeta,
-        expected_product_zeta,
-        &proof.srs_hash_hex,
-    );
-    if expected_alg_proof != proof.alg_proof_hex {
-        return Err("init algebraic proof mismatch".to_string());
-    }
-
-    let balance_total: i128 = state.reserve_balances.iter().sum();
-    if balance_total != proof.balance_total {
-        return Err("balance total mismatch".to_string());
-    }
-    let balance_blind = derive_balance_blind(balance_total, state.reserve_addresses.len());
-    if balance_blind != proof.balance_blind {
-        return Err("balance blind mismatch".to_string());
-    }
-    let balance_commitment = commit_balance(balance_total, balance_blind);
+    let balance_commitment = commit_balance(state.balance_total, state.balance_blind);
     if point_g1_to_hex(&balance_commitment)? != proof.balance_commitment_hex {
         return Err("balance commitment recomputation mismatch".to_string());
     }
@@ -500,48 +357,70 @@ pub fn verify_init_public_proof(
     if proof.srs_hash_hex != point_hash_srs(srs)? {
         return Err("SRS hash mismatch".to_string());
     }
-    if proof.scheme != "kzg-nizk-init" {
+    if proof.scheme != "kzg-nizk-init-v3-zkopen" {
         return Err("init proof is not a production ZK proof; use verify_init_debug only for transparent local tests".to_string());
     }
     if proof.mode != "sp1" {
         return Err("init proof mode is not sp1".to_string());
     }
-    if proof.chain_proof_hex.is_empty()
-        || proof.alg_proof_hex.is_empty()
-        || proof.kzg_opening_proof_hex.is_empty()
+    if proof.kzg_opening_proof_hex.is_empty()
         || proof.sp1_proof_hex.is_empty()
         || proof.sp1_vk_hex.is_empty()
     {
         return Err("missing init proof-system artifact".to_string());
     }
     let accumulator = point_g1_from_hex(&proof.accumulator_hex)?;
-    let opening = point_g1_from_hex(&proof.kzg_opening_proof_hex)?;
-    if !verify_kzg_open(srs, &accumulator, proof.zeta, proof.p_zeta, &opening)? {
-        return Err("init KZG opening verification failed".to_string());
+    let balance_commitment = point_g1_from_hex(&proof.balance_commitment_hex)?;
+    let c_shape = point_g1_from_hex(&proof.c_shape_hex)?;
+    let c_y = point_g1_from_hex(&proof.c_y_hex)?;
+    let expected_zeta = derive_zeta(
+        &proof.state_root,
+        proof.reserve_count,
+        &accumulator,
+        &balance_commitment,
+        &c_shape,
+    )?;
+    if expected_zeta != proof.zeta {
+        return Err("init Fiat-Shamir challenge mismatch".to_string());
     }
-    if proof.p_zeta != proof.product_zeta {
-        return Err("init public evaluation/product mismatch".to_string());
-    }
+    verify_committed_opening(
+        srs,
+        &proof.accumulator_hex,
+        proof.zeta,
+        &proof.c_y_hex,
+        &proof.kzg_opening_proof_hex,
+        "dynamic-poa-init-eval-zkopen",
+    )?;
 
     let sp1_public = sp1_host::init::verify_init_proof(proof)?;
+    let balance_value_base = derive_generator("balance-v", 0);
+    let balance_blind_base = derive_generator("balance-h", 0);
+    let eval_value_base = derive_generator("eval-v", 0);
+    let eval_blind_base = derive_generator("eval-h", 0);
+    let shape_value_bases = generator_window("init-shape-w", proof.reserve_count + 1)
+        .into_iter()
+        .map(Into::into)
+        .collect::<Vec<ark_bls12_381::G1Projective>>();
+    let shape_blind_base = derive_generator("init-shape-h", 0);
+    let expected_params_digest = sp1_host::init::commitment_params_digest(
+        &balance_value_base,
+        &balance_blind_base,
+        &eval_value_base,
+        &eval_blind_base,
+        &shape_value_bases,
+        &shape_blind_base,
+    );
     if sp1_public.chain_id != proof.chain_id
         || sp1_public.state_root != proof.state_root
         || sp1_public.session_id != proof.session_id
         || sp1_public.reserve_count != proof.reserve_count
-        || sp1_public.init_digest_hex != proof.init_digest_hex
-        || sp1_public.ownership_artifact_digest_hex != proof.ownership_artifact_digest_hex
-        || sp1_public.chain_balance_artifact_digest_hex != proof.chain_balance_artifact_digest_hex
         || sp1_public.zeta_le != fr_to_le_bytes(proof.zeta)
-        || sp1_public.p_zeta_le != fr_to_le_bytes(proof.p_zeta)
-        || sp1_public.product_zeta_le != fr_to_le_bytes(proof.product_zeta)
-        || sp1_public.balance_total != proof.balance_total
+        || !sp1_host::kzg_insert::point_matches(&sp1_public.balance_commitment, &balance_commitment)
+        || !sp1_host::kzg_insert::point_matches(&sp1_public.shape_commitment, &c_shape)
+        || !sp1_host::kzg_insert::point_matches(&sp1_public.eval_commitment, &c_y)
+        || sp1_public.commitment_params_digest_hex != expected_params_digest
     {
         return Err("init SP1 public values mismatch".to_string());
-    }
-
-    let expected_balance_commitment = commit_balance(proof.balance_total, proof.balance_blind);
-    if point_g1_to_hex(&expected_balance_commitment)? != proof.balance_commitment_hex {
-        return Err("init balance commitment opening mismatch".to_string());
     }
 
     let expected_transcript = build_transcript_hex(
@@ -553,95 +432,12 @@ pub fn verify_init_public_proof(
         &proof.balance_commitment_hex,
         &proof.c_shape_hex,
         &proof.c_y_hex,
-        &hex_to_32(&proof.init_digest_hex)?,
-        &proof.ownership_artifact_digest_hex,
-        &proof.chain_balance_artifact_digest_hex,
         proof.zeta,
-        proof.p_zeta,
-        proof.product_zeta,
     );
     if expected_transcript != proof.transcript_hex {
         return Err("init transcript mismatch".to_string());
     }
     Ok(())
-}
-
-fn derive_init_salt(state_root: &str, reserves: &[ReserveEntry]) -> Fr {
-    let mut bytes = Vec::new();
-    bytes.extend_from_slice(state_root.as_bytes());
-    for entry in reserves {
-        bytes.extend_from_slice(entry.address.as_bytes());
-        bytes.extend_from_slice(&entry.balance.to_le_bytes());
-    }
-    let mut salt = hash_to_scalar("init-salt", &bytes);
-    if salt.is_zero() {
-        salt = Fr::from(31u64);
-    }
-    salt
-}
-
-fn derive_init_digest(
-    state_root: &str,
-    addresses: &[String],
-    balances: &[i128],
-    salt: Fr,
-) -> Result<[u8; 32], String> {
-    let mut chunks: Vec<Vec<u8>> = Vec::new();
-    chunks.push(state_root.as_bytes().to_vec());
-    chunks.push(scalar_to_hex(&salt)?.into_bytes());
-    chunks.push(addresses.len().to_string().into_bytes());
-    for (address, balance) in addresses.iter().zip(balances.iter()) {
-        chunks.push(address.as_bytes().to_vec());
-        chunks.push(balance.to_le_bytes().to_vec());
-    }
-    let refs = chunks
-        .iter()
-        .map(|chunk| chunk.as_slice())
-        .collect::<Vec<_>>();
-    Ok(hash_bytes("init-digest", &refs))
-}
-
-fn derive_alpha(encoded_addresses: &[Fr]) -> Fr {
-    let mut bytes = Vec::new();
-    for address in encoded_addresses {
-        bytes.extend_from_slice(&address.into_bigint().to_bytes_le());
-    }
-    let mut alpha = hash_to_scalar("reserve-alpha", &bytes);
-    if alpha.is_zero() {
-        alpha = Fr::from(17u64);
-    }
-    alpha
-}
-
-fn derive_balance_blind(balance_total: i128, len: usize) -> Fr {
-    let payload = format!("balance-blind:{balance_total}:{len}");
-    let mut blind = hash_to_scalar("balance-blind", payload.as_bytes());
-    if blind.is_zero() {
-        blind = Fr::from(23u64);
-    }
-    blind
-}
-
-fn derive_shape_blind(roots: &[Fr], alpha: Fr) -> Fr {
-    let mut bytes = alpha.into_bigint().to_bytes_le();
-    for root in roots {
-        bytes.extend_from_slice(&root.into_bigint().to_bytes_le());
-    }
-    let mut blind = hash_to_scalar("shape-blind", &bytes);
-    if blind.is_zero() {
-        blind = Fr::from(43u64);
-    }
-    blind
-}
-
-fn derive_eval_blind(value: Fr, zeta: Fr) -> Fr {
-    let mut bytes = value.into_bigint().to_bytes_le();
-    bytes.extend_from_slice(&zeta.into_bigint().to_bytes_le());
-    let mut blind = hash_to_scalar("eval-blind", &bytes);
-    if blind.is_zero() {
-        blind = Fr::from(47u64);
-    }
-    blind
 }
 
 fn commit_shape(alpha: Fr, roots: &[Fr], blind: Fr) -> ark_bls12_381::G1Projective {
@@ -664,7 +460,6 @@ fn is_strictly_ordered(values: &[Fr]) -> bool {
 
 fn derive_zeta(
     state_root: &str,
-    init_digest: &[u8; 32],
     reserve_count: usize,
     accumulator: &ark_bls12_381::G1Projective,
     balance_commitment: &ark_bls12_381::G1Projective,
@@ -672,7 +467,6 @@ fn derive_zeta(
 ) -> Result<Fr, String> {
     let payload = [
         state_root.as_bytes(),
-        init_digest,
         &reserve_count.to_le_bytes(),
         point_g1_to_hex(accumulator)?.as_bytes(),
         point_g1_to_hex(balance_commitment)?.as_bytes(),
@@ -695,12 +489,7 @@ fn build_transcript_hex(
     balance_commitment: &str,
     c_shape: &str,
     c_y: &str,
-    init_digest: &[u8; 32],
-    ownership_artifact_digest_hex: &str,
-    chain_balance_artifact_digest_hex: &str,
     zeta: Fr,
-    p_zeta: Fr,
-    product_zeta: Fr,
 ) -> String {
     let payload = [
         chain_id.as_bytes(),
@@ -711,12 +500,7 @@ fn build_transcript_hex(
         balance_commitment.as_bytes(),
         c_shape.as_bytes(),
         c_y.as_bytes(),
-        init_digest,
-        ownership_artifact_digest_hex.as_bytes(),
-        chain_balance_artifact_digest_hex.as_bytes(),
         scalar_to_hex(&zeta).unwrap_or_default().as_bytes(),
-        scalar_to_hex(&p_zeta).unwrap_or_default().as_bytes(),
-        scalar_to_hex(&product_zeta).unwrap_or_default().as_bytes(),
     ]
     .concat();
     common::crypto::hex_encode(&hash_bytes("init-transcript", &[&payload]))
@@ -737,80 +521,10 @@ fn point_hash_srs(srs: &Srs) -> Result<String, String> {
     )))
 }
 
-fn build_chain_proof_hex(
-    chain_id: &str,
-    state_root: &str,
-    session_id: &str,
-    init_digest_hex: &str,
-    ownership_artifact_digest_hex: &str,
-    chain_balance_artifact_digest_hex: &str,
-    reserve_count: usize,
-    balance_total: i128,
-) -> String {
-    let payload = [
-        chain_id.as_bytes(),
-        state_root.as_bytes(),
-        session_id.as_bytes(),
-        init_digest_hex.as_bytes(),
-        ownership_artifact_digest_hex.as_bytes(),
-        chain_balance_artifact_digest_hex.as_bytes(),
-        reserve_count.to_string().as_bytes(),
-        balance_total.to_string().as_bytes(),
-    ]
-    .concat();
-    common::crypto::hex_encode(&hash_bytes("mock-init-chain-proof", &[&payload]))
-}
-
-fn build_alg_proof_hex(
-    state_root: &str,
-    accumulator_hex: &str,
-    balance_commitment_hex: &str,
-    init_digest_hex: &str,
-    zeta: Fr,
-    p_zeta: Fr,
-    product_zeta: Fr,
-    srs_hash_hex: &str,
-) -> String {
-    let payload = [
-        state_root.as_bytes(),
-        accumulator_hex.as_bytes(),
-        balance_commitment_hex.as_bytes(),
-        init_digest_hex.as_bytes(),
-        scalar_to_hex(&zeta).unwrap_or_default().as_bytes(),
-        scalar_to_hex(&p_zeta).unwrap_or_default().as_bytes(),
-        scalar_to_hex(&product_zeta).unwrap_or_default().as_bytes(),
-        srs_hash_hex.as_bytes(),
-    ]
-    .concat();
-    common::crypto::hex_encode(&hash_bytes("mock-init-alg-proof", &[&payload]))
-}
-
-fn derive_artifact_bundle_digest<'a>(
-    label: &str,
-    digests: impl Iterator<Item = &'a str>,
-) -> String {
-    let payload = digests
-        .flat_map(|digest| [digest.as_bytes(), b"|".as_slice()])
-        .flatten()
-        .copied()
-        .collect::<Vec<_>>();
-    common::crypto::hex_encode(&hash_bytes(label, &[&payload]))
-}
-
 fn fr_to_le_bytes(value: Fr) -> [u8; 32] {
     let raw = value.into_bigint().to_bytes_le();
     let mut out = [0u8; 32];
     let len = raw.len().min(32);
     out[..len].copy_from_slice(&raw[..len]);
     out
-}
-
-fn hex_to_32(value: &str) -> Result<[u8; 32], String> {
-    let bytes = common::crypto::hex_decode(value)?;
-    if bytes.len() != 32 {
-        return Err("expected 32-byte hex digest".to_string());
-    }
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&bytes);
-    Ok(out)
 }

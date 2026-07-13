@@ -21,7 +21,7 @@ struct StoredSp1Setup {
 }
 
 pub fn default_setup_dir() -> PathBuf {
-    PathBuf::from(".sp1-setup")
+    PathBuf::from("params/sp1")
 }
 
 pub fn ensure_all_setups(

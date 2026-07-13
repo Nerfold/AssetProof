@@ -13,6 +13,7 @@ members = [
     "crates/sp1-programs/kzg-insert",
     "crates/sp1-host",
     "crates/poa-cli",
+    "crates/poa-bench",
 ]
 resolver = "2"
 

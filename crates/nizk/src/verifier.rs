@@ -350,14 +350,14 @@ mod tests {
     }
 
     #[test]
-    fn rejects_tampered_init_digest() {
+    fn rejects_tampered_init_shape_commitment() {
         let srs = Srs::setup(16, b"test-srs-init-bad");
         let entries = vec![ReserveEntry {
             address: "0x1111111111111111111111111111111111111111".to_string(),
             balance: 100,
         }];
         let mut init = initialize_with_proof(&entries, "root-0", &srs).unwrap();
-        init.proof.init_digest_hex.push('0');
+        init.proof.c_shape_hex.push('0');
         let err = verify_init_debug(&srs, &init.state, &init.proof).expect_err("proof should fail");
         assert!(!err.is_empty());
     }

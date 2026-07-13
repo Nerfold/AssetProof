@@ -1,0 +1,4 @@
+#!/usr/bin/env sh
+set -eu
+
+exec cargo run --quiet --release -p poa-cli -- "$@"

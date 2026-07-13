@@ -19,3 +19,4 @@ sp1-host = { path = "../sp1-host" }
 merlin = "3"
 rand = "0.8"
 rayon = "1.12"
+sha2 = "0.10"

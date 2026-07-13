@@ -1,6 +1,7 @@
 pub mod bp;
 pub mod commitment;
 pub mod external;
+pub mod hpoly;
 pub mod init;
 pub mod init_proof;
 pub mod insert;

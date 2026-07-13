@@ -5,9 +5,10 @@ use std::path::Path;
 use ark_bls12_381::{Fr, G1Affine, G2Affine};
 
 use crate::crypto::{
-    hex_decode, hex_encode, read_scalar_vec_csv, read_srs_binary, read_srs_g1_prefix_binary,
-    read_srs_prefix_binary, read_u8_vec_csv, scalar_from_hex, scalar_to_hex, write_scalar_vec_csv,
-    write_srs_binary, write_string_vec_csv, write_u8_vec_csv,
+    hex_decode, hex_encode, read_scalar_vec_csv, read_srs_binary_with_hiding,
+    read_srs_g1_prefix_binary, read_srs_prefix_binary, read_u8_vec_csv, scalar_from_hex,
+    scalar_to_hex, write_scalar_vec_csv, write_srs_binary_with_hiding, write_string_vec_csv,
+    write_u8_vec_csv,
 };
 use crate::encoding::normalize_address;
 use crate::types::{
@@ -206,30 +207,8 @@ pub fn write_init_proof(path: &Path, proof: &StoredInitProof) -> Result<(), Stri
     ));
     lines.push(format!("c_shape_hex={}", proof.c_shape_hex));
     lines.push(format!("c_y_hex={}", proof.c_y_hex));
-    lines.push(format!("init_salt={}", scalar_to_hex(&proof.init_salt)?));
-    lines.push(format!("init_digest_hex={}", proof.init_digest_hex));
-    lines.push(format!(
-        "ownership_artifact_digest_hex={}",
-        proof.ownership_artifact_digest_hex
-    ));
-    lines.push(format!(
-        "chain_balance_artifact_digest_hex={}",
-        proof.chain_balance_artifact_digest_hex
-    ));
     lines.push(format!("reserve_count={}", proof.reserve_count));
     lines.push(format!("zeta={}", scalar_to_hex(&proof.zeta)?));
-    lines.push(format!("p_zeta={}", scalar_to_hex(&proof.p_zeta)?));
-    lines.push(format!(
-        "product_zeta={}",
-        scalar_to_hex(&proof.product_zeta)?
-    ));
-    lines.push(format!("r_shape={}", scalar_to_hex(&proof.r_shape)?));
-    lines.push(format!("r_y={}", scalar_to_hex(&proof.r_y)?));
-    lines.push(format!("balance_total={}", proof.balance_total));
-    lines.push(format!(
-        "balance_blind={}",
-        scalar_to_hex(&proof.balance_blind)?
-    ));
     lines.push(format!(
         "kzg_opening_proof_hex={}",
         proof.kzg_opening_proof_hex
@@ -240,8 +219,6 @@ pub fn write_init_proof(path: &Path, proof: &StoredInitProof) -> Result<(), Stri
         "sp1_public_values_hex={}",
         proof.sp1_public_values_hex
     ));
-    lines.push(format!("chain_proof_hex={}", proof.chain_proof_hex));
-    lines.push(format!("alg_proof_hex={}", proof.alg_proof_hex));
     lines.push(format!("transcript_hex={}", proof.transcript_hex));
     lines.push(format!("srs_hash_hex={}", proof.srs_hash_hex));
     fs::write(path, lines.join("\n")).map_err(|err| format!("write {}: {err}", path.display()))
@@ -269,38 +246,12 @@ pub fn read_init_proof(path: &Path) -> Result<StoredInitProof, String> {
         balance_commitment_hex: req_string(&kv, "balance_commitment_hex")?,
         c_shape_hex: kv.get("c_shape_hex").cloned().unwrap_or_default(),
         c_y_hex: kv.get("c_y_hex").cloned().unwrap_or_default(),
-        init_salt: req_scalar(&kv, "init_salt")?,
-        init_digest_hex: req_string(&kv, "init_digest_hex")?,
-        ownership_artifact_digest_hex: kv
-            .get("ownership_artifact_digest_hex")
-            .cloned()
-            .unwrap_or_default(),
-        chain_balance_artifact_digest_hex: kv
-            .get("chain_balance_artifact_digest_hex")
-            .cloned()
-            .unwrap_or_default(),
         reserve_count: req_usize(&kv, "reserve_count")?,
         zeta: req_scalar(&kv, "zeta")?,
-        p_zeta: req_scalar(&kv, "p_zeta")?,
-        product_zeta: req_scalar(&kv, "product_zeta")?,
-        r_shape: kv
-            .get("r_shape")
-            .map(|value| scalar_from_hex(value))
-            .transpose()?
-            .unwrap_or_else(|| Fr::from(0u64)),
-        r_y: kv
-            .get("r_y")
-            .map(|value| scalar_from_hex(value))
-            .transpose()?
-            .unwrap_or_else(|| Fr::from(0u64)),
-        balance_total: req_i128(&kv, "balance_total")?,
-        balance_blind: req_scalar(&kv, "balance_blind")?,
         kzg_opening_proof_hex: kv.get("kzg_opening_proof_hex").cloned().unwrap_or_default(),
         sp1_proof_hex: kv.get("sp1_proof_hex").cloned().unwrap_or_default(),
         sp1_vk_hex: kv.get("sp1_vk_hex").cloned().unwrap_or_default(),
         sp1_public_values_hex: kv.get("sp1_public_values_hex").cloned().unwrap_or_default(),
-        chain_proof_hex: kv.get("chain_proof_hex").cloned().unwrap_or_default(),
-        alg_proof_hex: kv.get("alg_proof_hex").cloned().unwrap_or_default(),
         transcript_hex: req_string(&kv, "transcript_hex")?,
         srs_hash_hex: req_string(&kv, "srs_hash_hex")?,
     })
@@ -961,15 +912,24 @@ pub fn write_srs(
     max_degree: usize,
     tau_g1_powers: &[G1Affine],
     tau_g2_powers: &[G2Affine],
+    hiding_tau_g1_powers: &[G1Affine],
 ) -> Result<(), String> {
     let mut file =
         fs::File::create(path).map_err(|err| format!("create {}: {err}", path.display()))?;
-    write_srs_binary(&mut file, max_degree, tau_g1_powers, tau_g2_powers)
+    write_srs_binary_with_hiding(
+        &mut file,
+        max_degree,
+        tau_g1_powers,
+        tau_g2_powers,
+        hiding_tau_g1_powers,
+    )
 }
 
-pub fn read_srs(path: &Path) -> Result<(usize, Vec<G1Affine>, Vec<G2Affine>), String> {
+pub fn read_srs(
+    path: &Path,
+) -> Result<(usize, Vec<G1Affine>, Vec<G2Affine>, Vec<G1Affine>), String> {
     let mut file = fs::File::open(path).map_err(|err| format!("open {}: {err}", path.display()))?;
-    read_srs_binary(&mut file)
+    read_srs_binary_with_hiding(&mut file)
 }
 
 pub fn read_srs_g1_prefix(
@@ -1258,30 +1218,8 @@ fn encode_stored_init_proof(proof: &StoredInitProof) -> Result<String, String> {
     ));
     lines.push(format!("c_shape_hex={}", proof.c_shape_hex));
     lines.push(format!("c_y_hex={}", proof.c_y_hex));
-    lines.push(format!("init_salt={}", scalar_to_hex(&proof.init_salt)?));
-    lines.push(format!("init_digest_hex={}", proof.init_digest_hex));
-    lines.push(format!(
-        "ownership_artifact_digest_hex={}",
-        proof.ownership_artifact_digest_hex
-    ));
-    lines.push(format!(
-        "chain_balance_artifact_digest_hex={}",
-        proof.chain_balance_artifact_digest_hex
-    ));
     lines.push(format!("reserve_count={}", proof.reserve_count));
     lines.push(format!("zeta={}", scalar_to_hex(&proof.zeta)?));
-    lines.push(format!("p_zeta={}", scalar_to_hex(&proof.p_zeta)?));
-    lines.push(format!(
-        "product_zeta={}",
-        scalar_to_hex(&proof.product_zeta)?
-    ));
-    lines.push(format!("r_shape={}", scalar_to_hex(&proof.r_shape)?));
-    lines.push(format!("r_y={}", scalar_to_hex(&proof.r_y)?));
-    lines.push(format!("balance_total={}", proof.balance_total));
-    lines.push(format!(
-        "balance_blind={}",
-        scalar_to_hex(&proof.balance_blind)?
-    ));
     lines.push(format!(
         "kzg_opening_proof_hex={}",
         proof.kzg_opening_proof_hex
@@ -1292,8 +1230,6 @@ fn encode_stored_init_proof(proof: &StoredInitProof) -> Result<String, String> {
         "sp1_public_values_hex={}",
         proof.sp1_public_values_hex
     ));
-    lines.push(format!("chain_proof_hex={}", proof.chain_proof_hex));
-    lines.push(format!("alg_proof_hex={}", proof.alg_proof_hex));
     lines.push(format!("transcript_hex={}", proof.transcript_hex));
     lines.push(format!("srs_hash_hex={}", proof.srs_hash_hex));
     Ok(lines.join(";"))
@@ -1321,32 +1257,12 @@ fn decode_stored_init_proof(raw: &str) -> Result<StoredInitProof, String> {
         balance_commitment_hex: req_string(&kv, "balance_commitment_hex")?,
         c_shape_hex: kv.get("c_shape_hex").cloned().unwrap_or_default(),
         c_y_hex: kv.get("c_y_hex").cloned().unwrap_or_default(),
-        init_salt: req_scalar(&kv, "init_salt")?,
-        init_digest_hex: req_string(&kv, "init_digest_hex")?,
-        ownership_artifact_digest_hex: req_string(&kv, "ownership_artifact_digest_hex")?,
-        chain_balance_artifact_digest_hex: req_string(&kv, "chain_balance_artifact_digest_hex")?,
         reserve_count: req_usize(&kv, "reserve_count")?,
         zeta: req_scalar(&kv, "zeta")?,
-        p_zeta: req_scalar(&kv, "p_zeta")?,
-        product_zeta: req_scalar(&kv, "product_zeta")?,
-        r_shape: kv
-            .get("r_shape")
-            .map(|value| scalar_from_hex(value))
-            .transpose()?
-            .unwrap_or_else(|| Fr::from(0u64)),
-        r_y: kv
-            .get("r_y")
-            .map(|value| scalar_from_hex(value))
-            .transpose()?
-            .unwrap_or_else(|| Fr::from(0u64)),
-        balance_total: req_i128(&kv, "balance_total")?,
-        balance_blind: req_scalar(&kv, "balance_blind")?,
         kzg_opening_proof_hex: kv.get("kzg_opening_proof_hex").cloned().unwrap_or_default(),
         sp1_proof_hex: kv.get("sp1_proof_hex").cloned().unwrap_or_default(),
         sp1_vk_hex: kv.get("sp1_vk_hex").cloned().unwrap_or_default(),
         sp1_public_values_hex: kv.get("sp1_public_values_hex").cloned().unwrap_or_default(),
-        chain_proof_hex: kv.get("chain_proof_hex").cloned().unwrap_or_default(),
-        alg_proof_hex: kv.get("alg_proof_hex").cloned().unwrap_or_default(),
         transcript_hex: req_string(&kv, "transcript_hex")?,
         srs_hash_hex: req_string(&kv, "srs_hash_hex")?,
     })
@@ -1362,4 +1278,49 @@ fn req_scalar_vec(kv: &BTreeMap<String, String>, key: &str) -> Result<Vec<Fr>, S
 
 fn req_u8_vec(kv: &BTreeMap<String, String>, key: &str) -> Result<Vec<u8>, String> {
     read_u8_vec_csv(&req_string(kv, key)?)
+}
+
+#[cfg(test)]
+mod init_privacy_tests {
+    use ark_bls12_381::Fr;
+
+    use super::encode_stored_init_proof;
+    use crate::types::StoredInitProof;
+
+    #[test]
+    fn public_init_proof_encoding_omits_private_openings() {
+        let proof = StoredInitProof {
+            scheme: "kzg-nizk-init-v3-zkopen".to_string(),
+            mode: "sp1".to_string(),
+            chain_id: "0x1".to_string(),
+            state_root: "root".to_string(),
+            session_id: "session".to_string(),
+            accumulator_hex: "acc".to_string(),
+            balance_commitment_hex: "balance".to_string(),
+            c_shape_hex: "shape".to_string(),
+            c_y_hex: "eval".to_string(),
+            reserve_count: 2,
+            zeta: Fr::from(3u64),
+            kzg_opening_proof_hex: "open".to_string(),
+            sp1_proof_hex: String::new(),
+            sp1_vk_hex: String::new(),
+            sp1_public_values_hex: String::new(),
+            transcript_hex: "transcript".to_string(),
+            srs_hash_hex: "srs".to_string(),
+        };
+        let encoded = encode_stored_init_proof(&proof).unwrap();
+        for private_key in [
+            "balance_total=",
+            "balance_blind=",
+            "r_shape=",
+            "r_y=",
+            "alpha=",
+            "product_zeta=",
+            "p_zeta=",
+            "init_salt=",
+            "init_digest_hex=",
+        ] {
+            assert!(!encoded.contains(private_key), "leaked {private_key}");
+        }
+    }
 }

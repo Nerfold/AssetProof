@@ -6,9 +6,10 @@ use ark_ec::{
 };
 use ark_ff::field_hashers::DefaultFieldHasher;
 use ark_ff::{PrimeField, UniformRand, Zero};
+use rayon::prelude::*;
 use sha2::Sha256;
 
-use common::crypto::{g1_mul_generator, g2_mul_generator, hash_to_scalar};
+use common::crypto::hash_to_scalar;
 
 use crate::polynomial::Polynomial;
 
@@ -36,29 +37,65 @@ impl Srs {
     }
 
     pub fn setup_development(max_degree: usize, seed: &[u8]) -> Self {
+        Self::setup_development_with_g2_degree(max_degree, max_degree, seed)
+    }
+
+    /// Builds a development SRS with full ordinary/hiding G1 powers and only the
+    /// G2 prefix required by the largest verifier-side polynomial.
+    ///
+    /// A KZG commitment to a degree-`max_degree` polynomial needs all G1
+    /// powers, while an opening check needs only `[1]G2` and `[tau]G2`. This
+    /// protocol additionally commits the update vanishing polynomial in G2,
+    /// so benchmark fixtures need powers only through `max_g2_degree` (normally
+    /// the largest update size), not through the reserve-set size.
+    pub fn setup_development_with_g2_degree(
+        max_degree: usize,
+        max_g2_degree: usize,
+        seed: &[u8],
+    ) -> Self {
+        assert!(
+            max_g2_degree <= max_degree,
+            "development SRS G2 degree exceeds declared max_degree"
+        );
+        assert!(
+            max_g2_degree >= 1,
+            "development SRS must include tau^0 and tau^1 G2 powers"
+        );
         let powers_len = max_degree
             .checked_add(1)
             .expect("development SRS max_degree is too large");
+        let g2_powers_len = max_g2_degree
+            .checked_add(1)
+            .expect("development SRS G2 degree is too large");
         let mut tau = hash_to_scalar("srs-tau", seed);
         if tau.is_zero() {
             tau = Fr::from(7u64);
         }
 
         let mut tau_power = Fr::from(1u64);
-        let mut tau_g1_powers = Vec::with_capacity(powers_len);
-        let mut tau_g2_powers = Vec::with_capacity(powers_len);
-        let hiding_base = hiding_base().expect("hash-to-curve for hiding KZG base");
-        let mut hiding_tau_g1_powers = Vec::with_capacity(powers_len);
-        for _ in 0..=max_degree {
-            tau_g1_powers.push(g1_mul_generator(&tau_power).into_affine());
-            tau_g2_powers.push(g2_mul_generator(&tau_power).into_affine());
-            hiding_tau_g1_powers.push(
-                hiding_base
-                    .mul_bigint(tau_power.into_bigint())
-                    .into_affine(),
-            );
+        let mut scalar_powers = Vec::with_capacity(powers_len);
+        for _ in 0..powers_len {
+            scalar_powers.push(tau_power);
             tau_power *= tau;
         }
+
+        eprintln!(
+            "SRS stage 1/3: deriving {} ordinary G1 powers (parallel)",
+            scalar_powers.len()
+        );
+        let tau_g1_powers = parallel_g1_powers(G1Projective::generator(), &scalar_powers);
+        eprintln!(
+            "SRS stage 2/3: deriving {} G2 powers (parallel)",
+            g2_powers_len
+        );
+        let tau_g2_powers =
+            parallel_g2_powers(G2Projective::generator(), &scalar_powers[..g2_powers_len]);
+        let hiding_base = hiding_base().expect("hash-to-curve for hiding KZG base");
+        eprintln!(
+            "SRS stage 3/3: deriving {} hiding G1 powers (parallel)",
+            scalar_powers.len()
+        );
+        let hiding_tau_g1_powers = parallel_g1_powers(hiding_base, &scalar_powers);
 
         Self {
             max_degree,
@@ -196,6 +233,40 @@ impl Srs {
             ),
         }
     }
+}
+
+const SRS_NORMALIZATION_CHUNK: usize = 8_192;
+
+fn parallel_g1_powers(base: G1Projective, scalars: &[Fr]) -> Vec<G1Affine> {
+    scalars
+        .par_chunks(SRS_NORMALIZATION_CHUNK)
+        .map(|chunk| {
+            let projective = chunk
+                .iter()
+                .map(|scalar| base.mul_bigint(scalar.into_bigint()))
+                .collect::<Vec<_>>();
+            G1Projective::normalize_batch(&projective)
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .flatten()
+        .collect()
+}
+
+fn parallel_g2_powers(base: G2Projective, scalars: &[Fr]) -> Vec<G2Affine> {
+    scalars
+        .par_chunks(SRS_NORMALIZATION_CHUNK)
+        .map(|chunk| {
+            let projective = chunk
+                .iter()
+                .map(|scalar| base.mul_bigint(scalar.into_bigint()))
+                .collect::<Vec<_>>();
+            G2Projective::normalize_batch(&projective)
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .flatten()
+        .collect()
 }
 
 fn challenge_powers(challenge: Fr, len: usize) -> Vec<Fr> {

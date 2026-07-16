@@ -116,6 +116,15 @@ fn run() -> Result<(), String> {
     let mut loads = Vec::new();
     let mut summaries = Vec::new();
 
+    let (max_n, srs_degree, max_g2_degree) = benchmark_srs_spec(&config)?;
+    let prepared_srs_path = srs_path(&config.srs_dir, srs_degree, max_g2_degree);
+    if config.require_existing {
+        require_existing(&prepared_srs_path, "benchmark SRS")?;
+    }
+    let (srs, srs_load, mut srs_records) =
+        prepare_srs(&config.srs_dir, max_n, srs_degree, max_g2_degree)?;
+    loads.append(&mut srs_records);
+
     println!("Dynamic PoA benchmark suite");
     println!("  n sizes: {:?}", config.n_sizes);
     println!("  m sizes: {:?}", config.m_sizes);
@@ -127,11 +136,12 @@ fn run() -> Result<(), String> {
         let degree = n
             .checked_add(1)
             .ok_or_else(|| format!("n={n} cannot be represented as an SRS degree"))?;
-        if config.require_existing {
-            require_existing(&srs_path(&config.srs_dir, degree), "benchmark SRS")?;
+        if degree > srs.max_degree {
+            return Err(format!(
+                "n={n} requires SRS degree {degree}, but the shared benchmark SRS has degree {}",
+                srs.max_degree
+            ));
         }
-        let (srs, srs_load, mut srs_records) = prepare_srs(&config.srs_dir, n, degree)?;
-        loads.append(&mut srs_records);
 
         let reserve_path = fixture_path(&config.fixture_dir, n);
         if config.require_existing {
@@ -270,16 +280,19 @@ fn prepare_benchmark_inputs(config: &Config) -> Result<(), String> {
         format!("n_sizes={:?}", config.n_sizes),
         format!("m_sizes={:?}", config.m_sizes),
     ];
+    let (max_n, srs_degree, max_g2_degree) = benchmark_srs_spec(config)?;
+    let (srs, _, _) = prepare_srs(&config.srs_dir, max_n, srs_degree, max_g2_degree)?;
+    drop(srs);
+    let prepared_srs_path = srs_path(&config.srs_dir, srs_degree, max_g2_degree);
+    manifest.push(format!("srs_path={}", prepared_srs_path.display()));
+    manifest.push(format!("srs_max_degree={srs_degree}"));
+    manifest.push(format!("srs_max_g2_degree={max_g2_degree}"));
+    manifest.push(format!("srs_bytes={}", file_len(&prepared_srs_path)?));
+
     for &n in &config.n_sizes {
         println!("\n== generating and validating n={n} ==");
-        let degree = n
-            .checked_add(1)
-            .ok_or_else(|| format!("n={n} cannot be represented as an SRS degree"))?;
-        let (srs, _, _) = prepare_srs(&config.srs_dir, n, degree)?;
-        drop(srs);
-        let prepared_srs_path = srs_path(&config.srs_dir, degree);
         manifest.push(format!("n.{n}.srs_path={}", prepared_srs_path.display()));
-        manifest.push(format!("n.{n}.srs_bytes={}", file_len(&prepared_srs_path)?));
+        manifest.push(format!("n.{n}.srs_max_degree={srs_degree}"));
 
         let init_path = fixture_path(&config.fixture_dir, n);
         let (fixture, generation, load, reused) =
@@ -346,8 +359,29 @@ fn delta_fixture_path(fixture_dir: &Path, n: usize, m: usize) -> PathBuf {
         .join(format!("deltas_m_{m}.csv"))
 }
 
-fn srs_path(srs_dir: &Path, degree: usize) -> PathBuf {
-    srs_dir.join(format!("bench-degree-{degree}.bin"))
+fn benchmark_srs_spec(config: &Config) -> Result<(usize, usize, usize), String> {
+    let max_n = config
+        .n_sizes
+        .iter()
+        .copied()
+        .max()
+        .ok_or_else(|| "n size list must not be empty".to_string())?;
+    let max_degree = max_n
+        .checked_add(1)
+        .ok_or_else(|| format!("n={max_n} cannot be represented as an SRS degree"))?;
+    let max_g2_degree = config.m_sizes.iter().copied().max().unwrap_or(1).max(1);
+    if max_g2_degree > max_degree {
+        return Err(format!(
+            "maximum update size {max_g2_degree} exceeds benchmark SRS degree {max_degree}"
+        ));
+    }
+    Ok((max_n, max_degree, max_g2_degree))
+}
+
+fn srs_path(srs_dir: &Path, degree: usize, max_g2_degree: usize) -> PathBuf {
+    srs_dir.join(format!(
+        "bench-max-degree-{degree}-g2-degree-{max_g2_degree}.bin"
+    ))
 }
 
 fn require_existing(path: &Path, label: &str) -> Result<(), String> {
@@ -694,25 +728,37 @@ fn prepare_srs(
     srs_dir: &Path,
     n: usize,
     degree: usize,
+    max_g2_degree: usize,
 ) -> Result<(Srs, Duration, Vec<LoadRecord>), String> {
-    let path = srs_path(srs_dir, degree);
+    let path = srs_path(srs_dir, degree, max_g2_degree);
     let mut records = Vec::new();
     if !path.exists() {
-        println!("   generating SRS degree={degree}");
+        println!(
+            "   generating shared SRS: G1/hiding-G1 degree={degree}, G2 degree={max_g2_degree}"
+        );
         let setup_start = Instant::now();
-        let srs = Srs::setup_development(
+        let srs = Srs::setup_development_with_g2_degree(
             degree,
-            format!("dynamic-poa-benchmark-srs-{degree}").as_bytes(),
+            max_g2_degree,
+            format!("dynamic-poa-benchmark-srs-v2-{degree}").as_bytes(),
         );
         let setup_elapsed = setup_start.elapsed();
         let write_start = Instant::now();
+        let temporary_path = path.with_extension("bin.tmp");
         write_srs(
-            &path,
+            &temporary_path,
             srs.max_degree,
             &srs.tau_g1_powers,
             &srs.tau_g2_powers,
             &srs.hiding_tau_g1_powers,
         )?;
+        fs::rename(&temporary_path, &path).map_err(|err| {
+            format!(
+                "install generated SRS {} -> {}: {err}",
+                temporary_path.display(),
+                path.display()
+            )
+        })?;
         let write_elapsed = write_start.elapsed();
         records.push(LoadRecord {
             n,
@@ -739,13 +785,16 @@ fn prepare_srs(
     let needed_powers = degree
         .checked_add(1)
         .ok_or_else(|| "benchmark SRS degree overflow".to_string())?;
-    if max_degree < degree
+    let needed_g2_powers = max_g2_degree
+        .checked_add(1)
+        .ok_or_else(|| "benchmark G2 SRS degree overflow".to_string())?;
+    if max_degree != degree
         || tau_g1_powers.len() < needed_powers
-        || tau_g2_powers.len() < needed_powers
+        || tau_g2_powers.len() < needed_g2_powers
         || hiding_tau_g1_powers.len() < needed_powers
     {
         return Err(format!(
-            "benchmark SRS {} is incomplete for degree {degree}",
+            "benchmark SRS {} is incomplete for G1/hiding degree {degree} and G2 degree {max_g2_degree}",
             path.display()
         ));
     }

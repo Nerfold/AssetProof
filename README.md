@@ -405,7 +405,10 @@ benchmark 依赖，不应被描述为当前 Ethereum 主网共识状态树实现
 - `m = 10^2, 10^3`：每个 `n` 先确定性生成最大 `10^3` 个互不重复的随机更新，
   `10^2` 是同一更新序列的前缀；两种规模分别持久化 canonical delta list 及其重建后
   的新 Verkle root；
-- 对应的 development benchmark SRS。
+- 一套由全部规模共享的 development benchmark SRS。普通 G1 和 HPolyCom hiding-G1
+  powers 覆盖 `max(n)+1`（insert 会增加一个账户），G2 powers 只覆盖 verifier 实际会
+  提交的最大更新消失多项式 `max(m)`。这与 KZG 关系一致，并避免生成约一百万个协议
+  完全不会使用的 G2 powers。
 
 文件默认持久化在：
 
@@ -437,7 +440,10 @@ SAMPLES=5 WARMUP=1 POA_SP1_PROOF_MODE=groth16 \
 初始化脚本会在宿主侧验证账户、公私钥、basic-data、初始化 multiproof、insert proof、
 delta 的旧 root 和重建后的新 root；initialization/insert 的 SP1 guest 随后还会在证明
 过程中再次验证对应的 Verkle opening。百万规模准备过程本身可能消耗大量内存、磁盘和
-时间，但这些时间不会进入 protocol prover/verifier 统计。
+时间，但这些时间不会进入 protocol prover/verifier 统计。SRS 会按三个阶段显示进度，
+默认使用全部逻辑 CPU；可用 `SRS_THREADS=8 ./scripts/initialize_benchmark_data.sh` 限制
+并行度。文件名同时绑定最大 G1/hiding-G1 degree 和最大 G2 degree，参数矩阵不变时会
+直接复用，不会重新生成。
 
 ## 测试
 

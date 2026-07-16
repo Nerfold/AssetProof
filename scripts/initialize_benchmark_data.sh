@@ -10,16 +10,22 @@ RUN_ID="${RUN_ID:-$(date +%Y%m%d-%H%M%S)}"
 OUTPUT_DIR="${OUTPUT_DIR:-artifacts/benchmarks/preparation-$RUN_ID}"
 SRS_DIR="${SRS_DIR:-params/srs/bench}"
 FIXTURE_DIR="${FIXTURE_DIR:-data/mock/bench/generated}"
+SRS_THREADS="${SRS_THREADS:-$(sysctl -n hw.logicalcpu 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)}"
+
+export RAYON_NUM_THREADS="$SRS_THREADS"
 
 echo "Dynamic PoA benchmark fixture initialization"
 echo "  n:          $N_SIZES"
 echo "  m:          $M_SIZES"
 echo "  fixtures:   $FIXTURE_DIR"
 echo "  SRS:        $SRS_DIR"
+echo "  SRS threads: $SRS_THREADS"
 echo "  manifest:   $OUTPUT_DIR/preparation-manifest.txt"
 echo
 echo "This stage can require substantial RAM, disk space, and time for n=1000000."
 echo "It generates data and validates Verkle proofs, but does not run SP1 proving."
+echo "One shared SRS is generated: full G1/hiding-G1 through max(n)+1,"
+echo "and only the G2 prefix required through max(m). Existing matching SRS is reused."
 
 echo
 echo "Building release fixture generator..."

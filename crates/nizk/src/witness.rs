@@ -48,7 +48,9 @@ pub fn build_update_witness_from_evaluations(
         if y.is_zero() {
             u_values.push(Fr::one());
             z_values.push(Fr::zero());
-            d_value += delta.delta;
+            d_value = d_value
+                .checked_add(delta.delta)
+                .ok_or_else(|| "aggregate reserve delta overflowed i128".to_string())?;
         } else {
             let z = y
                 .inverse()

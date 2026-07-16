@@ -106,6 +106,16 @@ fn initialize_core(
     if reserve_entries.is_empty() {
         return Err("reserve set must not be empty".to_string());
     }
+    if reserve_entries.iter().any(|entry| entry.balance < 0) {
+        return Err("reserve balances must be non-negative".to_string());
+    }
+    if reserve_entries.len() > srs.max_degree {
+        return Err(format!(
+            "reserve set size {} exceeds SRS degree bound {}",
+            reserve_entries.len(),
+            srs.max_degree
+        ));
+    }
     if reserve_entries.len() != prepared_witnesses.len()
         || reserve_entries.len() != reserve_witnesses.len()
     {
@@ -162,10 +172,12 @@ fn initialize_core(
     let balance_blind = Fr::rand(&mut rng);
     let balance_commitment = commit_balance(balance_total, balance_blind);
     let r_shape = Fr::rand(&mut rng);
-    let c_shape = commit_shape(alpha, &roots, r_shape);
+    let c_shape = commit_shape(alpha, &roots, r_shape)?;
 
     let zeta = derive_zeta(
+        &ctx.chain_id,
         &ctx.state_root,
+        &ctx.session_id,
         reserve_entries.len(),
         &accumulator,
         &balance_commitment,
@@ -202,7 +214,11 @@ fn initialize_core(
     let balance_blind_base = derive_generator("balance-h", 0);
     let eval_value_base = derive_generator("eval-v", 0);
     let eval_blind_base = derive_generator("eval-h", 0);
-    let shape_value_bases = generator_window("init-shape-w", roots.len() + 1)
+    let shape_width = roots
+        .len()
+        .checked_add(1)
+        .ok_or_else(|| "initialization shape width overflow".to_string())?;
+    let shape_value_bases = generator_window("init-shape-w", shape_width)
         .into_iter()
         .map(Into::into)
         .collect::<Vec<ark_bls12_381::G1Projective>>();
@@ -237,7 +253,7 @@ fn initialize_core(
         sp1_host::init::prove_init(sp1_stdin)?;
 
     let proof = StoredInitProof {
-        scheme: "kzg-nizk-init-v3-zkopen".to_string(),
+        scheme: "kzg-nizk-init-v5-zkopen-h2c-crs-mock-bound".to_string(),
         mode: "sp1".to_string(),
         chain_id: ctx.chain_id.clone(),
         state_root: ctx.state_root.clone(),
@@ -296,6 +312,14 @@ pub fn verify_init_proof(
     proof: &StoredInitProof,
 ) -> Result<(), String> {
     verify_init_public_proof(srs, &state.public_state(), proof)?;
+    if state.reserve_addresses.len() != state.reserve_balances.len() {
+        return Err(
+            "private reserve address and balance vectors have different lengths".to_string(),
+        );
+    }
+    if state.reserve_balances.iter().any(|balance| *balance < 0) {
+        return Err("private reserve balances must be non-negative".to_string());
+    }
     let roots = state
         .reserve_addresses
         .iter()
@@ -334,13 +358,16 @@ pub fn verify_init_proof(
     Ok(())
 }
 
-pub fn verify_init_public_proof(
+pub(crate) fn verify_init_public_proof(
     srs: &Srs,
     public_state: &PublicState,
     proof: &StoredInitProof,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     if public_state.srs_max_degree != srs.max_degree {
         return Err("state SRS degree does not match provided SRS".to_string());
+    }
+    if proof.reserve_count == 0 || proof.reserve_count > srs.max_degree {
+        return Err("init reserve count is outside the SRS-supported range".to_string());
     }
     if proof.state_root != public_state.state_root {
         return Err("init proof state_root mismatch".to_string());
@@ -357,7 +384,7 @@ pub fn verify_init_public_proof(
     if proof.srs_hash_hex != point_hash_srs(srs)? {
         return Err("SRS hash mismatch".to_string());
     }
-    if proof.scheme != "kzg-nizk-init-v3-zkopen" {
+    if proof.scheme != "kzg-nizk-init-v5-zkopen-h2c-crs-mock-bound" {
         return Err("init proof is not a production ZK proof; use verify_init_debug only for transparent local tests".to_string());
     }
     if proof.mode != "sp1" {
@@ -374,7 +401,9 @@ pub fn verify_init_public_proof(
     let c_shape = point_g1_from_hex(&proof.c_shape_hex)?;
     let c_y = point_g1_from_hex(&proof.c_y_hex)?;
     let expected_zeta = derive_zeta(
+        &proof.chain_id,
         &proof.state_root,
+        &proof.session_id,
         proof.reserve_count,
         &accumulator,
         &balance_commitment,
@@ -397,7 +426,11 @@ pub fn verify_init_public_proof(
     let balance_blind_base = derive_generator("balance-h", 0);
     let eval_value_base = derive_generator("eval-v", 0);
     let eval_blind_base = derive_generator("eval-h", 0);
-    let shape_value_bases = generator_window("init-shape-w", proof.reserve_count + 1)
+    let shape_width = proof
+        .reserve_count
+        .checked_add(1)
+        .ok_or_else(|| "initialization shape width overflow".to_string())?;
+    let shape_value_bases = generator_window("init-shape-w", shape_width)
         .into_iter()
         .map(Into::into)
         .collect::<Vec<ark_bls12_381::G1Projective>>();
@@ -437,14 +470,23 @@ pub fn verify_init_public_proof(
     if expected_transcript != proof.transcript_hex {
         return Err("init transcript mismatch".to_string());
     }
-    Ok(())
+    Ok(sp1_public.uses_mock_inputs)
 }
 
-fn commit_shape(alpha: Fr, roots: &[Fr], blind: Fr) -> ark_bls12_381::G1Projective {
-    let mut values = Vec::with_capacity(roots.len() + 1);
+fn commit_shape(alpha: Fr, roots: &[Fr], blind: Fr) -> Result<ark_bls12_381::G1Projective, String> {
+    let width = roots
+        .len()
+        .checked_add(1)
+        .ok_or_else(|| "initialization shape width overflow".to_string())?;
+    let mut values = Vec::with_capacity(width);
     values.push(alpha);
     values.extend_from_slice(roots);
-    commit_linear(&values, "init-shape-w", "init-shape-h", blind)
+    Ok(commit_linear(
+        &values,
+        "init-shape-w",
+        "init-shape-h",
+        blind,
+    ))
 }
 
 fn commit_eval(value: Fr, blind: Fr) -> ark_bls12_381::G1Projective {
@@ -459,14 +501,18 @@ fn is_strictly_ordered(values: &[Fr]) -> bool {
 }
 
 fn derive_zeta(
+    chain_id: &str,
     state_root: &str,
+    session_id: &str,
     reserve_count: usize,
     accumulator: &ark_bls12_381::G1Projective,
     balance_commitment: &ark_bls12_381::G1Projective,
     c_shape: &ark_bls12_381::G1Projective,
 ) -> Result<Fr, String> {
     let payload = [
+        chain_id.as_bytes(),
         state_root.as_bytes(),
+        session_id.as_bytes(),
         &reserve_count.to_le_bytes(),
         point_g1_to_hex(accumulator)?.as_bytes(),
         point_g1_to_hex(balance_commitment)?.as_bytes(),
@@ -507,12 +553,19 @@ fn build_transcript_hex(
 }
 
 fn point_hash_srs(srs: &Srs) -> Result<String, String> {
+    if srs.tau_g1_powers.len() < 2 || srs.tau_g2_powers.len() < 2 {
+        return Err(
+            "initialization verification requires tau^0 and tau^1 in both SRS groups".to_string(),
+        );
+    }
     let mut bytes = Vec::new();
-    bytes.extend_from_slice(&(srs.max_degree as u64).to_le_bytes());
-    for point in &srs.tau_g1_powers {
+    let encoded_degree = u64::try_from(srs.max_degree)
+        .map_err(|_| "SRS max_degree does not fit the initialization transcript".to_string())?;
+    bytes.extend_from_slice(&encoded_degree.to_le_bytes());
+    for point in &srs.tau_g1_powers[..2] {
         bytes.extend_from_slice(&common::crypto::serialize_hex(point)?.into_bytes());
     }
-    for point in &srs.tau_g2_powers {
+    for point in &srs.tau_g2_powers[..2] {
         bytes.extend_from_slice(&common::crypto::serialize_hex(point)?.into_bytes());
     }
     Ok(common::crypto::hex_encode(&hash_bytes(

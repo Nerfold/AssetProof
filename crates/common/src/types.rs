@@ -94,6 +94,7 @@ pub struct Delta {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SyncProof {
     pub scheme: String,
+    pub chain_id: String,
     pub old_state_root: String,
     pub new_state_root: String,
     pub delta_list_commitment_hex: String,
@@ -184,6 +185,9 @@ pub struct StoredProof {
     pub witness_link_ipa_proof: Vec<u8>,
     pub v_link_proof: Vec<u8>,
     pub projection_ipa_proof: Vec<u8>,
+    /// Bulletproof proving that the updated aggregate balance commitment opens
+    /// to a value in the protocol's accepted nonnegative integer range.
+    pub balance_range_proof_hex: String,
 }
 
 pub type PublicUpdateProof = StoredProof;

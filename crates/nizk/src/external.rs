@@ -53,6 +53,70 @@ impl ExternalProofArtifact {
 #[derive(Clone, Debug, Default)]
 pub struct MockExternalProofAdapter;
 
+/// Host-side binder for ownership and native chain proofs that are verified
+/// inside the SP1 initialization/insert guest. This adapter does not claim to
+/// verify those private witnesses outside SP1; it only commits their public
+/// artifact labels into the outer transcript.
+#[derive(Clone, Debug, Default)]
+pub struct Sp1NativeProofAdapter;
+
+#[derive(Clone, Debug)]
+pub struct PinnedSyncProofAdapter {
+    pub expected_scheme: String,
+    pub expected_proof_hex: String,
+}
+
+impl ExternalProofAdapter for PinnedSyncProofAdapter {
+    fn prepare_init_witness(
+        &self,
+        _ctx: &InitProvingContext,
+        _witness: &InitReserveWitness,
+    ) -> Result<PreparedInitReserveWitness, String> {
+        Err("pinned Sync adapter cannot prepare initialization witnesses".to_string())
+    }
+
+    fn verify_insert_ownership(
+        &self,
+        _state_root: &str,
+        _address: &str,
+        _artifact: &ExternalProofArtifact,
+    ) -> Result<PreparedOwnershipWitness, String> {
+        Err("pinned Sync adapter cannot verify insertion ownership".to_string())
+    }
+
+    fn verify_insert_balance(
+        &self,
+        _state_root: &str,
+        _address: &str,
+        _balance: i128,
+        _artifact: &ExternalProofArtifact,
+    ) -> Result<PreparedChainBalanceWitness, String> {
+        Err("pinned Sync adapter cannot verify insertion balances".to_string())
+    }
+
+    fn verify_sync(
+        &self,
+        old_state_root: &str,
+        new_state_root: &str,
+        delta_list_commitment_hex: &str,
+        proof: &SyncProof,
+    ) -> Result<(), String> {
+        if proof.old_state_root != old_state_root
+            || proof.new_state_root != new_state_root
+            || proof.delta_list_commitment_hex != delta_list_commitment_hex
+        {
+            return Err("pinned Sync public statement mismatch".to_string());
+        }
+        if proof.scheme != self.expected_scheme || proof.proof_hex != self.expected_proof_hex {
+            return Err("Sync proof is not the transition artifact pinned by policy".to_string());
+        }
+        if proof.proof_hex.is_empty() {
+            return Err("pinned Sync proof must not be empty".to_string());
+        }
+        Ok(())
+    }
+}
+
 impl ExternalProofAdapter for MockExternalProofAdapter {
     fn prepare_init_witness(
         &self,
@@ -139,11 +203,82 @@ impl ExternalProofAdapter for MockExternalProofAdapter {
             return Err("sync proof delta commitment mismatch".to_string());
         }
         match proof.scheme.as_str() {
-            "mock-canonical-sync" | "external-canonical-sync" if !proof.proof_hex.is_empty() => {
-                Ok(())
-            }
+            "mock-canonical-sync" if !proof.proof_hex.is_empty() => Ok(()),
             _ => Err("missing accepted canonical Sync proof".to_string()),
         }
+    }
+}
+
+impl ExternalProofAdapter for Sp1NativeProofAdapter {
+    fn prepare_init_witness(
+        &self,
+        ctx: &InitProvingContext,
+        witness: &InitReserveWitness,
+    ) -> Result<PreparedInitReserveWitness, String> {
+        Ok(PreparedInitReserveWitness {
+            address: witness.address.clone(),
+            balance: witness.balance,
+            ownership: prepare_ownership(ctx, witness)?,
+            chain_balance: prepare_chain_balance(ctx, witness)?,
+        })
+    }
+
+    fn verify_insert_ownership(
+        &self,
+        state_root: &str,
+        address: &str,
+        artifact: &ExternalProofArtifact,
+    ) -> Result<PreparedOwnershipWitness, String> {
+        if artifact.scheme != "sp1-native-ownership" {
+            return Err("SP1-native insert requires an sp1-native-ownership artifact".to_string());
+        }
+        Ok(PreparedOwnershipWitness {
+            scheme: artifact.scheme.clone(),
+            proof_digest_hex: hex_hash(
+                "sp1-native-insert-ownership",
+                &[
+                    state_root.as_bytes(),
+                    address.as_bytes(),
+                    artifact.payload_hex.as_bytes(),
+                ],
+            ),
+        })
+    }
+
+    fn verify_insert_balance(
+        &self,
+        state_root: &str,
+        address: &str,
+        balance: i128,
+        artifact: &ExternalProofArtifact,
+    ) -> Result<PreparedChainBalanceWitness, String> {
+        if artifact.scheme != "sp1-native-chain-balance" {
+            return Err(
+                "SP1-native insert requires an sp1-native-chain-balance artifact".to_string(),
+            );
+        }
+        Ok(PreparedChainBalanceWitness {
+            scheme: artifact.scheme.clone(),
+            proof_digest_hex: hex_hash(
+                "sp1-native-insert-chain-balance",
+                &[
+                    state_root.as_bytes(),
+                    address.as_bytes(),
+                    &balance.to_le_bytes(),
+                    artifact.payload_hex.as_bytes(),
+                ],
+            ),
+        })
+    }
+
+    fn verify_sync(
+        &self,
+        _old_state_root: &str,
+        _new_state_root: &str,
+        _delta_list_commitment_hex: &str,
+        _proof: &SyncProof,
+    ) -> Result<(), String> {
+        Err("SP1-native witness adapter cannot verify Sync transitions".to_string())
     }
 }
 

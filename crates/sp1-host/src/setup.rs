@@ -21,7 +21,14 @@ struct StoredSp1Setup {
 }
 
 pub fn default_setup_dir() -> PathBuf {
-    PathBuf::from("params/sp1")
+    if let Some(path) = std::env::var_os("POA_SP1_SETUP_DIR") {
+        return PathBuf::from(path);
+    }
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("sp1-host must live under the workspace crates directory")
+        .join("params/sp1")
 }
 
 pub fn ensure_all_setups(

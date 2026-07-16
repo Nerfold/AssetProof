@@ -25,9 +25,12 @@ fn main() {
 
 fn verify_insert(input: Sp1KzgInsertStdin) -> Sp1KzgInsertPublicValues {
     assert!(input.balance >= 0, "negative inserted balance");
+    let expected_reserve_count_after = input
+        .reserve_count_before
+        .checked_add(1)
+        .expect("insert reserve count overflow");
     assert_eq!(
-        input.reserve_count_after,
-        input.reserve_count_before + 1,
+        input.reserve_count_after, expected_reserve_count_after,
         "insert reserve count mismatch"
     );
     verify_ownership(&input.chain_id, &input.address, &input.ownership);
@@ -65,9 +68,22 @@ fn verify_insert(input: Sp1KzgInsertStdin) -> Sp1KzgInsertPublicValues {
         "balance-delta commitment opening mismatch"
     );
 
+    let uses_mock_inputs = matches!(input.ownership, Sp1OwnershipWitness::MockPrivateKey { .. })
+        || matches!(
+            input.chain_balance_proof,
+            Sp1ChainBalanceProof::MockBinding { .. }
+        );
+
     Sp1KzgInsertPublicValues {
         chain_id: input.chain_id,
         state_root: input.state_root,
+        commitment_params_digest_hex: commitment_params_digest(
+            &input.eval_value_base,
+            &input.eval_blind_base,
+            &input.balance_value_base,
+            &input.balance_blind_base,
+        ),
+        uses_mock_inputs,
         c_x: input.c_x,
         c_balance_delta: input.c_balance_delta,
         old_accumulator_hex: input.old_accumulator_hex,
@@ -90,14 +106,65 @@ fn commit_two(
     let right_base = point_from_io(right_base);
     assert_on_curve(&left_base);
     assert_on_curve(&right_base);
-    let left = (!is_zero(left_scalar)).then(|| left_base.scalar_mul(left_scalar));
-    let right = (!is_zero(right_scalar)).then(|| right_base.scalar_mul(right_scalar));
+    let left = (!is_zero(left_scalar)).then(|| scalar_mul_safe(&left_base, left_scalar));
+    let right = (!is_zero(right_scalar)).then(|| scalar_mul_safe(&right_base, right_scalar));
     match (left, right) {
-        (Some(left), Some(right)) => &left + &right,
+        (Some(left), Some(right)) => add_safe(&left, &right),
         (Some(left), None) => left,
         (None, Some(right)) => right,
         (None, None) => panic!("commitment cannot be the identity"),
     }
+}
+
+fn scalar_mul_safe(base: &AffinePoint<Bls12381>, scalar: &BigUint) -> AffinePoint<Bls12381> {
+    let mut result = None;
+    let mut power = base.clone();
+    for byte in scalar.to_bytes_le() {
+        for bit in 0..8 {
+            if byte & (1 << bit) != 0 {
+                result = Some(match result {
+                    Some(current) => add_safe(&current, &power),
+                    None => power.clone(),
+                });
+            }
+            power = power.sw_double();
+        }
+    }
+    result.expect("non-zero commitment scalar")
+}
+
+fn add_safe(left: &AffinePoint<Bls12381>, right: &AffinePoint<Bls12381>) -> AffinePoint<Bls12381> {
+    if left == right {
+        left.sw_double()
+    } else {
+        assert!(left.x != right.x, "commitment addition produced identity");
+        left + right
+    }
+}
+
+fn commitment_params_digest(
+    eval_value: &Sp1G1Affine,
+    eval_blind: &Sp1G1Affine,
+    balance_value: &Sp1G1Affine,
+    balance_blind: &Sp1G1Affine,
+) -> alloc::string::String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"dynamic-poa-insert-commitment-params-v1");
+    for point in [eval_value, eval_blind, balance_value, balance_blind] {
+        hasher.update(&point.x_be);
+        hasher.update(&point.y_be);
+    }
+    hex_hash(hasher.finalize().as_bytes())
+}
+
+fn hex_hash(bytes: &[u8]) -> alloc::string::String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = alloc::string::String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
 }
 
 fn point_from_io(value: &Sp1G1Affine) -> AffinePoint<Bls12381> {

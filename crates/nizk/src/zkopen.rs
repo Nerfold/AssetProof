@@ -225,7 +225,7 @@ mod tests {
 
     #[test]
     fn sigma_zkopen_accepts_honest_opening_and_rejects_tampering() {
-        let srs = Srs::setup(8, b"zkopen-sigma-test");
+        let srs = Srs::setup_development(8, b"zkopen-sigma-test");
         let polynomial =
             Polynomial::from_coeffs(vec![Fr::from(3u64), Fr::from(7u64), Fr::from(11u64)]);
         let zeta = Fr::from(19u64);
@@ -286,7 +286,7 @@ mod tests {
     #[test]
     fn sigma_zkopen_rejects_evaluation_at_tau() {
         let seed = b"zkopen-tau-test";
-        let srs = Srs::setup(4, seed);
+        let srs = Srs::setup_development(4, seed);
         let mut tau = common::crypto::hash_to_scalar("srs-tau", seed);
         if tau == Fr::from(0u64) {
             tau = Fr::from(7u64);

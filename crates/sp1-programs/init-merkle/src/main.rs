@@ -81,6 +81,16 @@ fn verify_init(input: Sp1InitStdin) -> Sp1InitPublicValues {
     );
     verify_private_commitment_openings(&input);
 
+    let uses_mock_inputs = input.reserves.iter().any(|reserve| {
+        matches!(
+            &reserve.ownership,
+            Sp1OwnershipWitness::MockPrivateKey { .. }
+        ) || matches!(
+            &reserve.chain_balance_proof,
+            Sp1ChainBalanceProof::MockBinding { .. }
+        )
+    });
+
     Sp1InitPublicValues {
         chain_id: input.chain_id,
         state_root: input.state_root,
@@ -91,13 +101,19 @@ fn verify_init(input: Sp1InitStdin) -> Sp1InitPublicValues {
         shape_commitment: input.shape_commitment,
         eval_commitment: input.eval_commitment,
         commitment_params_digest_hex: input.commitment_params_digest_hex,
+        uses_mock_inputs,
     }
 }
 
 fn verify_private_commitment_openings(input: &Sp1InitStdin) {
+    let expected_shape_base_count = input
+        .reserves
+        .len()
+        .checked_add(1)
+        .expect("shape commitment base count overflow");
     assert_eq!(
         input.shape_value_bases.len(),
-        input.reserves.len() + 1,
+        expected_shape_base_count,
         "shape commitment base count mismatch"
     );
     let expected_params_digest = commitment_params_digest(
@@ -172,20 +188,46 @@ fn commit_many(
         .map(|(base, scalar)| {
             let base = point_from_io(base);
             assert_on_curve(&base);
-            base.scalar_mul(scalar)
+            scalar_mul_safe(&base, scalar)
         })
         .collect::<Vec<_>>();
     if !is_zero(blind) {
         let base = point_from_io(blind_base);
         assert_on_curve(&base);
-        terms.push(base.scalar_mul(blind));
+        terms.push(scalar_mul_safe(&base, blind));
     }
     let mut terms = terms.into_iter();
     let mut result = terms.next().expect("commitment cannot be identity");
     for term in terms {
-        result = &result + &term;
+        result = add_safe(&result, &term);
     }
     result
+}
+
+fn scalar_mul_safe(base: &AffinePoint<Bls12381>, scalar: &BigUint) -> AffinePoint<Bls12381> {
+    let mut result = None;
+    let mut power = base.clone();
+    for byte in scalar.to_bytes_le() {
+        for bit in 0..8 {
+            if byte & (1 << bit) != 0 {
+                result = Some(match result {
+                    Some(current) => add_safe(&current, &power),
+                    None => power.clone(),
+                });
+            }
+            power = power.sw_double();
+        }
+    }
+    result.expect("non-zero commitment scalar")
+}
+
+fn add_safe(left: &AffinePoint<Bls12381>, right: &AffinePoint<Bls12381>) -> AffinePoint<Bls12381> {
+    if left == right {
+        left.sw_double()
+    } else {
+        assert!(left.x != right.x, "commitment addition produced identity");
+        left + right
+    }
 }
 
 fn point_from_io(value: &Sp1G1Affine) -> AffinePoint<Bls12381> {

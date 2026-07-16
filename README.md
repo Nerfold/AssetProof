@@ -43,11 +43,16 @@ cargo build --release -p poa-cli
   artifacts/states/init-state.txt \
   data/mock/deltas.csv \
   mock-root-1
-./poa check-update \
+./poa check-update-debug \
   artifacts/states/init-state.txt \
   data/mock/deltas.csv \
   artifacts/states/init-state-next.txt \
   artifacts/proofs/init-state-update-proof.txt
+./poa prove-threshold artifacts/states/init-state-next.txt 100
+./poa check-threshold \
+  artifacts/states/init-state-next.txt.public \
+  100 \
+  artifacts/proofs/threshold-proof.txt
 ```
 
 初始化产物会写入 `artifacts/states/init-state.txt` 和
@@ -139,6 +144,20 @@ artifacts/test-runs/ethereum-sync.json
 前者可直接交给 `prove-update`；后者包含规范地址向量、delta 向量、区块和
 state root 元数据、delta-list commitment 与 transition commitment。
 
+生产验证还需要独立的 verifier policy 文件，格式见
+`data/ethereum/finality-policy.example.json`。其中的 chain id、finalized roots、
+last accepted root、last accepted public-state digest 和 pinned transition commitment
+必须来自验证者信任的 finality/同步来源，不能直接从待验证 proof 或 sync-output
+自报。完整协议状态摘要可用下面的命令计算，再由验证者独立记录到 policy：
+
+```bash
+./poa state-digest artifacts/states/init-state.txt
+```
+
+只记录链 state root 不够：同一个链根下可能连续执行 insert，产生不同的 accumulator
+和 balance commitment。摘要会同时绑定 root、SRS degree、reserve count、accumulator
+以及 balance commitment，防止旧协议状态分叉或重放。
+
 同步器的输入不是单独的 Ethereum block。它必须是账本执行完成后得到的完整
 state diff，并且区块已最终确认。Geth `prestateTracer` diff mode 可作为数据源，
 但上游还必须覆盖 withdrawals、fee recipient 等协议级余额变化。详细格式见
@@ -156,9 +175,9 @@ state diff，并且区块已最终确认。Geth `prestateTracer` diff mode 可�
 
 1. `params/srs/` 保存 KZG powers-of-tau。当前 SRS 同时包含普通 G1/G2 powers
    与 HPolyCom 使用的独立 hiding G1 powers。
-2. `params/crs/` 保存 Pedersen commitment 和 Sigma ZKOpen 所用基点的派生约定。
-   当前实现仍通过代码中的 domain-separated label 确定性派生，这仅适合原型；
-   生产版本必须换成离散对数关系未知、经过审计的独立基点。
+2. `params/crs/` 保存 Pedersen commitment 和 Sigma ZKOpen 所用透明 CRS 的派生约定。
+   基点使用标准 BLS12-381 G1 `XMD:SHA-256_SSWU_RO` hash-to-curve、独立 domain
+   label 和 index 派生，不再使用已知离散对数的 `hash_to_scalar * G`。
 3. `params/sp1/` 保存 SP1 guest 对应的 setup/verifying-key 缓存。它们不是 KZG
    参数，也不是 Pedersen CRS。
 
@@ -168,13 +187,27 @@ state diff，并且区块已最终确认。Geth `prestateTracer` diff mode 可�
 ./poa sp1-setup
 ```
 
-默认位置是 `params/sp1/`。开发 SRS 由确定性 seed 生成，不代表可信仪式；生产
-环境应替换为经过验证的 ceremony 输出并单独记录来源和 digest。
+默认位置是 `params/sp1/`。开发 SRS 由确定性 seed 生成，不代表可信仪式，并会被
+生产验证器拒绝。生产 SRS 必须由外部 ceremony 生成并导入：
 
-目前 `setup` **不会生成单独的 Pedersen CRS 文件**。Pedersen 和 ZKOpen 的基点
-仍由代码按照 `params/crs/domains.json` 中的 label 确定性派生；该目录现在保存的
-是派生约定，不是二进制 CRS。因为当前开发派生方式不能提供生产环境要求的未知
-离散对数关系，它只能用于原型。生产化时应改为独立生成/导入并校验 Pedersen CRS。
+```bash
+./poa import-srs ceremony.srs.bin <ceremony-id>
+```
+
+导入器使用 subgroup-checked 反序列化，并用批量 pairing 关系检查普通 G1/G2 powers
+和 HPolyCom hiding powers；导入后在 SRS 旁写入 provenance `.meta` 文件。
+
+`setup` **不会生成单独的 Pedersen CRS 文件**。Pedersen CRS 是透明 CRS：验证者
+按照 `params/crs/domains.json` 记录的 suite、DST、label 和 index 重新 hash-to-curve。
+它不需要秘密或可信仪式；KZG SRS 仍然需要外部 powers-of-tau ceremony，两者不能混用。
+
+本次 CRS 升级与旧的 `hash_to_scalar * G` 基点不兼容。旧 state 中的 balance
+commitment、旧 initialization/update/insert proof 都必须从 initialization 开始重新生成；
+不能在旧 state 上继续 update。初始化 scheme 已升级为
+`kzg-nizk-init-v5-zkopen-h2c-crs-mock-bound`，insert scheme 为
+`kzg-nizk-insert-v5-hpoly-bounded-range-mock-bound`。修改过 SP1 guest 后也必须重新运行 `./poa sp1-setup`；
+loader 会比较 artifact 中记录的 ELF digest，旧 artifact 会 fail-closed 并提示重新 setup。
+本轮只修改代码、未重新生成 SP1 artifact，因此首次运行前必须执行一次该命令。
 
 SRS 文件格式已经扩展：旧格式为 `G1 powers + G2 powers`，新格式在末尾追加
 HPolyCom 的 hiding G1 powers。读取器仍能读取旧格式，因此普通 KZG 初始化/更新
@@ -182,7 +215,7 @@ HPolyCom 的 hiding G1 powers。读取器仍能读取旧格式，因此普通 KZ
 会检查默认 `params/srs/dev.srs.bin`，发现旧格式时自动按原 degree 重新生成完整 SRS。
 只要实际替换了 SRS，最安全的做法仍是重新生成依赖它的 state 和 proof。
 
-自定义 SRS 仍可用底层命令生成：
+底层 `gen-srs` 只生成明确标记的开发 SRS：
 
 ```bash
 ./poa gen-srs 10000 params/srs/custom-10000.bin
@@ -209,20 +242,61 @@ HPolyCom 与 HZKOpen。HPolyCom 通过隐藏多项式对多项式 commitment 本
 proof label 当作 Ethereum 账户证明。EthereumAccountProof 与链上 Merkle proof 的
 构造方式取决于所使用的执行层状态树和 proof provider。
 
+真实单地址插入可通过库接口 `KzgInsertWitness::ethereum(...)` 构造。默认
+`apply_insert` 会选择 `Sp1NativeProofAdapter`：host 只把 artifact 标签绑定进外层
+transcript，私钥所有权、地址派生以及 Ethereum account MPT balance proof 都在
+SP1 guest 内验证；它不会把 host-side 标签误当成链证明本身。
+
+## Range proof 与阈值证明
+
+余额 range proof 使用与余额 commitment 相同的 Pedersen 基点。每个下界或上界
+证明用两个 64-bit limb 组成一个 128-bit Bulletproof，并检查
+`C_lo + 2^64 C_hi = C`。系统同时证明 `value >= 0` 与
+`i128::MAX - value >= 0`，因此接受区间严格为 `[0, i128::MAX]`，同时不公开余额、
+slack 或 blinding。
+
+每个固定集合 update proof 都内嵌新总余额的非负 range proof；验证器还限制每个
+公开 delta 以及全部公开 delta 的绝对值之和。这两部分共同排除有限域模数回绕。
+update proof 的持久化格式因此升级为 `DPOAUPD5`：旧 update proof 必须重新生成，
+KZG SRS 不需要因此重建。
+
+insert proof 也内嵌插入后 aggregate balance commitment 的非负 range proof，避免
+状态经过插入后离开协议接受的整数范围。
+
+对公开阈值 `T` 证明 committed assets `>= T`：
+
+```bash
+./poa prove-threshold <private-state.txt> <T> [proof.txt]
+./poa check-threshold <public-state.txt> <T> <proof.txt>
+```
+
+库接口还提供 `prove_committed_liability_threshold` 和
+`verify_committed_liability_threshold`，用于论文中的 committed liabilities 比较；
+证明对象是 `C_assets - C_liabilities` 对应的非负 slack。
+
 ## 高层命令
 
 ```text
 ./poa setup [max-degree]
+./poa import-srs <source.srs.bin> <ceremony-id> [destination.srs.bin]
 ./poa mock-data [accounts reserves blocks txs-per-block seed]
 ./poa eth-sync <transition.json> [deltas.csv sync-output.json]
 ./poa prove-init <state-root> [reserves.csv]
 ./poa prove-update <state.txt> <deltas.csv> <new-state-root>
-./poa check-update <old-state.txt> <deltas.csv> <new-state.txt> <proof.txt>
+./poa check-update <old-state.txt> <deltas.csv> <new-state.txt> <proof.txt> <sync-output.json> <policy.json>
+./poa check-update-debug <old-state.txt> <deltas.csv> <new-state.txt> <proof.txt>
+./poa state-digest <state.txt>
+./poa prove-threshold <state.txt> <threshold> [proof.txt]
+./poa check-threshold <public-state.txt> <threshold> <proof.txt>
 ```
 
-`check-update` 是当前原型产物的本地 debug verifier；它不会把 mock external
-adapter 提升为真实链信任来源。生产 verifier 仍要求完整的 committed-opening 与
-真实 external/sync proof。
+`check-update` 是 fail-closed 生产入口：要求 external-ceremony SRS、完整
+committed-opening、finalized/last-accepted `ChainPolicy`，并把 delta CSV 绑定到指定的
+Ethereum sync output。`check-update-debug` 才是允许 development SRS 且不声明链上
+Sync/finality 安全性的本地测试入口。
+
+若规范 Sync 输出为空，update 使用显式的 `dpoa-empty-update-v1` no-op artifact：
+只推进已认证的链根，不改变 accumulator、reserve count 或 balance commitment。
 
 原有的 `init`、`update`、`verify`、`smt-*`、`parallel-*`、benchmark 和持久化
 run 命令仍保留，便于实验脚本显式控制每一个路径。运行
@@ -246,8 +320,14 @@ mock deltas.csv ─────────────────────�
 old private state + deltas.csv + new state root + SRS
   └─> prove-update ─> next private/public state + update proof
 
-old/new public state + deltas.csv + proof + SRS
+old/new public state + deltas.csv + proof + external SRS + pinned sync output
   └─> check-update / production verifier
+
+private state + public threshold
+  └─> prove-threshold ─> value-hiding range proof
+
+public state + same threshold + range proof
+  └─> check-threshold
 ```
 
 Pedersen commitment 所需基点在证明和验证过程中由代码加载/派生，不会作为数据流

@@ -76,6 +76,25 @@ pub fn build_stdin(
     })
 }
 
+pub fn commitment_params_digest(
+    eval_value: &G1Projective,
+    eval_blind: &G1Projective,
+    balance_value: &G1Projective,
+    balance_blind: &G1Projective,
+) -> String {
+    let points = [eval_value, eval_blind, balance_value, balance_blind]
+        .into_iter()
+        .map(point_to_io)
+        .collect::<Vec<_>>();
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"dynamic-poa-insert-commitment-params-v1");
+    for point in points {
+        hasher.update(&point.x_be);
+        hasher.update(&point.y_be);
+    }
+    hex_encode(hasher.finalize().as_bytes())
+}
+
 pub fn prove(
     stdin_value: Sp1KzgInsertStdin,
 ) -> Result<(String, String, String, Sp1KzgInsertPublicValues), String> {

@@ -40,6 +40,7 @@ pub fn verify_account_balance(
         match children.len() {
             17 => {
                 if path_offset == nibbles.len() {
+                    ensure_proof_consumed(proof_index, proof_nodes.len())?;
                     return verify_account_value(children[16], expected_balance);
                 }
                 let child = children[nibbles[path_offset] as usize];
@@ -61,6 +62,7 @@ pub fn verify_account_balance(
                     if path_offset != nibbles.len() {
                         return Err("Ethereum leaf ended before account key");
                     }
+                    ensure_proof_consumed(proof_index, proof_nodes.len())?;
                     return verify_account_value(children[1], expected_balance);
                 }
                 node_bytes = resolve_child(children[1], proof_nodes, &mut proof_index)?;
@@ -79,6 +81,13 @@ fn resolve_child<'a>(
         if child.raw.len() >= 32 {
             return Err("oversized inline Ethereum trie child");
         }
+        if proof_nodes
+            .get(*proof_index + 1)
+            .is_some_and(|node| node.as_slice() == child.raw)
+        {
+            *proof_index += 1;
+            return Ok(proof_nodes[*proof_index].as_slice());
+        }
         return Ok(child.raw);
     }
     if child.payload.is_empty() {
@@ -95,6 +104,13 @@ fn resolve_child<'a>(
         return Ok(next);
     }
     Err("invalid Ethereum trie child reference")
+}
+
+fn ensure_proof_consumed(index: usize, proof_len: usize) -> Result<(), &'static str> {
+    if index.checked_add(1) != Some(proof_len) {
+        return Err("unused Ethereum trie proof nodes");
+    }
+    Ok(())
 }
 
 fn verify_account_value(value: RlpItem<'_>, expected_balance: i128) -> Result<(), &'static str> {
@@ -131,7 +147,7 @@ fn decode_compact_path(encoded: &[u8]) -> Result<(bool, Vec<u8>), &'static str> 
     if !odd && encoded[0] & 0x0f != 0 {
         return Err("non-canonical compact Ethereum trie path");
     }
-    let mut out = Vec::with_capacity(encoded.len() * 2);
+    let mut out = Vec::new();
     if odd {
         out.push(encoded[0] & 0x0f);
     }

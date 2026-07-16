@@ -179,6 +179,7 @@ pub struct Sp1InitPublicValues {
     pub shape_commitment: Sp1G1Affine,
     pub eval_commitment: Sp1G1Affine,
     pub commitment_params_digest_hex: String,
+    pub uses_mock_inputs: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -211,6 +212,8 @@ pub struct Sp1KzgInsertStdin {
 pub struct Sp1KzgInsertPublicValues {
     pub chain_id: String,
     pub state_root: String,
+    pub commitment_params_digest_hex: String,
+    pub uses_mock_inputs: bool,
     pub c_x: Sp1G1Affine,
     pub c_balance_delta: Sp1G1Affine,
     pub old_accumulator_hex: String,

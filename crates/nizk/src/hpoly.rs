@@ -200,7 +200,9 @@ fn commit_pair(
 }
 
 fn ensure_hiding_srs(srs: &Srs, degree_bound: usize) -> Result<(), String> {
-    let needed = degree_bound + 1;
+    let needed = degree_bound
+        .checked_add(1)
+        .ok_or_else(|| "HPolyCom degree bound overflow".to_string())?;
     if srs.tau_g1_powers.len() < needed || srs.hiding_tau_g1_powers.len() < needed {
         return Err(format!(
             "HPolyCom requires {needed} ordinary and independent hiding G1 SRS powers"
@@ -305,7 +307,7 @@ mod tests {
 
     #[test]
     fn hpoly_commitment_hides_polynomial_and_hzkopen_verifies() {
-        let srs = Srs::setup(8, b"hpoly-test-srs");
+        let srs = Srs::setup_development(8, b"hpoly-test-srs");
         let polynomial =
             Polynomial::from_coeffs(vec![Fr::from(2u64), Fr::from(5u64), Fr::from(7u64)]);
         let hiding = commit_hiding_polynomial(&srs, &polynomial, 4).unwrap();
@@ -369,7 +371,7 @@ mod tests {
 
     #[test]
     fn hpoly_rejects_srs_without_independent_hiding_powers() {
-        let mut srs = Srs::setup(4, b"hpoly-missing-srs");
+        let mut srs = Srs::setup_development(4, b"hpoly-missing-srs");
         srs.hiding_tau_g1_powers.clear();
         let polynomial = Polynomial::from_coeffs(vec![Fr::from(1u64)]);
         assert!(commit_hiding_polynomial(&srs, &polynomial, 1).is_err());

@@ -86,7 +86,10 @@ pub fn read_delta_csv(path: &Path) -> Result<Vec<Delta>, String> {
         let delta = parts[1]
             .parse::<i128>()
             .map_err(|err| format!("invalid delta on line {}: {err}", line_no + 1))?;
-        *merged.entry(address).or_insert(0) += delta;
+        let total = merged.entry(address).or_insert(0);
+        *total = total
+            .checked_add(delta)
+            .ok_or_else(|| format!("merged delta overflowed i128 on line {}", line_no + 1))?;
     }
 
     let mut deltas = Vec::new();
@@ -266,7 +269,7 @@ pub fn read_proof(path: &Path) -> Result<StoredProof, String> {
     decode_proof_binary(&bytes)
 }
 
-const UPDATE_PROOF_MAGIC: &[u8; 8] = b"DPOAUPD3";
+const UPDATE_PROOF_MAGIC: &[u8; 8] = b"DPOAUPD5";
 
 pub fn encode_proof_binary(proof: &StoredProof) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
@@ -290,13 +293,14 @@ pub fn encode_proof_binary(proof: &StoredProof) -> Result<Vec<u8>, String> {
     put_bytes(&mut out, &proof.witness_link_ipa_proof)?;
     put_bytes(&mut out, &proof.v_link_proof)?;
     put_bytes(&mut out, &proof.projection_ipa_proof)?;
+    put_bytes(&mut out, proof.balance_range_proof_hex.as_bytes())?;
     Ok(out)
 }
 
 fn decode_proof_binary(bytes: &[u8]) -> Result<StoredProof, String> {
     if !bytes.starts_with(UPDATE_PROOF_MAGIC) {
         return Err(
-            "unsupported update proof format; regenerate the proof with protocol v3".to_string(),
+            "unsupported update proof format; regenerate the proof with protocol v4".to_string(),
         );
     }
     let mut input = BinaryReader::new(&bytes[UPDATE_PROOF_MAGIC.len()..]);
@@ -320,6 +324,7 @@ fn decode_proof_binary(bytes: &[u8]) -> Result<StoredProof, String> {
     let witness_link_ipa_proof = input.bytes()?.to_vec();
     let v_link_proof = input.bytes()?.to_vec();
     let projection_ipa_proof = input.bytes()?.to_vec();
+    let balance_range_proof_hex = input.string()?;
     input.finish()?;
     Ok(StoredProof {
         old_state_root,
@@ -341,6 +346,7 @@ fn decode_proof_binary(bytes: &[u8]) -> Result<StoredProof, String> {
         witness_link_ipa_proof,
         v_link_proof,
         projection_ipa_proof,
+        balance_range_proof_hex,
     })
 }
 
@@ -1284,13 +1290,13 @@ fn req_u8_vec(kv: &BTreeMap<String, String>, key: &str) -> Result<Vec<u8>, Strin
 mod init_privacy_tests {
     use ark_bls12_381::Fr;
 
-    use super::encode_stored_init_proof;
-    use crate::types::StoredInitProof;
+    use super::{decode_proof_binary, encode_proof_binary, encode_stored_init_proof};
+    use crate::types::{StoredInitProof, StoredProof};
 
     #[test]
     fn public_init_proof_encoding_omits_private_openings() {
         let proof = StoredInitProof {
-            scheme: "kzg-nizk-init-v3-zkopen".to_string(),
+            scheme: "kzg-nizk-init-v5-zkopen-h2c-crs-mock-bound".to_string(),
             mode: "sp1".to_string(),
             chain_id: "0x1".to_string(),
             state_root: "root".to_string(),
@@ -1322,5 +1328,34 @@ mod init_privacy_tests {
         ] {
             assert!(!encoded.contains(private_key), "leaked {private_key}");
         }
+    }
+
+    #[test]
+    fn update_v4_binary_round_trip_includes_balance_range_proof() {
+        let proof = StoredProof {
+            old_state_root: "old".to_string(),
+            new_state_root: "new".to_string(),
+            delta_list_commitment_hex: "00".to_string(),
+            c_u_hex: "01".to_string(),
+            c_y_hex: "02".to_string(),
+            c_d_hex: "03".to_string(),
+            eval_proof_hex: "04".to_string(),
+            c_v_hex: "05".to_string(),
+            theta: Fr::from(7u64),
+            theta_opening_proof_hex: "zkopen:v1:06:07:08:09:0a".to_string(),
+            gate_count: 2,
+            transcript_hex: "09".to_string(),
+            bp_proof_hex: "0a".to_string(),
+            witness_vector_commitment_hex: "0b".to_string(),
+            rho_bp_commitment_hex: "0c".to_string(),
+            v_bp_commitment_hex: "0d".to_string(),
+            witness_link_ipa_proof: vec![14],
+            v_link_proof: vec![15],
+            projection_ipa_proof: vec![16],
+            balance_range_proof_hex: "crange:v1:128:aa,bb:cc".to_string(),
+        };
+        let encoded = encode_proof_binary(&proof).unwrap();
+        assert!(encoded.starts_with(b"DPOAUPD5"));
+        assert_eq!(decode_proof_binary(&encoded).unwrap(), proof);
     }
 }

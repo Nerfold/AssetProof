@@ -132,7 +132,7 @@ pub fn write_string_vec_csv(values: &[String]) -> String {
 }
 
 pub fn hex_encode(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
+    let mut out = String::new();
     for byte in bytes {
         let _ = write!(out, "{byte:02x}");
     }
@@ -163,11 +163,17 @@ pub fn write_srs_binary<W: IoWrite>(
     tau_g1_powers: &[G1Affine],
     tau_g2_powers: &[G2Affine],
 ) -> Result<(), String> {
+    let encoded_max_degree = u64::try_from(max_degree)
+        .map_err(|_| "SRS max_degree does not fit the binary format".to_string())?;
+    let encoded_g1_len = u64::try_from(tau_g1_powers.len())
+        .map_err(|_| "SRS G1 length does not fit the binary format".to_string())?;
+    let encoded_g2_len = u64::try_from(tau_g2_powers.len())
+        .map_err(|_| "SRS G2 length does not fit the binary format".to_string())?;
     writer
-        .write_all(&(max_degree as u64).to_le_bytes())
+        .write_all(&encoded_max_degree.to_le_bytes())
         .map_err(|err| format!("write srs degree: {err}"))?;
     writer
-        .write_all(&(tau_g1_powers.len() as u64).to_le_bytes())
+        .write_all(&encoded_g1_len.to_le_bytes())
         .map_err(|err| format!("write srs g1 len: {err}"))?;
     for point in tau_g1_powers {
         let mut bytes = Vec::new();
@@ -179,7 +185,7 @@ pub fn write_srs_binary<W: IoWrite>(
             .map_err(|err| format!("write srs g1 bytes: {err}"))?;
     }
     writer
-        .write_all(&(tau_g2_powers.len() as u64).to_le_bytes())
+        .write_all(&encoded_g2_len.to_le_bytes())
         .map_err(|err| format!("write srs g2 len: {err}"))?;
     for point in tau_g2_powers {
         let mut bytes = Vec::new();
@@ -201,8 +207,10 @@ pub fn write_srs_binary_with_hiding<W: IoWrite>(
     hiding_tau_g1_powers: &[G1Affine],
 ) -> Result<(), String> {
     write_srs_binary(writer, max_degree, tau_g1_powers, tau_g2_powers)?;
+    let encoded_hiding_len = u64::try_from(hiding_tau_g1_powers.len())
+        .map_err(|_| "hiding SRS G1 length does not fit the binary format".to_string())?;
     writer
-        .write_all(&(hiding_tau_g1_powers.len() as u64).to_le_bytes())
+        .write_all(&encoded_hiding_len.to_le_bytes())
         .map_err(|err| format!("write hiding srs g1 len: {err}"))?;
     for point in hiding_tau_g1_powers {
         let mut bytes = Vec::new();
@@ -219,28 +227,46 @@ pub fn write_srs_binary_with_hiding<W: IoWrite>(
 pub fn read_srs_binary<R: Read>(
     reader: &mut R,
 ) -> Result<(usize, Vec<G1Affine>, Vec<G2Affine>), String> {
-    let max_degree = read_u64(reader)? as usize;
-    let g1_len = read_u64(reader)? as usize;
-    let mut tau_g1_powers = Vec::with_capacity(g1_len);
+    let max_degree = usize::try_from(read_u64(reader)?)
+        .map_err(|_| "SRS max_degree does not fit this platform".to_string())?;
+    let max_len = max_degree
+        .checked_add(1)
+        .ok_or_else(|| "SRS max_degree overflow".to_string())?;
+    let g1_len = usize::try_from(read_u64(reader)?)
+        .map_err(|_| "SRS G1 length does not fit this platform".to_string())?;
+    if g1_len > max_len {
+        return Err("SRS G1 length exceeds declared max_degree".to_string());
+    }
+    let mut tau_g1_powers = Vec::new();
+    tau_g1_powers
+        .try_reserve_exact(g1_len)
+        .map_err(|err| format!("reserve SRS G1 powers: {err}"))?;
     for _ in 0..g1_len {
         let mut bytes = vec![0u8; G1Affine::identity().compressed_size()];
         reader
             .read_exact(&mut bytes)
             .map_err(|err| format!("read srs g1 bytes: {err}"))?;
         tau_g1_powers.push(
-            G1Affine::deserialize_compressed_unchecked(&bytes[..])
+            G1Affine::deserialize_compressed(&bytes[..])
                 .map_err(|err| format!("read srs g1 point: {err}"))?,
         );
     }
-    let g2_len = read_u64(reader)? as usize;
-    let mut tau_g2_powers = Vec::with_capacity(g2_len);
+    let g2_len = usize::try_from(read_u64(reader)?)
+        .map_err(|_| "SRS G2 length does not fit this platform".to_string())?;
+    if g2_len > max_len {
+        return Err("SRS G2 length exceeds declared max_degree".to_string());
+    }
+    let mut tau_g2_powers = Vec::new();
+    tau_g2_powers
+        .try_reserve_exact(g2_len)
+        .map_err(|err| format!("reserve SRS G2 powers: {err}"))?;
     for _ in 0..g2_len {
         let mut bytes = vec![0u8; G2Affine::identity().compressed_size()];
         reader
             .read_exact(&mut bytes)
             .map_err(|err| format!("read srs g2 bytes: {err}"))?;
         tau_g2_powers.push(
-            G2Affine::deserialize_compressed_unchecked(&bytes[..])
+            G2Affine::deserialize_compressed(&bytes[..])
                 .map_err(|err| format!("read srs g2 point: {err}"))?,
         );
     }
@@ -264,15 +290,25 @@ pub fn read_srs_binary_with_hiding<R: Read>(
             .map_err(|err| format!("read hiding srs g1 len: {err}"))?,
         _ => unreachable!(),
     }
-    let len = u64::from_le_bytes(len_bytes) as usize;
-    let mut hiding_tau_g1_powers = Vec::with_capacity(len);
+    let len = usize::try_from(u64::from_le_bytes(len_bytes))
+        .map_err(|_| "hiding SRS G1 length does not fit this platform".to_string())?;
+    let max_len = max_degree
+        .checked_add(1)
+        .ok_or_else(|| "SRS max_degree overflow".to_string())?;
+    if len > max_len {
+        return Err("hiding SRS G1 length exceeds declared max_degree".to_string());
+    }
+    let mut hiding_tau_g1_powers = Vec::new();
+    hiding_tau_g1_powers
+        .try_reserve_exact(len)
+        .map_err(|err| format!("reserve hiding SRS G1 powers: {err}"))?;
     for _ in 0..len {
         let mut bytes = vec![0u8; G1Affine::identity().compressed_size()];
         reader
             .read_exact(&mut bytes)
             .map_err(|err| format!("read hiding srs g1 bytes: {err}"))?;
         hiding_tau_g1_powers.push(
-            G1Affine::deserialize_compressed_unchecked(&bytes[..])
+            G1Affine::deserialize_compressed(&bytes[..])
                 .map_err(|err| format!("read hiding srs g1 point: {err}"))?,
         );
     }
@@ -288,8 +324,16 @@ pub fn read_srs_g1_prefix_binary<R: Read + Seek>(
     reader: &mut R,
     needed_g1_len: usize,
 ) -> Result<(usize, Vec<G1Affine>), String> {
-    let max_degree = read_u64(reader)? as usize;
-    let g1_len = read_u64(reader)? as usize;
+    let max_degree = usize::try_from(read_u64(reader)?)
+        .map_err(|_| "SRS max_degree does not fit this platform".to_string())?;
+    let g1_len = usize::try_from(read_u64(reader)?)
+        .map_err(|_| "SRS G1 length does not fit this platform".to_string())?;
+    let max_len = max_degree
+        .checked_add(1)
+        .ok_or_else(|| "SRS max_degree overflow".to_string())?;
+    if g1_len > max_len {
+        return Err("SRS G1 length exceeds declared max_degree".to_string());
+    }
     if needed_g1_len > g1_len {
         return Err(format!(
             "requested {} G1 powers but SRS only stores {}",
@@ -298,22 +342,29 @@ pub fn read_srs_g1_prefix_binary<R: Read + Seek>(
     }
 
     let g1_point_size = G1Affine::identity().compressed_size() as i64;
-    let mut tau_g1_powers = Vec::with_capacity(needed_g1_len);
+    let mut tau_g1_powers = Vec::new();
+    tau_g1_powers
+        .try_reserve_exact(needed_g1_len)
+        .map_err(|err| format!("reserve SRS G1 prefix: {err}"))?;
     for _ in 0..needed_g1_len {
         let mut bytes = vec![0u8; g1_point_size as usize];
         reader
             .read_exact(&mut bytes)
             .map_err(|err| format!("read srs g1 bytes: {err}"))?;
         tau_g1_powers.push(
-            G1Affine::deserialize_compressed_unchecked(&bytes[..])
+            G1Affine::deserialize_compressed(&bytes[..])
                 .map_err(|err| format!("read srs g1 point: {err}"))?,
         );
     }
 
     let remaining_g1 = g1_len - needed_g1_len;
     if remaining_g1 > 0 {
+        let byte_offset = remaining_g1
+            .checked_mul(g1_point_size as usize)
+            .and_then(|offset| i64::try_from(offset).ok())
+            .ok_or_else(|| "SRS G1 tail offset overflow".to_string())?;
         reader
-            .seek(SeekFrom::Current((remaining_g1 as i64) * g1_point_size))
+            .seek(SeekFrom::Current(byte_offset))
             .map_err(|err| format!("skip srs g1 tail: {err}"))?;
     }
 
@@ -325,8 +376,16 @@ pub fn read_srs_prefix_binary<R: Read + Seek>(
     needed_g1_len: usize,
     needed_g2_len: usize,
 ) -> Result<(usize, Vec<G1Affine>, Vec<G2Affine>), String> {
-    let max_degree = read_u64(reader)? as usize;
-    let g1_len = read_u64(reader)? as usize;
+    let max_degree = usize::try_from(read_u64(reader)?)
+        .map_err(|_| "SRS max_degree does not fit this platform".to_string())?;
+    let g1_len = usize::try_from(read_u64(reader)?)
+        .map_err(|_| "SRS G1 length does not fit this platform".to_string())?;
+    let max_len = max_degree
+        .checked_add(1)
+        .ok_or_else(|| "SRS max_degree overflow".to_string())?;
+    if g1_len > max_len {
+        return Err("SRS G1 length exceeds declared max_degree".to_string());
+    }
     if needed_g1_len > g1_len {
         return Err(format!(
             "requested {} G1 powers but SRS only stores {}",
@@ -335,26 +394,37 @@ pub fn read_srs_prefix_binary<R: Read + Seek>(
     }
 
     let g1_point_size = G1Affine::identity().compressed_size() as i64;
-    let mut tau_g1_powers = Vec::with_capacity(needed_g1_len);
+    let mut tau_g1_powers = Vec::new();
+    tau_g1_powers
+        .try_reserve_exact(needed_g1_len)
+        .map_err(|err| format!("reserve SRS G1 prefix: {err}"))?;
     for _ in 0..needed_g1_len {
         let mut bytes = vec![0u8; g1_point_size as usize];
         reader
             .read_exact(&mut bytes)
             .map_err(|err| format!("read srs g1 bytes: {err}"))?;
         tau_g1_powers.push(
-            G1Affine::deserialize_compressed_unchecked(&bytes[..])
+            G1Affine::deserialize_compressed(&bytes[..])
                 .map_err(|err| format!("read srs g1 point: {err}"))?,
         );
     }
 
     let remaining_g1 = g1_len - needed_g1_len;
     if remaining_g1 > 0 {
+        let byte_offset = remaining_g1
+            .checked_mul(g1_point_size as usize)
+            .and_then(|offset| i64::try_from(offset).ok())
+            .ok_or_else(|| "SRS G1 tail offset overflow".to_string())?;
         reader
-            .seek(SeekFrom::Current((remaining_g1 as i64) * g1_point_size))
+            .seek(SeekFrom::Current(byte_offset))
             .map_err(|err| format!("skip srs g1 tail: {err}"))?;
     }
 
-    let g2_len = read_u64(reader)? as usize;
+    let g2_len = usize::try_from(read_u64(reader)?)
+        .map_err(|_| "SRS G2 length does not fit this platform".to_string())?;
+    if g2_len > max_len {
+        return Err("SRS G2 length exceeds declared max_degree".to_string());
+    }
     if needed_g2_len > g2_len {
         return Err(format!(
             "requested {} G2 powers but SRS only stores {}",
@@ -363,14 +433,17 @@ pub fn read_srs_prefix_binary<R: Read + Seek>(
     }
 
     let g2_point_size = G2Affine::identity().compressed_size() as usize;
-    let mut tau_g2_powers = Vec::with_capacity(needed_g2_len);
+    let mut tau_g2_powers = Vec::new();
+    tau_g2_powers
+        .try_reserve_exact(needed_g2_len)
+        .map_err(|err| format!("reserve SRS G2 prefix: {err}"))?;
     for _ in 0..needed_g2_len {
         let mut bytes = vec![0u8; g2_point_size];
         reader
             .read_exact(&mut bytes)
             .map_err(|err| format!("read srs g2 bytes: {err}"))?;
         tau_g2_powers.push(
-            G2Affine::deserialize_compressed_unchecked(&bytes[..])
+            G2Affine::deserialize_compressed(&bytes[..])
                 .map_err(|err| format!("read srs g2 point: {err}"))?,
         );
     }

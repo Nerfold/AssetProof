@@ -45,7 +45,7 @@ pub struct GethAccountState {
     pub storage: BTreeMap<String, String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EthereumSyncOutput {
     pub chain_id: String,
@@ -61,6 +61,39 @@ pub struct EthereumSyncOutput {
 }
 
 impl EthereumSyncOutput {
+    pub fn verify_integrity(&self) -> Result<(), String> {
+        if self.addresses.len() != self.deltas.len() {
+            return Err("Ethereum Sync address/delta vector length mismatch".to_string());
+        }
+        let deltas = self.to_deltas();
+        let mut previous = None;
+        for delta in &deltas {
+            let normalized = normalize_address(&delta.address)?;
+            if normalized != delta.address {
+                return Err("Ethereum Sync address is not canonical".to_string());
+            }
+            if previous.as_ref().is_some_and(|value| value >= &normalized) {
+                return Err("Ethereum Sync addresses are not strictly sorted".to_string());
+            }
+            previous = Some(normalized);
+        }
+        if canonical_delta_commitment(&deltas) != self.delta_list_commitment_hex {
+            return Err("Ethereum Sync delta commitment mismatch".to_string());
+        }
+        let expected_transition = transition_commitment(
+            &self.chain_id,
+            &self.block_hash,
+            &self.parent_hash,
+            &self.old_state_root,
+            &self.new_state_root,
+            &self.delta_list_commitment_hex,
+        );
+        if expected_transition != self.transition_commitment_hex {
+            return Err("Ethereum Sync transition commitment mismatch".to_string());
+        }
+        Ok(())
+    }
+
     pub fn to_deltas(&self) -> Vec<Delta> {
         self.addresses
             .iter()
@@ -87,6 +120,7 @@ impl EthereumSyncOutput {
     pub fn to_sync_proof(&self) -> SyncProof {
         SyncProof {
             scheme: "external-canonical-sync".to_string(),
+            chain_id: self.chain_id.clone(),
             old_state_root: self.old_state_root.clone(),
             new_state_root: self.new_state_root.clone(),
             delta_list_commitment_hex: self.delta_list_commitment_hex.clone(),
@@ -121,17 +155,31 @@ pub fn synchronize(input: &EthereumSyncInput) -> Result<EthereumSyncOutput, Stri
 
     let mut canonical = Vec::new();
     for address in addresses {
-        let old_balance = match pre.get(&address) {
-            Some(account) => parse_required_balance(account, &address, "pre")?,
-            None => Uint256::ZERO,
-        };
-        let new_balance = match post.get(&address) {
-            Some(account) => match account.balance.as_deref() {
-                Some(value) => Uint256::from_quantity(value)?,
-                None => old_balance,
+        let (old_balance, new_balance) = match (pre.get(&address), post.get(&address)) {
+            (Some(old), Some(new)) => match (old.balance.as_deref(), new.balance.as_deref()) {
+                (Some(old), Some(new)) => {
+                    (Uint256::from_quantity(old)?, Uint256::from_quantity(new)?)
+                }
+                (Some(old), None) => {
+                    let old = Uint256::from_quantity(old)?;
+                    (old, old)
+                }
+                (None, None) => continue,
+                (None, Some(_)) => {
+                    return Err(format!(
+                        "pre account {address} is missing the old balance for a balance change"
+                    ));
+                }
             },
-            None if pre.contains_key(&address) => Uint256::ZERO,
-            None => continue,
+            (Some(old), None) => (
+                parse_required_balance(old, &address, "deleted pre")?,
+                Uint256::ZERO,
+            ),
+            (None, Some(new)) => match new.balance.as_deref() {
+                Some(new) => (Uint256::ZERO, Uint256::from_quantity(new)?),
+                None => continue,
+            },
+            (None, None) => continue,
         };
         let delta = signed_delta(old_balance, new_balance)?;
         if delta != 0 {
@@ -193,7 +241,7 @@ pub fn synchronize_json(input: &str) -> Result<EthereumSyncOutput, String> {
 }
 
 pub fn canonical_delta_commitment(deltas: &[Delta]) -> String {
-    let mut chunks = Vec::with_capacity(1 + deltas.len() * 2);
+    let mut chunks = Vec::new();
     chunks.push(deltas.len().to_string().into_bytes());
     for delta in deltas {
         chunks.push(delta.address.as_bytes().to_vec());

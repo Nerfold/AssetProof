@@ -493,7 +493,7 @@ pub fn prove_optimized_zero_test_logic(
     let wire_capacity = update_relation_capacity(deltas.len());
     let wire_values = zero_test_wire_values(witness, wire_capacity)?;
     let pc_gens = pedersen_gens();
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rngs::OsRng;
     let r_w = Fr::rand(&mut rng);
     let c_w = commit_witness_vector(&wire_values, wire_capacity, fr_to_bp_scalar(&r_w)?)?;
     let witness_vector_commitment_hex = encode_bp_point(&c_w);
@@ -765,7 +765,7 @@ pub fn prove_projection_ipa(
     append_projection_ipa_public(&mut transcript, c_u_hex, c_d_hex, deltas);
     let proof = LinearProof::create(
         &mut transcript,
-        rand::thread_rng(),
+        rand::rngs::OsRng,
         &commitment,
         blind,
         a,
@@ -1193,17 +1193,17 @@ fn prove_link_with_layout(
     query_ctx: Option<&QueryContext>,
     layout: LinkLayout,
 ) -> Result<LinkProof, String> {
-    let m = deltas.len();
     let pc_gens = pedersen_gens();
+    let mut rng = rand::rngs::OsRng;
     let mut t_values = Vec::with_capacity(values.len());
     let mut t_bp_blinds = Vec::with_capacity(values.len());
-    for idx in 0..values.len() {
-        t_values.push(hash_fr("link-tv", &[idx as u64]));
-        t_bp_blinds.push(hash_bp("link-tb", &[idx as u64])?);
+    for _ in 0..values.len() {
+        t_values.push(Fr::rand(&mut rng));
+        t_bp_blinds.push(BpScalar::random(&mut rng));
     }
-    let t_r_u = hash_fr("link-tru", &[m as u64]);
-    let t_rho_y = hash_fr("link-try", &[m as u64]);
-    let t_r_d = hash_fr("link-trd", &[m as u64]);
+    let t_r_u = Fr::rand(&mut rng);
+    let t_rho_y = Fr::rand(&mut rng);
+    let t_r_d = Fr::rand(&mut rng);
 
     let r_bp = t_values
         .iter()
@@ -1516,7 +1516,10 @@ fn prove_witness_link_ipa(
     r_w: Fr,
     bp_proof_bytes: &[u8],
 ) -> Result<Vec<u8>, String> {
-    let n = deltas.len() * 2;
+    let n = deltas
+        .len()
+        .checked_mul(2)
+        .ok_or_else(|| "link vector length overflow".to_string())?;
     if opening.a_l().len() != n || opening.a_r().len() != n {
         return Err("R1CS phase-one opening length mismatch".to_string());
     }
@@ -1546,7 +1549,7 @@ fn prove_witness_link_ipa(
     );
     let proof = LinearProof::create(
         &mut transcript,
-        rand::thread_rng(),
+        rand::rngs::OsRng,
         &commitment,
         blind,
         opening_values,
@@ -1838,8 +1841,11 @@ fn verify_bp_commitment_equations_batched(
     let mut weight = BpScalar::ONE;
     let mut aggregated_value = BpScalar::ZERO;
     let mut aggregated_blind = BpScalar::ZERO;
-    let mut msm_points = Vec::with_capacity(2 * len);
-    let mut msm_scalars = Vec::with_capacity(2 * len);
+    let msm_len = len
+        .checked_mul(2)
+        .ok_or_else(|| "batched BP commitment length overflow".to_string())?;
+    let mut msm_points = Vec::with_capacity(msm_len);
+    let mut msm_scalars = Vec::with_capacity(msm_len);
 
     for index in 0..len {
         aggregated_value += weight * fr_to_bp_scalar(&s_values[index])?;
@@ -1924,16 +1930,16 @@ fn prove_insert_link(
     let mut a_bp_blinds = Vec::with_capacity(values.len());
     let mut a_ext_blinds = Vec::with_capacity(7);
     let pc_gens = pedersen_gens();
-    for index in 0..values.len() {
-        let a_value = hash_fr("insert-link-a-value", &[index as u64]);
-        let a_bp_blind = hash_bp("insert-link-a-bp-blind", &[index as u64])?;
+    let mut rng = rand::rngs::OsRng;
+    for _ in 0..values.len() {
+        let a_value = Fr::rand(&mut rng);
+        let a_bp_blind = BpScalar::random(&mut rng);
         r_bp.push(pc_gens.commit(fr_to_bp_scalar(&a_value)?, a_bp_blind));
         a_values.push(a_value);
         a_bp_blinds.push(a_bp_blind);
     }
-    for index in 0..7 {
-        let a_blind = hash_fr("insert-link-a-ext-blind", &[index as u64]);
-        a_ext_blinds.push(a_blind);
+    for _ in 0..7 {
+        a_ext_blinds.push(Fr::rand(&mut rng));
     }
     for index in 0..6 {
         r_ext.push(external_eval_commit(a_values[index], a_ext_blinds[index]));
@@ -2156,12 +2162,8 @@ fn random_link_value(y_values: &[Fr], rho_y: Fr, lagrange_at_theta: &[Fr], z_the
         .fold(rho_y * z_theta, |acc, (y, coeff)| acc + *y * *coeff)
 }
 
-fn derive_eval_blind(label: &str, value: Fr, theta: Fr) -> Fr {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(label.as_bytes());
-    hasher.update(&value.into_bigint().to_bytes_le());
-    hasher.update(&theta.into_bigint().to_bytes_le());
-    Fr::from_le_bytes_mod_order(hasher.finalize().as_bytes())
+fn derive_eval_blind(_label: &str, _value: Fr, _theta: Fr) -> Fr {
+    Fr::rand(&mut rand::rngs::OsRng)
 }
 
 fn append_ark_g1_bytes(hasher: &mut blake3::Hasher, point: &ArkG1) -> Result<(), String> {
@@ -2175,38 +2177,11 @@ fn append_ark_g1_bytes(hasher: &mut blake3::Hasher, point: &ArkG1) -> Result<(),
 }
 
 fn derive_bp_blinds(values: &[Fr]) -> Result<Vec<BpScalar>, String> {
-    values
-        .iter()
-        .enumerate()
-        .map(|(index, value)| {
-            let mut hasher = blake3::Hasher::new();
-            hasher.update(b"bp-blind");
-            hasher.update(&(index as u64).to_le_bytes());
-            hasher.update(&value.into_bigint().to_bytes_le());
-            bp_scalar_from_32(hasher.finalize().as_bytes())
-        })
-        .collect()
+    let mut rng = rand::rngs::OsRng;
+    Ok(values.iter().map(|_| BpScalar::random(&mut rng)).collect())
 }
 
-fn hash_fr(label: &str, parts: &[u64]) -> Fr {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(label.as_bytes());
-    for part in parts {
-        hasher.update(&part.to_le_bytes());
-    }
-    Fr::from_le_bytes_mod_order(hasher.finalize().as_bytes())
-}
-
-fn hash_bp(label: &str, parts: &[u64]) -> Result<BpScalar, String> {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(label.as_bytes());
-    for part in parts {
-        hasher.update(&part.to_le_bytes());
-    }
-    bp_scalar_from_32(hasher.finalize().as_bytes())
-}
-
-fn fr_to_bp_scalar(value: &Fr) -> Result<BpScalar, String> {
+pub(crate) fn fr_to_bp_scalar(value: &Fr) -> Result<BpScalar, String> {
     let ark_repr = value.into_bigint().to_bytes_le();
     let mut array = [0u8; 32];
     let len = ark_repr.len().min(32);
@@ -2219,8 +2194,96 @@ fn fr_to_bp_scalar(value: &Fr) -> Result<BpScalar, String> {
     }
 }
 
-fn ark_g1_to_bp(point: &ArkG1) -> Result<BpG1, String> {
+pub(crate) fn ark_g1_to_bp(point: &ArkG1) -> Result<BpG1, String> {
     ark_g1_affine_to_bp(&point.into_affine())
+}
+
+#[cfg(test)]
+mod insert_link_security_tests {
+    use ark_bls12_381::Fr;
+    use ark_ff::{Field, One};
+    use common::crypto::point_g1_to_hex;
+
+    use super::{prove_insert_relation_logic, verify_insert_relation_logic};
+    use crate::commitment::commit_balance;
+    use crate::zkopen::eval_commit;
+
+    #[test]
+    fn insert_link_uses_fresh_sigma_randomness() {
+        let x = Fr::from(2u64);
+        let beta = Fr::from(3u64);
+        let y = Fr::from(5u64);
+        let zeta = Fr::from(7u64);
+        let q = Fr::from(4u64);
+        let y_x = y - q * (zeta - x);
+        let y_prime = beta * y * (zeta - x);
+        let z_x = y_x.inverse().unwrap();
+        let z_beta = beta.inverse().unwrap();
+        let inserted_balance = 4i128;
+        let blinds = (11u64..18).map(Fr::from).collect::<Vec<_>>();
+        let commitments = [x, beta, y_x, y, y_prime, q]
+            .iter()
+            .zip(blinds.iter())
+            .map(|(value, blind)| point_g1_to_hex(&eval_commit(*value, *blind)).unwrap())
+            .collect::<Vec<_>>();
+        let old_balance = commit_balance(10, Fr::from(19u64));
+        let new_balance = old_balance + commit_balance(inserted_balance, blinds[6]);
+        let old_balance_hex = point_g1_to_hex(&old_balance).unwrap();
+        let new_balance_hex = point_g1_to_hex(&new_balance).unwrap();
+
+        let prove = || {
+            prove_insert_relation_logic(
+                x,
+                beta,
+                y_x,
+                y,
+                y_prime,
+                q,
+                z_x,
+                z_beta,
+                inserted_balance,
+                zeta,
+                blinds[0],
+                blinds[1],
+                blinds[2],
+                blinds[3],
+                blinds[4],
+                blinds[5],
+                blinds[6],
+                &commitments[0],
+                &commitments[1],
+                &commitments[2],
+                &commitments[3],
+                &commitments[4],
+                &commitments[5],
+                &old_balance_hex,
+                &new_balance_hex,
+            )
+            .unwrap()
+        };
+        let first = prove();
+        let second = prove();
+        assert_ne!(first.link_proof_hex, second.link_proof_hex);
+        assert_ne!(first.bp_commitments_hex, second.bp_commitments_hex);
+        for proof in [&first, &second] {
+            verify_insert_relation_logic(
+                zeta,
+                &commitments[0],
+                &commitments[1],
+                &commitments[2],
+                &commitments[3],
+                &commitments[4],
+                &commitments[5],
+                &old_balance_hex,
+                &new_balance_hex,
+                &proof.bp_proof_hex,
+                &proof.bp_commitments_hex,
+                &proof.link_proof_hex,
+            )
+            .unwrap();
+        }
+        assert_eq!(y_x * z_x, Fr::one());
+    }
 }
 
 fn ark_g1_affine_to_bp(point: &ArkG1Affine) -> Result<BpG1, String> {
@@ -2241,7 +2304,7 @@ fn ark_g1_affine_to_bp(point: &ArkG1Affine) -> Result<BpG1, String> {
     }
 }
 
-fn bp_g1_to_ark(point: &BpG1) -> Result<ArkG1, String> {
+pub(crate) fn bp_g1_to_ark(point: &BpG1) -> Result<ArkG1, String> {
     let bytes = point.to_affine().to_compressed();
     let mut input: &[u8] = bytes.as_ref();
     let point = ArkG1Affine::deserialize_compressed(&mut input)
@@ -2307,7 +2370,7 @@ fn prove_scalar_commitment_link(
     c_external: &ArkG1,
     theta: Fr,
 ) -> Result<Vec<u8>, String> {
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rngs::OsRng;
     let t_value = Fr::rand(&mut rng);
     let t_bp_blind = BpScalar::random(&mut rng);
     let t_external_blind = Fr::rand(&mut rng);

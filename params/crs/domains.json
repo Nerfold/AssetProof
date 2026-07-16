@@ -1,6 +1,9 @@
 {
   "curve": "BLS12-381 G1",
-  "status": "deterministically derived in code",
+  "status": "transparent IETF-style hash-to-curve CRS",
+  "suite": "BLS12381G1_XMD:SHA-256_SSWU_RO",
+  "dst": "DPOA_PEDERSEN_CRS_BLS12381G1_XMD:SHA-256_SSWU_RO_V1",
+  "messageEncoding": "label || 0x00 || decimal(index)",
   "baseLabels": [
     "balance-v",
     "balance-h",

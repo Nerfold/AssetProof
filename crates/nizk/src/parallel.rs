@@ -3,8 +3,8 @@ use std::thread;
 use std::time::Instant;
 
 use ark_bls12_381::{Fr, G1Projective};
-use ark_ff::{BigInteger, PrimeField, Zero};
-use common::crypto::{hash_to_scalar, point_g1_from_hex, point_g1_to_hex};
+use ark_ff::{UniformRand, Zero};
+use common::crypto::{point_g1_from_hex, point_g1_to_hex};
 use common::types::{
     Delta, ReserveEntry, StoredParallelInitProof, StoredParallelProof, StoredParallelShardProof,
     StoredParallelShardState, StoredParallelState, StoredState,
@@ -18,6 +18,7 @@ use crate::commitment::commit_balance;
 use crate::init_proof::initialize_with_proof;
 use crate::kzg::{commit_g1, commit_g2, verify_batch_many, Srs};
 use crate::polynomial::{product_from_roots, Polynomial, QueryContext};
+use crate::range::{check_public_delta_range, RangePolicy};
 use crate::verifier::verify_init_debug;
 use crate::witness::{build_update_witness, UpdateWitness};
 
@@ -72,12 +73,11 @@ pub fn initialize_parallel(
         Ok::<_, String>(out)
     })?;
 
-    let balance_total = results
-        .iter()
-        .map(|result| result.state.balance_total)
-        .sum();
-    let balance_blind =
-        derive_parallel_balance_blind(state_root, reserve_entries.len(), shard_count);
+    let balance_total = results.iter().try_fold(0i128, |sum, result| {
+        sum.checked_add(result.state.balance_total)
+            .ok_or_else(|| "parallel initial balance total overflowed i128".to_string())
+    })?;
+    let balance_blind = Fr::rand(&mut rand::rngs::OsRng);
     let balance_commitment = commit_balance(balance_total, balance_blind);
     let balance_commitment_hex = point_g1_to_hex(&balance_commitment)?;
 
@@ -144,6 +144,7 @@ pub fn apply_parallel_update(
     if state.shards.is_empty() {
         return Err("parallel state must contain at least one shard".to_string());
     }
+    check_public_delta_range(deltas, &RangePolicy::protocol_default())?;
     let x_values = deltas
         .iter()
         .map(|delta| common::encoding::encode_address(&delta.address))
@@ -153,9 +154,8 @@ pub fn apply_parallel_update(
     let updates = thread::scope(|scope| {
         let mut handles = Vec::with_capacity(state.shards.len());
         for shard in &state.shards {
-            handles.push(scope.spawn(|| {
-                build_parallel_shard_update(srs, shard, deltas, new_state_root, &query_ctx)
-            }));
+            handles
+                .push(scope.spawn(|| build_parallel_shard_update(srs, shard, deltas, &query_ctx)));
         }
         let mut out = Vec::with_capacity(handles.len());
         for handle in handles {
@@ -168,10 +168,11 @@ pub fn apply_parallel_update(
         Ok::<_, String>(out)
     })?;
 
-    let aggregate_delta = updates
-        .iter()
-        .map(|update| update.proof.d_value)
-        .sum::<i128>();
+    let aggregate_delta = updates.iter().try_fold(0i128, |total, update| {
+        total
+            .checked_add(update.proof.d_value)
+            .ok_or_else(|| "parallel aggregate delta overflowed i128".to_string())
+    })?;
     let mut aggregate_u = vec![Fr::zero(); deltas.len()];
     let mut aggregate_c_u = G1Projective::zero();
     let mut aggregate_r_u = Fr::zero();
@@ -182,12 +183,7 @@ pub fn apply_parallel_update(
         aggregate_c_u += update.c_u;
         aggregate_r_u += update.proof.r_u;
     }
-    let aggregate_blind = derive_parallel_delta_blind(
-        &state.state_root,
-        new_state_root,
-        aggregate_delta,
-        state.shards.len(),
-    );
+    let aggregate_blind = Fr::rand(&mut rand::rngs::OsRng);
     let c_d = commit_balance(aggregate_delta, aggregate_blind);
     let c_u_hex = point_g1_to_hex(&aggregate_c_u)?;
     let c_d_hex = point_g1_to_hex(&c_d)?;
@@ -201,7 +197,13 @@ pub fn apply_parallel_update(
     )?;
     let old_balance_commitment = point_g1_from_hex(&state.balance_commitment_hex)?;
     let next_balance_commitment = old_balance_commitment + c_d;
-    let next_balance_total = state.balance_total + aggregate_delta;
+    let next_balance_total = state
+        .balance_total
+        .checked_add(aggregate_delta)
+        .ok_or_else(|| "parallel updated balance total overflowed i128".to_string())?;
+    if next_balance_total < 0 {
+        return Err("parallel updated balance total is negative".to_string());
+    }
     let next_balance_blind = state.balance_blind + aggregate_blind;
 
     let mut next_shards = Vec::with_capacity(updates.len());
@@ -268,11 +270,10 @@ pub fn verify_parallel_init(
         verify_init_debug(srs, &serial, shard_proof)?;
     }
 
-    let expected_total = state
-        .shards
-        .iter()
-        .map(|shard| shard.balance_total)
-        .sum::<i128>();
+    let expected_total = state.shards.iter().try_fold(0i128, |sum, shard| {
+        sum.checked_add(shard.balance_total)
+            .ok_or_else(|| "parallel initial balance total overflowed i128".to_string())
+    })?;
     if expected_total != state.balance_total || proof.balance_total != state.balance_total {
         return Err("parallel init aggregate balance mismatch".to_string());
     }
@@ -319,6 +320,7 @@ pub fn verify_parallel_update(
     );
 
     let block_data_start = Instant::now();
+    check_public_delta_range(deltas, &RangePolicy::protocol_default())?;
     let x_values = deltas
         .iter()
         .map(|delta| common::encoding::encode_address(&delta.address))
@@ -388,7 +390,9 @@ pub fn verify_parallel_update(
         eval_proofs.push(point_g1_from_hex(&shard_proof.eval_proof_hex)?);
         aggregate_c_u += point_g1_from_hex(&shard_proof.c_u_hex)?;
         aggregate_r_u += shard_proof.r_u;
-        reported_shard_delta += shard_proof.d_value;
+        reported_shard_delta = reported_shard_delta
+            .checked_add(shard_proof.d_value)
+            .ok_or_else(|| "parallel reported shard delta overflowed i128".to_string())?;
 
         let zero_test_start = Instant::now();
         verify_zero_test_logic(
@@ -469,7 +473,14 @@ pub fn verify_parallel_update(
     if new_balance_commitment != old_balance_commitment + expected_c_d {
         return Err("parallel aggregate balance commitment mismatch".to_string());
     }
-    if old_state.balance_total + proof.d_value != new_state.balance_total {
+    let expected_new_total = old_state
+        .balance_total
+        .checked_add(proof.d_value)
+        .ok_or_else(|| "parallel balance total overflowed i128".to_string())?;
+    if expected_new_total < 0 {
+        return Err("parallel updated balance total is negative".to_string());
+    }
+    if expected_new_total != new_state.balance_total {
         return Err("parallel balance_total mismatch".to_string());
     }
     if old_state.balance_blind + proof.r_d != new_state.balance_blind {
@@ -517,28 +528,20 @@ fn build_parallel_shard_update(
     srs: &Srs,
     shard: &StoredParallelShardState,
     deltas: &[Delta],
-    new_state_root: &str,
     query_ctx: &QueryContext,
 ) -> Result<ShardWorkerResult, String> {
     let polynomial = Polynomial::from_coeffs(shard.masked_polynomial_coeffs.clone());
     let witness = build_update_witness(&polynomial, deltas)?;
     let z_poly = query_ctx.z_poly().clone();
     let i_y = query_ctx.interpolate(&witness.y_values)?;
-    let rho_y = derive_shard_scalar(
-        "parallel-rho-y",
-        shard.shard_id,
-        &[new_state_root.as_bytes(), &fr_vec_bytes(&witness.y_values)],
-    );
+    let mut rng = rand::rngs::OsRng;
+    let rho_y = Fr::rand(&mut rng);
     let j_y = i_y.add(&z_poly.mul_scalar(rho_y));
     let quotient = polynomial.sub(&j_y).div_exact(&z_poly)?;
     let c_y = commit_g1(srs, &j_y)?;
     let eval_proof = commit_g1(srs, &quotient)?;
 
-    let r_u = derive_shard_scalar(
-        "parallel-r-u",
-        shard.shard_id,
-        &[&fr_vec_bytes(&witness.u_values)],
-    );
+    let r_u = Fr::rand(&mut rng);
     let c_u = commit_membership_vector(&witness.u_values, r_u)?;
     let c_u_hex = point_g1_to_hex(&c_u)?;
     let c_y_hex = point_g1_to_hex(&c_y)?;
@@ -573,7 +576,10 @@ fn build_parallel_shard_update(
             r_u,
             rho_y,
             d_value: witness.d_value,
-            gate_count: deltas.len() * 2,
+            gate_count: deltas
+                .len()
+                .checked_mul(2)
+                .ok_or_else(|| "parallel update gate count overflow".to_string())?,
             bp_proof_hex: zero_test.bp_proof_hex,
             bp_commitments_hex: zero_test.bp_commitments_hex,
             link_proof_hex: zero_test.link_proof_hex,
@@ -609,47 +615,6 @@ fn shard_to_serial_state(
         balance_blind: shard.balance_blind,
         balance_commitment_hex: shard.balance_commitment_hex.clone(),
     }
-}
-
-fn derive_parallel_balance_blind(state_root: &str, reserve_count: usize, shard_count: usize) -> Fr {
-    let payload = format!("{state_root}|{reserve_count}|{shard_count}");
-    nonzero_hash("parallel-balance-blind", payload.as_bytes())
-}
-
-fn derive_parallel_delta_blind(
-    old_state_root: &str,
-    new_state_root: &str,
-    aggregate_delta: i128,
-    shard_count: usize,
-) -> Fr {
-    let payload = format!("{old_state_root}|{new_state_root}|{aggregate_delta}|{shard_count}");
-    nonzero_hash("parallel-delta-blind", payload.as_bytes())
-}
-
-fn derive_shard_scalar(label: &str, shard_id: usize, chunks: &[&[u8]]) -> Fr {
-    let mut bytes = Vec::new();
-    bytes.extend_from_slice(&(shard_id as u64).to_le_bytes());
-    for chunk in chunks {
-        bytes.extend_from_slice(chunk);
-    }
-    nonzero_hash(label, &bytes)
-}
-
-fn nonzero_hash(label: &str, payload: &[u8]) -> Fr {
-    let mut scalar = hash_to_scalar(label, payload);
-    if scalar.is_zero() {
-        scalar = Fr::from(41u64);
-    }
-    scalar
-}
-
-fn fr_vec_bytes(values: &[Fr]) -> Vec<u8> {
-    let mut out = Vec::new();
-    for value in values {
-        out.extend_from_slice(&value.into_bigint().to_bytes_le());
-        out.push(b'|');
-    }
-    out
 }
 
 fn verify_timing_enabled() -> bool {
@@ -738,7 +703,7 @@ mod tests {
 
     #[test]
     fn accepts_parallel_init() {
-        let srs = Srs::setup(16, b"parallel-init");
+        let srs = Srs::setup_development(16, b"parallel-init");
         let init = initialize_parallel(&sample_reserves(), "root-0", &srs, 2).unwrap();
         verify_parallel_init(&srs, &init.state, &init.proof).unwrap();
         assert_eq!(init.state.balance_total, 440);
@@ -746,7 +711,7 @@ mod tests {
 
     #[test]
     fn accepts_parallel_update() {
-        let srs = Srs::setup(16, b"parallel-update");
+        let srs = Srs::setup_development(16, b"parallel-update");
         let init = initialize_parallel(&sample_reserves(), "root-0", &srs, 2).unwrap();
         let deltas = vec![
             Delta {
@@ -771,7 +736,7 @@ mod tests {
 
     #[test]
     fn rejects_tampered_parallel_proof() {
-        let srs = Srs::setup(16, b"parallel-bad");
+        let srs = Srs::setup_development(16, b"parallel-bad");
         let init = initialize_parallel(&sample_reserves(), "root-0", &srs, 2).unwrap();
         let deltas = vec![Delta {
             address: "0x1111111111111111111111111111111111111111".to_string(),

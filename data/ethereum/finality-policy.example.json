@@ -1,0 +1,10 @@
+{
+  "expectedChainId": "0x1",
+  "finalizedStateRoots": [
+    "0x0000000000000000000000000000000000000000000000000000000000000000"
+  ],
+  "lastAcceptedStateRoot": "0x0000000000000000000000000000000000000000000000000000000000000000",
+  "lastAcceptedPublicStateDigest": "0000000000000000000000000000000000000000000000000000000000000000",
+  "maxUpdateSize": 4096,
+  "pinnedSyncTransitionCommitment": "replace-with-trusted-sync-transition-commitment"
+}

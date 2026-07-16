@@ -1,5 +1,6 @@
 use std::env;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -16,15 +17,23 @@ use common::io::{
 use common::types::{Delta, InitProvingContext, StoredParallelState, StoredState};
 use mock_chain::generator::{generate_scenario, load_manifest, write_scenario};
 use nizk_fixed_set::commitment::commit_balance;
+use nizk_fixed_set::external::PinnedSyncProofAdapter;
 use nizk_fixed_set::init_proof::initialize_with_proof;
 use nizk_fixed_set::kzg::commit_g1;
-use nizk_fixed_set::kzg::Srs;
+use nizk_fixed_set::kzg::{Srs, SrsProvenance};
 use nizk_fixed_set::parallel::{
     apply_parallel_update, initialize_parallel, verify_parallel_init, verify_parallel_update,
 };
 use nizk_fixed_set::polynomial::Polynomial;
+use nizk_fixed_set::threshold::{
+    prove_threshold, verify_threshold, ThresholdProof, ThresholdStatement, ThresholdWitness,
+};
 use nizk_fixed_set::update::apply_update;
-use nizk_fixed_set::verifier::{verify_init_debug, verify_update, verify_update_debug};
+use nizk_fixed_set::verifier::{
+    public_state_digest, verify_init_debug, verify_update_debug, verify_update_production,
+    ChainPolicy,
+};
+use serde::Deserialize;
 use smt::insert::build_insert_witness;
 use smt::leaf::Leaf;
 use smt::state::SmtState;
@@ -39,8 +48,20 @@ const DEFAULT_SRS_PATH: &str = "params/srs/dev.srs.bin";
 const DEFAULT_MOCK_RESERVES_PATH: &str = "data/mock/reserves.csv";
 const DEFAULT_INIT_STATE_PATH: &str = "artifacts/states/init-state.txt";
 const DEFAULT_INIT_PROOF_PATH: &str = "artifacts/proofs/init-proof.txt";
+const DEFAULT_THRESHOLD_PROOF_PATH: &str = "artifacts/proofs/threshold-proof.txt";
 const DEFAULT_ETH_DELTAS_PATH: &str = "artifacts/deltas/ethereum.csv";
 const DEFAULT_ETH_SYNC_PATH: &str = "artifacts/test-runs/ethereum-sync.json";
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct VerificationPolicyFile {
+    expected_chain_id: String,
+    finalized_state_roots: Vec<String>,
+    last_accepted_state_root: String,
+    last_accepted_public_state_digest: String,
+    max_update_size: usize,
+    pinned_sync_transition_commitment: String,
+}
 
 fn main() {
     if let Err(err) = real_main() {
@@ -60,10 +81,23 @@ fn real_main() -> Result<(), String> {
         "help" | "--help" | "-h" => print_usage(),
         "help-advanced" => print_advanced_usage(),
         "setup" => quick_setup(&args)?,
+        "import-srs" => import_external_srs(&args)?,
         "mock-data" => quick_mock_data(&args)?,
         "prove-init" => quick_prove_init(&args)?,
         "prove-update" => quick_prove_update(&args)?,
         "check-update" => quick_check_update(&args)?,
+        "check-update-debug" => quick_check_update_debug(&args)?,
+        "state-digest" => {
+            if args.len() != 3 {
+                return Err("usage: poa-cli state-digest <state.txt>".to_string());
+            }
+            let path = Path::new(&args[2]);
+            let state = read_state(path)?;
+            let public_state = read_public_state_or_derive(path, &state)?;
+            println!("{}", public_state_digest(&public_state)?);
+        }
+        "prove-threshold" => quick_prove_threshold(&args)?,
+        "check-threshold" => quick_check_threshold(&args)?,
         "eth-sync" => {
             if args.len() != 3 && args.len() != 5 {
                 return Err(
@@ -124,7 +158,7 @@ fn real_main() -> Result<(), String> {
             let max_degree = args[2]
                 .parse::<usize>()
                 .map_err(|err| format!("invalid max-degree: {err}"))?;
-            let srs = Srs::setup(max_degree, b"dynamic-poa-srs");
+            let srs = Srs::setup_development(max_degree, b"dynamic-poa-srs");
             write_srs(
                 Path::new(&args[3]),
                 srs.max_degree,
@@ -132,6 +166,7 @@ fn real_main() -> Result<(), String> {
                 &srs.tau_g2_powers,
                 &srs.hiding_tau_g1_powers,
             )?;
+            write_srs_provenance(Path::new(&args[3]), &srs.provenance)?;
             println!("wrote SRS with max_degree={} to {}", max_degree, args[3]);
         }
         "init" => {
@@ -199,7 +234,7 @@ fn real_main() -> Result<(), String> {
                 .map_err(|err| format!("invalid max-degree: {err}"))?;
             let srs_path = run_dir.join("srs.bin");
             if !srs_path.exists() {
-                let srs = Srs::setup(max_degree, b"dynamic-poa-srs");
+                let srs = Srs::setup_development(max_degree, b"dynamic-poa-srs");
                 write_srs(
                     &srs_path,
                     srs.max_degree,
@@ -242,7 +277,7 @@ fn real_main() -> Result<(), String> {
                 .map_err(|err| format!("invalid degree: {err}"))?;
             let srs_path = run_dir.join("srs.bin");
             if !srs_path.exists() {
-                let srs = Srs::setup(degree, b"dynamic-poa-srs");
+                let srs = Srs::setup_development(degree, b"dynamic-poa-srs");
                 write_srs(
                     &srs_path,
                     srs.max_degree,
@@ -1159,12 +1194,87 @@ fn real_main() -> Result<(), String> {
 
 fn load_srs(path: &Path) -> Result<Srs, String> {
     let (max_degree, tau_g1_powers, tau_g2_powers, hiding_tau_g1_powers) = read_srs(path)?;
-    Ok(Srs {
+    let srs = Srs {
         max_degree,
         tau_g1_powers,
         tau_g2_powers,
         hiding_tau_g1_powers,
-    })
+        provenance: read_srs_provenance(path)?,
+    };
+    srs.validate_complete_structure()?;
+    Ok(srs)
+}
+
+fn srs_meta_path(path: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.meta", path.display()))
+}
+
+fn read_srs_provenance(path: &Path) -> Result<SrsProvenance, String> {
+    let meta_path = srs_meta_path(path);
+    if !meta_path.exists() {
+        return Ok(SrsProvenance::Development);
+    }
+    let raw = fs::read_to_string(&meta_path)
+        .map_err(|err| format!("read {}: {err}", meta_path.display()))?;
+    let expected_digest = raw
+        .lines()
+        .find_map(|line| line.strip_prefix("srs_digest_blake3="))
+        .unwrap_or_default()
+        .trim();
+    let actual_digest = file_blake3(path)?;
+    if expected_digest.is_empty() || expected_digest != actual_digest {
+        return Err(format!(
+            "SRS provenance digest mismatch for {}; re-import or regenerate the SRS",
+            path.display()
+        ));
+    }
+    let ceremony_id = raw
+        .lines()
+        .find_map(|line| line.strip_prefix("ceremony_id="))
+        .unwrap_or_default()
+        .trim();
+    if raw
+        .lines()
+        .any(|line| line == "provenance=external-ceremony")
+        && !ceremony_id.is_empty()
+    {
+        Ok(SrsProvenance::ExternalCeremony {
+            ceremony_id: ceremony_id.to_string(),
+        })
+    } else {
+        Ok(SrsProvenance::Development)
+    }
+}
+
+fn write_srs_provenance(path: &Path, provenance: &SrsProvenance) -> Result<(), String> {
+    let meta_path = srs_meta_path(path);
+    let digest = file_blake3(path)?;
+    let contents = match provenance {
+        SrsProvenance::Development => format!(
+            "provenance=development\nsrs_digest_blake3={digest}\nwarning=toxic-waste-known-do-not-use-in-production\n"
+        ),
+        SrsProvenance::ExternalCeremony { ceremony_id } => {
+            format!("provenance=external-ceremony\nceremony_id={ceremony_id}\nsrs_digest_blake3={digest}\n")
+        }
+    };
+    fs::write(&meta_path, contents).map_err(|err| format!("write {}: {err}", meta_path.display()))
+}
+
+fn file_blake3(path: &Path) -> Result<String, String> {
+    let mut file =
+        fs::File::open(path).map_err(|err| format!("open {} for digest: {err}", path.display()))?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|err| format!("read {} for digest: {err}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hasher.finalize().to_hex().to_string())
 }
 
 fn ensure_project_layout() -> Result<(), String> {
@@ -1203,18 +1313,41 @@ fn quick_setup(args: &[String]) -> Result<(), String> {
     let mut generation_degree = requested_degree;
     let path = Path::new(DEFAULT_SRS_PATH);
     if path.exists() {
-        let srs = load_srs(path)?;
+        let (max_degree, tau_g1_powers, tau_g2_powers, hiding_tau_g1_powers) = read_srs(path)?;
+        let srs = Srs {
+            max_degree,
+            tau_g1_powers,
+            tau_g2_powers,
+            hiding_tau_g1_powers,
+            provenance: read_srs_provenance(path)?,
+        };
+        srs.validate_structure()?;
         generation_degree = generation_degree.max(srs.max_degree);
-        let has_standard_powers = srs.tau_g1_powers.len() >= requested_degree + 1
-            && srs.tau_g2_powers.len() >= requested_degree + 1;
-        let has_hiding_powers = srs.hiding_tau_g1_powers.len() >= requested_degree + 1;
+        let declared_powers = srs
+            .max_degree
+            .checked_add(1)
+            .ok_or_else(|| "declared SRS degree overflow".to_string())?;
+        let has_standard_powers = srs.tau_g1_powers.len() == declared_powers
+            && srs.tau_g2_powers.len() == declared_powers;
+        let has_hiding_powers = srs.hiding_tau_g1_powers.len() == declared_powers;
         if srs.max_degree >= requested_degree && has_standard_powers && has_hiding_powers {
+            let provenance = match &srs.provenance {
+                SrsProvenance::Development => "development-only",
+                SrsProvenance::ExternalCeremony { .. } => "external-ceremony",
+            };
             println!(
-                "layout ready; reusing {} (degree={})",
+                "layout ready; reusing {} (degree={}, provenance={})",
                 path.display(),
-                srs.max_degree
+                srs.max_degree,
+                provenance
             );
             return Ok(());
+        }
+        if matches!(srs.provenance, SrsProvenance::ExternalCeremony { .. }) {
+            return Err(format!(
+                "external ceremony SRS {} is too small/incomplete for degree {}; import a larger ceremony SRS instead of replacing it",
+                path.display(), requested_degree
+            ));
         }
         if !has_hiding_powers {
             println!(
@@ -1231,7 +1364,7 @@ fn quick_setup(args: &[String]) -> Result<(), String> {
             );
         }
     }
-    let srs = Srs::setup(generation_degree, b"dynamic-poa-srs");
+    let srs = Srs::setup_development(generation_degree, b"dynamic-poa-srs");
     write_srs(
         path,
         srs.max_degree,
@@ -1239,9 +1372,47 @@ fn quick_setup(args: &[String]) -> Result<(), String> {
         &srs.tau_g2_powers,
         &srs.hiding_tau_g1_powers,
     )?;
+    write_srs_provenance(path, &srs.provenance)?;
     println!(
-        "layout ready; generated {} (degree={generation_degree})",
+        "layout ready; generated DEVELOPMENT-ONLY {} (degree={generation_degree}); production requires `./poa import-srs ...`",
         path.display(),
+    );
+    Ok(())
+}
+
+fn import_external_srs(args: &[String]) -> Result<(), String> {
+    if args.len() != 4 && args.len() != 5 {
+        return Err(
+            "usage: poa-cli import-srs <source.srs.bin> <ceremony-id> [destination.srs.bin]"
+                .to_string(),
+        );
+    }
+    ensure_project_layout()?;
+    let source = Path::new(&args[2]);
+    let ceremony_id = args[3].trim();
+    if ceremony_id.is_empty() {
+        return Err("ceremony-id must not be empty".to_string());
+    }
+    let destination = args
+        .get(4)
+        .map(Path::new)
+        .unwrap_or_else(|| Path::new(DEFAULT_SRS_PATH));
+    let (max_degree, g1, g2, hiding) = read_srs(source)?;
+    let srs = Srs::from_external_ceremony(max_degree, g1, g2, hiding, ceremony_id.to_string())?;
+    write_srs(
+        destination,
+        srs.max_degree,
+        &srs.tau_g1_powers,
+        &srs.tau_g2_powers,
+        &srs.hiding_tau_g1_powers,
+    )?;
+    write_srs_provenance(destination, &srs.provenance)?;
+    println!(
+        "validated and imported external ceremony SRS {} -> {} (degree={}, ceremony_id={})",
+        source.display(),
+        destination.display(),
+        srs.max_degree,
+        ceremony_id
     );
     Ok(())
 }
@@ -1342,10 +1513,9 @@ fn quick_prove_update(args: &[String]) -> Result<(), String> {
 }
 
 fn quick_check_update(args: &[String]) -> Result<(), String> {
-    if args.len() != 6 {
+    if args.len() != 8 {
         return Err(
-            "usage: poa-cli check-update <old-state.txt> <deltas.csv> <new-state.txt> <proof.txt>"
-                .to_string(),
+            "usage: poa-cli check-update <old-state.txt> <deltas.csv> <new-state.txt> <proof.txt> <sync-output.json> <policy.json>".to_string(),
         );
     }
     let old_path = Path::new(&args[2]);
@@ -1357,13 +1527,152 @@ fn quick_check_update(args: &[String]) -> Result<(), String> {
     let srs = load_srs_for_verify(Path::new(DEFAULT_SRS_PATH), deltas.len())?;
     let old_public = read_public_state_or_derive(old_path, &old_state)?;
     let new_public = read_public_state_or_derive(new_path, &new_state)?;
-    verify_update_debug(&srs, &old_public, &deltas, &new_public, &proof)?;
+    let sync_raw =
+        fs::read_to_string(&args[6]).map_err(|err| format!("read {}: {err}", args[6]))?;
+    let sync_output: eth_sync::EthereumSyncOutput = serde_json::from_str(&sync_raw)
+        .map_err(|err| format!("parse Ethereum Sync output: {err}"))?;
+    sync_output.verify_integrity()?;
+    if sync_output.to_deltas() != deltas {
+        return Err("delta CSV does not match the pinned Ethereum Sync output".to_string());
+    }
+    let policy_raw =
+        fs::read_to_string(&args[7]).map_err(|err| format!("read {}: {err}", args[7]))?;
+    let policy_file: VerificationPolicyFile = serde_json::from_str(&policy_raw)
+        .map_err(|err| format!("parse verification policy: {err}"))?;
+    let sync_proof = sync_output.to_sync_proof();
+    let policy = ChainPolicy::production(
+        policy_file.expected_chain_id,
+        policy_file.finalized_state_roots,
+        Some(policy_file.last_accepted_state_root),
+        Some(policy_file.last_accepted_public_state_digest),
+        policy_file.max_update_size,
+    )?;
+    let adapter = PinnedSyncProofAdapter {
+        expected_scheme: "external-canonical-sync".to_string(),
+        expected_proof_hex: policy_file.pinned_sync_transition_commitment,
+    };
+    verify_update_production(
+        &srs,
+        &old_public,
+        &deltas,
+        &new_public,
+        &proof,
+        &policy,
+        &sync_proof,
+        &adapter,
+    )?;
     println!(
         "update proof valid: m={}, new_state_root={}",
         deltas.len(),
         new_public.state_root
     );
     Ok(())
+}
+
+fn quick_check_update_debug(args: &[String]) -> Result<(), String> {
+    if args.len() != 6 {
+        return Err(
+            "usage: poa-cli check-update-debug <old-state.txt> <deltas.csv> <new-state.txt> <proof.txt>"
+                .to_string(),
+        );
+    }
+    let old_path = Path::new(&args[2]);
+    let new_path = Path::new(&args[4]);
+    let old_state = read_state(old_path)?;
+    let new_state = read_state(new_path)?;
+    let deltas = read_delta_csv(Path::new(&args[3]))?;
+    let proof = read_proof(Path::new(&args[5]))?;
+    let srs = load_srs_for_verify(Path::new(DEFAULT_SRS_PATH), deltas.len())?;
+    verify_update_debug(
+        &srs,
+        &read_public_state_or_derive(old_path, &old_state)?,
+        &deltas,
+        &read_public_state_or_derive(new_path, &new_state)?,
+        &proof,
+    )?;
+    println!("debug update proof valid: m={}", deltas.len());
+    Ok(())
+}
+
+fn quick_prove_threshold(args: &[String]) -> Result<(), String> {
+    if args.len() != 4 && args.len() != 5 {
+        return Err(
+            "usage: poa-cli prove-threshold <state.txt> <threshold> [proof.txt]".to_string(),
+        );
+    }
+    ensure_project_layout()?;
+    let state = read_state(Path::new(&args[2]))?;
+    let threshold = args[3]
+        .parse::<i128>()
+        .map_err(|err| format!("invalid threshold: {err}"))?;
+    let statement = ThresholdStatement {
+        public_state: state.public_state(),
+        threshold,
+    };
+    let proof = prove_threshold(&statement, &ThresholdWitness::from_state(&state))?;
+    let proof_path = args
+        .get(4)
+        .map(String::as_str)
+        .unwrap_or(DEFAULT_THRESHOLD_PROOF_PATH);
+    write_threshold_proof(Path::new(proof_path), &proof)?;
+    println!(
+        "threshold proof ready: threshold={}, proof={}, exact_balance_hidden=true",
+        threshold, proof_path
+    );
+    Ok(())
+}
+
+fn quick_check_threshold(args: &[String]) -> Result<(), String> {
+    if args.len() != 5 {
+        return Err(
+            "usage: poa-cli check-threshold <public-state.txt> <threshold> <proof.txt>".to_string(),
+        );
+    }
+    let public_state = read_public_state(Path::new(&args[2]))?;
+    let threshold = args[3]
+        .parse::<i128>()
+        .map_err(|err| format!("invalid threshold: {err}"))?;
+    let proof = read_threshold_proof(Path::new(&args[4]))?;
+    verify_threshold(
+        &ThresholdStatement {
+            public_state,
+            threshold,
+        },
+        &proof,
+    )?;
+    println!("threshold proof valid: assets >= {threshold}");
+    Ok(())
+}
+
+fn write_threshold_proof(path: &Path, proof: &ThresholdProof) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|err| format!("create {}: {err}", parent.display()))?;
+    }
+    fs::write(
+        path,
+        format!("scheme={}\nproof_hex={}\n", proof.scheme, proof.proof_hex),
+    )
+    .map_err(|err| format!("write {}: {err}", path.display()))
+}
+
+fn read_threshold_proof(path: &Path) -> Result<ThresholdProof, String> {
+    let content =
+        fs::read_to_string(path).map_err(|err| format!("read {}: {err}", path.display()))?;
+    let mut scheme = None;
+    let mut proof_hex = None;
+    for line in content.lines() {
+        if let Some((key, value)) = line.split_once('=') {
+            match key.trim() {
+                "scheme" => scheme = Some(value.trim().to_string()),
+                "proof_hex" => proof_hex = Some(value.trim().to_string()),
+                _ => {}
+            }
+        }
+    }
+    Ok(ThresholdProof {
+        scheme: scheme.ok_or_else(|| "threshold proof is missing scheme".to_string())?,
+        proof_hex: proof_hex.ok_or_else(|| "threshold proof is missing proof_hex".to_string())?,
+    })
 }
 
 fn load_srs_g1_prefix(path: &Path, needed_g1_len: usize) -> Result<Srs, String> {
@@ -1373,6 +1682,7 @@ fn load_srs_g1_prefix(path: &Path, needed_g1_len: usize) -> Result<Srs, String> 
         tau_g1_powers,
         tau_g2_powers: Vec::new(),
         hiding_tau_g1_powers: Vec::new(),
+        provenance: read_srs_provenance(path)?,
     })
 }
 
@@ -1384,12 +1694,15 @@ fn load_srs_prefix(path: &Path, needed_g1_len: usize, needed_g2_len: usize) -> R
         tau_g1_powers,
         tau_g2_powers,
         hiding_tau_g1_powers: Vec::new(),
+        provenance: read_srs_provenance(path)?,
     })
 }
 
 fn load_srs_for_update(path: &Path, state: &StoredState, modified: usize) -> Result<Srs, String> {
     let needed_g1_len = state.masked_polynomial_coeffs.len();
-    let needed_g2_len = modified + 1;
+    let needed_g2_len = modified
+        .checked_add(1)
+        .ok_or_else(|| "modified-address count overflow".to_string())?;
     load_srs_prefix(path, needed_g1_len, needed_g2_len)
 }
 
@@ -1418,7 +1731,7 @@ fn run_update_benchmark(
         eprintln!("phase=warmup iteration={}", index + 1);
         let new_root = format!("{label}-warmup-root-{index}");
         let updated = apply_update(srs, state, deltas, &new_root)?;
-        verify_update(
+        verify_update_debug(
             srs,
             &state.public_state(),
             deltas,
@@ -1439,7 +1752,7 @@ fn run_update_benchmark(
         let prover_elapsed = prover_start.elapsed();
 
         let verifier_start = Instant::now();
-        verify_update(
+        verify_update_debug(
             srs,
             &state.public_state(),
             deltas,
@@ -1534,19 +1847,25 @@ fn load_srs_for_parallel_state(
     state: &StoredParallelState,
     modified: usize,
 ) -> Result<Srs, String> {
+    let modified_powers = modified
+        .checked_add(1)
+        .ok_or_else(|| "modified-address count overflow".to_string())?;
     let needed_g1_len = state
         .shards
         .iter()
         .map(|shard| shard.masked_polynomial_coeffs.len())
         .max()
         .unwrap_or(1)
-        .max(modified + 1);
-    let needed_g2_len = modified + 1;
+        .max(modified_powers);
+    let needed_g2_len = modified_powers;
     load_srs_prefix(path, needed_g1_len, needed_g2_len)
 }
 
 fn load_srs_for_verify(path: &Path, modified: usize) -> Result<Srs, String> {
-    let needed_len = modified + 1;
+    let needed_len = modified
+        .checked_add(1)
+        .ok_or_else(|| "modified-address count overflow".to_string())?
+        .max(2);
     load_srs_prefix(path, needed_len, needed_len)
 }
 
@@ -1582,11 +1901,16 @@ fn flatten_parallel_state(state: &StoredParallelState) -> StoredState {
 fn print_usage() {
     println!("Dynamic PoA daily commands:");
     println!("  ./poa setup [max-degree]");
+    println!("  ./poa import-srs <source.srs.bin> <ceremony-id> [destination.srs.bin]");
     println!("  ./poa mock-data [accounts reserves blocks txs-per-block seed]");
     println!("  ./poa eth-sync <transition.json> [deltas.csv sync-output.json]");
     println!("  ./poa prove-init <state-root> [reserves.csv]");
     println!("  ./poa prove-update <state.txt> <deltas.csv> <new-state-root>");
-    println!("  ./poa check-update <old-state.txt> <deltas.csv> <new-state.txt> <proof.txt>");
+    println!("  ./poa check-update <old-state.txt> <deltas.csv> <new-state.txt> <proof.txt> <sync-output.json> <policy.json>");
+    println!("  ./poa check-update-debug <old-state.txt> <deltas.csv> <new-state.txt> <proof.txt>");
+    println!("  ./poa state-digest <state.txt>");
+    println!("  ./poa prove-threshold <state.txt> <threshold> [proof.txt]");
+    println!("  ./poa check-threshold <public-state.txt> <threshold> <proof.txt>");
     println!();
     println!("Run `./poa help-advanced` for explicit paths, SP1, SMT, and benchmarks.");
 }

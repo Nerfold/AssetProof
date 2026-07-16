@@ -14,11 +14,13 @@ use common::io::{
 use common::types::{Delta, ReserveEntry, StoredInitProof, StoredProof, StoredState};
 use nizk_fixed_set::init_proof::{initialize_with_proof, InitProofResult};
 use nizk_fixed_set::insert::{
-    apply_insert, verify_insert_with_srs, KzgInsertProof, KzgInsertWitness,
+    apply_insert, verify_insert_with_srs_and_policy, KzgInsertProof, KzgInsertWitness,
 };
-use nizk_fixed_set::kzg::Srs;
+use nizk_fixed_set::kzg::{Srs, SrsProvenance};
 use nizk_fixed_set::update::apply_update;
-use nizk_fixed_set::verifier::{verify_init, verify_update};
+use nizk_fixed_set::verifier::{
+    public_state_digest, verify_init_with_policy, verify_update_debug, ChainPolicy,
+};
 
 const FIXTURE_VERSION: &str = "deterministic-account-delta-v1";
 
@@ -247,7 +249,14 @@ fn benchmark_init(
         println!("   warmup {}/{}", warmup + 1, config.warmup);
         let result =
             initialize_with_proof(reserves, &format!("bench-init-{n}-warmup-{warmup}"), srs)?;
-        verify_init(srs, &result.state.public_state(), &result.proof)?;
+        let policy = ChainPolicy::development(
+            "mock-chain",
+            [result.state.state_root.clone()],
+            None,
+            None,
+            srs.max_degree,
+        )?;
+        verify_init_with_policy(srs, &result.state.public_state(), &result.proof, &policy)?;
         black_box(result);
     }
 
@@ -262,7 +271,14 @@ fn benchmark_init(
         let prover = prove_start.elapsed();
 
         let verify_start = Instant::now();
-        verify_init(srs, &result.state.public_state(), &result.proof)?;
+        let policy = ChainPolicy::development(
+            "mock-chain",
+            [result.state.state_root.clone()],
+            None,
+            None,
+            srs.max_degree,
+        )?;
+        verify_init_with_policy(srs, &result.state.public_state(), &result.proof, &policy)?;
         let verifier = verify_start.elapsed();
 
         let proof_path = config
@@ -326,14 +342,22 @@ fn benchmark_insert(
         format!("benchmark-owner:{address}"),
         format!("benchmark-balance:{address}"),
     );
+    let policy = ChainPolicy::development(
+        "mock-chain",
+        [state.state_root.clone()],
+        Some(state.state_root.clone()),
+        Some(public_state_digest(&state.public_state())?),
+        srs.max_degree,
+    )?;
     for warmup in 0..config.warmup {
         println!("   warmup {}/{}", warmup + 1, config.warmup);
         let result = apply_insert(srs, state, &witness)?;
-        verify_insert_with_srs(
+        verify_insert_with_srs_and_policy(
             srs,
             &state.public_state(),
             &result.next_state.public_state(),
             &result.proof,
+            &policy,
         )?;
         black_box(result);
     }
@@ -347,11 +371,12 @@ fn benchmark_insert(
         let prover = prove_start.elapsed();
 
         let verify_start = Instant::now();
-        verify_insert_with_srs(
+        verify_insert_with_srs_and_policy(
             srs,
             &state.public_state(),
             &result.next_state.public_state(),
             &result.proof,
+            &policy,
         )?;
         let verifier = verify_start.elapsed();
 
@@ -420,7 +445,7 @@ fn benchmark_update(
             deltas,
             &format!("bench-update-{n}-{m}-warmup-{warmup}"),
         )?;
-        verify_update(
+        verify_update_debug(
             srs,
             &state.public_state(),
             deltas,
@@ -444,7 +469,7 @@ fn benchmark_update(
         let prover = prove_start.elapsed();
 
         let verify_start = Instant::now();
-        verify_update(
+        verify_update_debug(
             srs,
             &state.public_state(),
             deltas,
@@ -477,7 +502,7 @@ fn benchmark_update(
             prover,
             verifier,
             proof_bytes,
-            proof_encoding: "DPOAUPD3-binary",
+            proof_encoding: "DPOAUPD5-binary",
         });
         prover_samples.push(prover);
         verifier_samples.push(verifier);
@@ -493,7 +518,7 @@ fn benchmark_update(
         &prover_samples,
         &verifier_samples,
         &proof_sizes,
-        "DPOAUPD3-binary",
+        "DPOAUPD5-binary",
     ))
 }
 
@@ -507,7 +532,7 @@ fn prepare_srs(
     if !path.exists() {
         println!("   generating SRS degree={degree}");
         let setup_start = Instant::now();
-        let srs = Srs::setup(
+        let srs = Srs::setup_development(
             degree,
             format!("dynamic-poa-benchmark-srs-{degree}").as_bytes(),
         );
@@ -543,10 +568,13 @@ fn prepare_srs(
     let load_start = Instant::now();
     let (max_degree, tau_g1_powers, tau_g2_powers, hiding_tau_g1_powers) = read_srs(&path)?;
     let load_elapsed = load_start.elapsed();
+    let needed_powers = degree
+        .checked_add(1)
+        .ok_or_else(|| "benchmark SRS degree overflow".to_string())?;
     if max_degree < degree
-        || tau_g1_powers.len() < degree + 1
-        || tau_g2_powers.len() < degree + 1
-        || hiding_tau_g1_powers.len() < degree + 1
+        || tau_g1_powers.len() < needed_powers
+        || tau_g2_powers.len() < needed_powers
+        || hiding_tau_g1_powers.len() < needed_powers
     {
         return Err(format!(
             "benchmark SRS {} is incomplete for degree {degree}",
@@ -567,6 +595,7 @@ fn prepare_srs(
             tau_g1_powers,
             tau_g2_powers,
             hiding_tau_g1_powers,
+            provenance: SrsProvenance::Development,
         },
         load_elapsed,
         records,
@@ -860,6 +889,7 @@ fn command_output(program: &str, args: &[&str]) -> String {
 fn encode_insert_proof_text(proof: &KzgInsertProof) -> Result<String, String> {
     Ok([
         format!("scheme={}", proof.scheme),
+        format!("chain_id={}", proof.chain_id),
         format!("old_state_root={}", proof.old_state_root),
         format!("new_state_root={}", proof.new_state_root),
         format!("old_accumulator_hex={}", proof.old_accumulator_hex),
@@ -894,6 +924,7 @@ fn encode_insert_proof_text(proof: &KzgInsertProof) -> Result<String, String> {
             "quotient_eval_opening_proof_hex={}",
             proof.quotient_eval_opening_proof_hex
         ),
+        format!("balance_range_proof_hex={}", proof.balance_range_proof_hex),
         format!("relation_bp_proof_hex={}", proof.relation_bp_proof_hex),
         format!(
             "relation_bp_commitments_hex={}",

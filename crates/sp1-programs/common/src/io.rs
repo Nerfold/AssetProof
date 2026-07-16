@@ -136,9 +136,23 @@ pub enum Sp1ChainBalanceProof {
     EthereumAccountProof {
         nodes: Vec<Vec<u8>>,
     },
+    EthereumVerkleBatchMember {
+        tree_key: Hash,
+        basic_data: Hash,
+    },
+    EthereumVerkleProof {
+        tree_key: Hash,
+        basic_data: Hash,
+        proof: Vec<u8>,
+    },
     UnsupportedGeneric {
         proof_system: String,
     },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Sp1EthereumVerkleBatchProof {
+    pub proof: Vec<u8>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -165,6 +179,7 @@ pub struct Sp1InitStdin {
     pub shape_commitment: Sp1G1Affine,
     pub eval_commitment: Sp1G1Affine,
     pub commitment_params_digest_hex: String,
+    pub ethereum_verkle_batch_proof: Option<Sp1EthereumVerkleBatchProof>,
     pub reserves: Vec<Sp1InitReserveEntry>,
 }
 

@@ -89,6 +89,37 @@ impl KzgInsertWitness {
             },
         }
     }
+
+    pub fn ethereum_verkle(
+        chain_id: String,
+        address: String,
+        balance: i128,
+        private_key_hex: String,
+        tree_key: [u8; 32],
+        basic_data: [u8; 32],
+        proof: Vec<u8>,
+    ) -> Self {
+        Self {
+            chain_id: chain_id.clone(),
+            address,
+            balance,
+            ownership: OwnershipWitnessInput::EthereumEoaPrivateKeyHex { private_key_hex },
+            chain_balance_proof: ChainBalanceProofInput::EthereumVerkleProof {
+                chain_id,
+                tree_key,
+                basic_data,
+                proof,
+            },
+            ownership_artifact: ExternalProofArtifact {
+                scheme: "sp1-native-ownership".to_string(),
+                payload_hex: String::new(),
+            },
+            chain_balance_artifact: ExternalProofArtifact {
+                scheme: "sp1-native-chain-balance".to_string(),
+                payload_hex: String::new(),
+            },
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -525,7 +556,9 @@ fn validate_insert_chain_id(witness: &KzgInsertWitness) -> Result<(), String> {
         ChainBalanceProofInput::Mock { .. } => return Ok(()),
         ChainBalanceProofInput::EthereumAccountProof { chain_id, .. }
         | ChainBalanceProofInput::GenericMerkleProof { chain_id, .. }
-        | ChainBalanceProofInput::BinaryMerkleV1 { chain_id, .. } => chain_id,
+        | ChainBalanceProofInput::BinaryMerkleV1 { chain_id, .. }
+        | ChainBalanceProofInput::EthereumVerkleBatchMember { chain_id, .. }
+        | ChainBalanceProofInput::EthereumVerkleProof { chain_id, .. } => chain_id,
     };
     if actual != &witness.chain_id {
         return Err(format!(

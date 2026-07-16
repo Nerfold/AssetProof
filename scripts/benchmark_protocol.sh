@@ -23,6 +23,14 @@ echo "  samples:    $SAMPLES"
 echo "  warmup:     $WARMUP"
 echo "  SP1 mode:   $POA_SP1_PROOF_MODE"
 echo "  output:     $OUTPUT_DIR"
+
+if [[ ! -f "$FIXTURE_DIR/preparation-manifest.txt" ]]; then
+  echo >&2
+  echo "Missing prepared benchmark fixtures: $FIXTURE_DIR/preparation-manifest.txt" >&2
+  echo "Run scripts/initialize_benchmark_data.sh first." >&2
+  exit 1
+fi
+
 echo
 echo "Preparing SP1 verification-key setup outside benchmark timers..."
 ./poa sp1-setup
@@ -33,6 +41,8 @@ cargo build --release -p poa-bench
 
 echo
 exec ./target/release/poa-bench \
+  --mode benchmark \
+  --require-existing true \
   --output "$OUTPUT_DIR" \
   --srs-dir "$SRS_DIR" \
   --fixture-dir "$FIXTURE_DIR" \

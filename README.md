@@ -372,6 +372,73 @@ POA_TIMING=1 ./poa prove-update \
 `mock-bench` 的第三个参数是显式报告路径。benchmark 应始终通过 `./poa` 的 release
 模式运行，否则 debug 编译会严重扭曲密码学运算耗时。
 
+完整协议矩阵由 `scripts/benchmark_protocol.sh` 运行。其 initialization fixture 在
+SP1 外生成：确定性的有效 secp256k1 私钥、未压缩公钥、由 Keccak 派生的 Ethereum
+地址、随机化余额、EIP-6800 basic-data leaves，以及一棵 256 叉 Banderwagon Verkle
+tree。前 `n` 个账户作为初始化储备，第 `n+1` 个账户只存在于同一个 Ethereum state
+中，供 insert benchmark 使用。SP1 内实际执行私钥到地址验证、EIP-6800 tree-key 与
+basic-data 编码检查、Banderwagon commitment 解析和 IPA opening 验证，不再使用
+`mock-private-key:<address>` / `mock-balance-proof:<address>` 标签。fixture 生成、磁盘
+加载和密钥一致性检查单独记录，不计入 prover/verifier time。
+
+初始化不会把同一份证明复制 `n` 次：每个账户有独立的 key/value opening，密码学上
+按 Verkle witness 的标准方式聚合为一份 multiproof，并在 SP1 guest 中验证一次。
+Insert 使用同一 state root 下的单账户 Verkle proof。Update fixture 对随机 delta 应用
+新余额后重新构建 Verkle tree，以真实的新 root 作为协议输入；Sync/finality 证明仍按
+论文中的独立抽象处理，不计入 debug update verifier。
+
+该后端固定使用 `crate-crypto/rust-verkle` commit
+`e27b8b4edf1992b4afa636c2fc7983bcc27ddb88`，其 Pedersen basis、31-byte stem/1-byte
+suffix、leaf splitting 和 IPA transcript 与 EIP-6800 参考实现一致。它属于研究型
+benchmark 依赖，不应被描述为当前 Ethereum 主网共识状态树实现。
+
+完整 benchmark 必须分两阶段执行。先初始化并持久化最大到 `10^6` 个账户的数据：
+
+```bash
+./scripts/initialize_benchmark_data.sh
+```
+
+默认会准备以下矩阵：
+
+- `n = 10^4, 10^5, 10^6`：每个规模都有独立的 `n+1` 账户 Verkle tree、初始化
+  multiproof 和 insert proof；
+- `m = 10^2, 10^3`：每个 `n` 先确定性生成最大 `10^3` 个互不重复的随机更新，
+  `10^2` 是同一更新序列的前缀；两种规模分别持久化 canonical delta list 及其重建后
+  的新 Verkle root；
+- 对应的 development benchmark SRS。
+
+文件默认持久化在：
+
+```text
+data/mock/bench/generated/
+  preparation-manifest.txt
+  n_10000/ethereum-eip6800-verkle-v2/
+  n_100000/ethereum-eip6800-verkle-v2/
+  n_1000000/ethereum-eip6800-verkle-v2/
+
+params/srs/bench/
+```
+
+准备完成后再运行：
+
+```bash
+./scripts/benchmark_protocol.sh
+```
+
+benchmark 脚本只加载并验证持久化数据；缺少任一指定规模的 SRS、初始化 fixture 或
+delta fixture 都会立即退出，不会在 benchmark 过程中自动生成。默认运行
+`3` 个 measured samples 和 `1` 个 warmup。可通过环境变量覆盖，例如：
+
+```bash
+SAMPLES=5 WARMUP=1 POA_SP1_PROOF_MODE=groth16 \
+  ./scripts/benchmark_protocol.sh
+```
+
+初始化脚本会在宿主侧验证账户、公私钥、basic-data、初始化 multiproof、insert proof、
+delta 的旧 root 和重建后的新 root；initialization/insert 的 SP1 guest 随后还会在证明
+过程中再次验证对应的 Verkle opening。百万规模准备过程本身可能消耗大量内存、磁盘和
+时间，但这些时间不会进入 protocol prover/verifier 统计。
+
 ## 测试
 
 常规工作区测试：

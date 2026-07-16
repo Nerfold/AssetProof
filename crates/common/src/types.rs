@@ -63,6 +63,27 @@ pub enum ChainBalanceProofInput {
         leaf_index: u64,
         siblings_hex: Vec<String>,
     },
+    /// One key/value opening authenticated by the shared initialization
+    /// multiproof in [`EthereumVerkleBatchProofInput`].
+    EthereumVerkleBatchMember {
+        chain_id: String,
+        tree_key: [u8; 32],
+        basic_data: [u8; 32],
+    },
+    /// A self-contained EIP-6800-style Verkle opening. This form is used by
+    /// insertion, where only one account is authenticated.
+    EthereumVerkleProof {
+        chain_id: String,
+        tree_key: [u8; 32],
+        basic_data: [u8; 32],
+        proof: Vec<u8>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EthereumVerkleBatchProofInput {
+    pub root_commitment: [u8; 32],
+    pub proof: Vec<u8>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

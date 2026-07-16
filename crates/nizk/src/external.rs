@@ -420,6 +420,44 @@ fn prepare_chain_balance(
                 ),
             }
         }
+        ChainBalanceProofInput::EthereumVerkleBatchMember {
+            chain_id,
+            tree_key,
+            basic_data,
+        } => PreparedChainBalanceWitness {
+            scheme: "ethereum-verkle-batch-member-v1".to_string(),
+            proof_digest_hex: hex_hash(
+                "ethereum-verkle-batch-member-v1",
+                &[
+                    chain_id.as_bytes(),
+                    ctx.state_root.as_bytes(),
+                    witness.address.as_bytes(),
+                    &witness.balance.to_le_bytes(),
+                    tree_key,
+                    basic_data,
+                ],
+            ),
+        },
+        ChainBalanceProofInput::EthereumVerkleProof {
+            chain_id,
+            tree_key,
+            basic_data,
+            proof,
+        } => PreparedChainBalanceWitness {
+            scheme: "ethereum-verkle-proof-v1".to_string(),
+            proof_digest_hex: hex_hash(
+                "ethereum-verkle-proof-v1",
+                &[
+                    chain_id.as_bytes(),
+                    ctx.state_root.as_bytes(),
+                    witness.address.as_bytes(),
+                    &witness.balance.to_le_bytes(),
+                    tree_key,
+                    basic_data,
+                    proof,
+                ],
+            ),
+        },
     })
 }
 

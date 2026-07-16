@@ -4,5 +4,10 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+blake3 = "1.8"
 common = { path = "../common" }
+k256 = { version = "0.13", features = ["arithmetic"] }
 nizk-fixed-set = { path = "../nizk" }
+sha3 = "0.10"
+verkle-trie = { git = "https://github.com/crate-crypto/rust-verkle", rev = "e27b8b4edf1992b4afa636c2fc7983bcc27ddb88" }
+verkle-spec = { git = "https://github.com/crate-crypto/rust-verkle", rev = "e27b8b4edf1992b4afa636c2fc7983bcc27ddb88" }

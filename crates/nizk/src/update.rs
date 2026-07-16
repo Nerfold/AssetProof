@@ -157,7 +157,7 @@ pub fn apply_update(
         return Err("stored reserve addresses are not in canonical strict order".to_string());
     }
     let mut next_reserve_balances = state.reserve_balances.clone();
-    for (point, delta) in x_values.iter().zip(deltas.iter()) {
+    for (point, delta) in witness.x_values.iter().zip(deltas.iter()) {
         if let Ok(index) = reserve_roots
             .binary_search_by(|candidate| candidate.into_bigint().cmp(&point.into_bigint()))
         {

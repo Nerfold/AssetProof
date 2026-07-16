@@ -5,9 +5,12 @@ use ark_bls12_381::{Fr, G1Projective};
 use ark_ff::{BigInteger, PrimeField};
 use common::crypto::{hex_decode, hex_encode};
 use common::types::{
-    ChainBalanceProofInput, InitReserveWitness, OwnershipWitnessInput, StoredInitProof,
+    ChainBalanceProofInput, EthereumVerkleBatchProofInput, InitReserveWitness,
+    OwnershipWitnessInput, StoredInitProof,
 };
-use sp1_programs_common::io::{Sp1ChainBalanceProof, Sp1G1Affine, Sp1OwnershipWitness};
+use sp1_programs_common::io::{
+    Sp1ChainBalanceProof, Sp1EthereumVerkleBatchProof, Sp1G1Affine, Sp1OwnershipWitness,
+};
 use sp1_programs_common::io::{Sp1InitPublicValues, Sp1InitReserveEntry, Sp1InitStdin};
 use sp1_sdk::blocking::{ProveRequest, Prover as BlockingProver, ProverClient};
 use sp1_sdk::include_elf;
@@ -101,6 +104,7 @@ pub fn build_init_stdin(
     encoded_addresses: &[Fr],
     balances: &[i128],
     witnesses: &[InitReserveWitness],
+    ethereum_verkle_batch_proof: Option<&EthereumVerkleBatchProofInput>,
 ) -> Result<Sp1InitStdin, String> {
     if addresses.len() != encoded_addresses.len()
         || addresses.len() != balances.len()
@@ -156,6 +160,11 @@ pub fn build_init_stdin(
             shape_value_bases,
             shape_blind_base,
         ),
+        ethereum_verkle_batch_proof: ethereum_verkle_batch_proof.map(|proof| {
+            Sp1EthereumVerkleBatchProof {
+                proof: proof.proof.clone(),
+            }
+        }),
         reserves,
     })
 }
@@ -254,6 +263,24 @@ pub(crate) fn convert_chain_proof(
                 proof_system: proof_system.clone(),
             })
         }
+        ChainBalanceProofInput::EthereumVerkleBatchMember {
+            tree_key,
+            basic_data,
+            ..
+        } => Ok(Sp1ChainBalanceProof::EthereumVerkleBatchMember {
+            tree_key: *tree_key,
+            basic_data: *basic_data,
+        }),
+        ChainBalanceProofInput::EthereumVerkleProof {
+            tree_key,
+            basic_data,
+            proof,
+            ..
+        } => Ok(Sp1ChainBalanceProof::EthereumVerkleProof {
+            tree_key: *tree_key,
+            basic_data: *basic_data,
+            proof: proof.clone(),
+        }),
     }
 }
 

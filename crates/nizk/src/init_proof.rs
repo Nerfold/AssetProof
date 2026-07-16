@@ -5,8 +5,8 @@ use common::crypto::{
     hash_bytes, hash_to_scalar, point_g1_from_hex, point_g1_to_hex, scalar_to_hex,
 };
 use common::types::{
-    InitProvingContext, InitReserveWitness, PreparedInitReserveWitness, PublicState, ReserveEntry,
-    StoredInitProof, StoredState,
+    EthereumVerkleBatchProofInput, InitProvingContext, InitReserveWitness,
+    PreparedInitReserveWitness, PublicState, ReserveEntry, StoredInitProof, StoredState,
 };
 
 use crate::commitment::commit_balance;
@@ -36,8 +36,57 @@ pub fn initialize_from_witnesses_with_adapter(
     srs: &Srs,
     external: &impl ExternalProofAdapter,
 ) -> Result<InitProofResult, String> {
+    initialize_from_witnesses_with_optional_verkle_proof(
+        ctx,
+        reserve_witnesses,
+        None,
+        srs,
+        external,
+    )
+}
+
+pub fn initialize_from_witnesses_with_verkle_proof(
+    ctx: &InitProvingContext,
+    reserve_witnesses: &[InitReserveWitness],
+    verkle_proof: &EthereumVerkleBatchProofInput,
+    srs: &Srs,
+    external: &impl ExternalProofAdapter,
+) -> Result<InitProofResult, String> {
+    let expected_root = common::crypto::hex_encode(&verkle_proof.root_commitment);
+    if ctx.state_root.strip_prefix("0x").unwrap_or(&ctx.state_root) != expected_root {
+        return Err("Verkle batch proof root does not match initialization state_root".to_string());
+    }
+    initialize_from_witnesses_with_optional_verkle_proof(
+        ctx,
+        reserve_witnesses,
+        Some(verkle_proof),
+        srs,
+        external,
+    )
+}
+
+fn initialize_from_witnesses_with_optional_verkle_proof(
+    ctx: &InitProvingContext,
+    reserve_witnesses: &[InitReserveWitness],
+    verkle_proof: Option<&EthereumVerkleBatchProofInput>,
+    srs: &Srs,
+    external: &impl ExternalProofAdapter,
+) -> Result<InitProofResult, String> {
     if reserve_witnesses.is_empty() {
         return Err("reserve set must not be empty".to_string());
+    }
+    let verkle_member_count = reserve_witnesses
+        .iter()
+        .filter(|witness| {
+            matches!(
+                &witness.chain_balance_proof,
+                common::types::ChainBalanceProofInput::EthereumVerkleBatchMember { .. }
+            )
+        })
+        .count();
+    match ethereum_verkle_batch_shape(reserve_witnesses.len(), verkle_member_count, verkle_proof) {
+        Ok(()) => {}
+        Err(err) => return Err(err),
     }
     for witness in reserve_witnesses {
         validate_chain_id(&ctx.chain_id, &witness.chain_balance_proof)?;
@@ -54,7 +103,33 @@ pub fn initialize_from_witnesses_with_adapter(
             balance: witness.balance,
         })
         .collect::<Vec<_>>();
-    initialize_core(ctx, &reserve_entries, reserve_witnesses, &prepared, srs)
+    initialize_core(
+        ctx,
+        &reserve_entries,
+        reserve_witnesses,
+        &prepared,
+        verkle_proof,
+        srs,
+    )
+}
+
+fn ethereum_verkle_batch_shape(
+    reserve_count: usize,
+    member_count: usize,
+    proof: Option<&EthereumVerkleBatchProofInput>,
+) -> Result<(), String> {
+    match (member_count, proof) {
+        (0, None) => Ok(()),
+        (0, Some(_)) => Err("Verkle batch proof has no member openings".to_string()),
+        (_, None) => Err("Verkle batch members require a shared multiproof".to_string()),
+        (members, Some(_)) if members != reserve_count => Err(
+            "initialization cannot mix Verkle batch members with other chain proofs".to_string(),
+        ),
+        (_, Some(proof)) if proof.proof.is_empty() => {
+            Err("Verkle initialization multiproof is empty".to_string())
+        }
+        (_, Some(_)) => Ok(()),
+    }
 }
 
 pub fn initialize_with_proof(
@@ -93,7 +168,14 @@ pub fn initialize_with_proof_and_adapter(
         .iter()
         .map(|witness| external.prepare_init_witness(&ctx, witness))
         .collect::<Result<Vec<_>, _>>()?;
-    initialize_core(&ctx, reserve_entries, &reserve_witnesses, &prepared, srs)
+    initialize_core(
+        &ctx,
+        reserve_entries,
+        &reserve_witnesses,
+        &prepared,
+        None,
+        srs,
+    )
 }
 
 fn initialize_core(
@@ -101,6 +183,7 @@ fn initialize_core(
     reserve_entries: &[ReserveEntry],
     reserve_witnesses: &[InitReserveWitness],
     prepared_witnesses: &[PreparedInitReserveWitness],
+    ethereum_verkle_batch_proof: Option<&EthereumVerkleBatchProofInput>,
     srs: &Srs,
 ) -> Result<InitProofResult, String> {
     if reserve_entries.is_empty() {
@@ -248,12 +331,18 @@ fn initialize_core(
         &roots,
         &reserve_balances,
         &canonical_witnesses,
+        ethereum_verkle_batch_proof,
     )?;
     let (sp1_proof_hex, sp1_vk_hex, sp1_public_values_hex, _) =
         sp1_host::init::prove_init(sp1_stdin)?;
 
     let proof = StoredInitProof {
-        scheme: "kzg-nizk-init-v5-zkopen-h2c-crs-mock-bound".to_string(),
+        scheme: if ethereum_verkle_batch_proof.is_some() {
+            "kzg-nizk-init-v5-zkopen-h2c-crs-eip6800-verkle-bound"
+        } else {
+            "kzg-nizk-init-v5-zkopen-h2c-crs-mock-bound"
+        }
+        .to_string(),
         mode: "sp1".to_string(),
         chain_id: ctx.chain_id.clone(),
         state_root: ctx.state_root.clone(),
@@ -296,7 +385,9 @@ fn validate_chain_id(
         common::types::ChainBalanceProofInput::Mock { .. } => return Ok(()),
         common::types::ChainBalanceProofInput::EthereumAccountProof { chain_id, .. }
         | common::types::ChainBalanceProofInput::GenericMerkleProof { chain_id, .. }
-        | common::types::ChainBalanceProofInput::BinaryMerkleV1 { chain_id, .. } => chain_id,
+        | common::types::ChainBalanceProofInput::BinaryMerkleV1 { chain_id, .. }
+        | common::types::ChainBalanceProofInput::EthereumVerkleBatchMember { chain_id, .. }
+        | common::types::ChainBalanceProofInput::EthereumVerkleProof { chain_id, .. } => chain_id,
     };
     if actual != expected {
         return Err(format!(
@@ -384,7 +475,9 @@ pub(crate) fn verify_init_public_proof(
     if proof.srs_hash_hex != point_hash_srs(srs)? {
         return Err("SRS hash mismatch".to_string());
     }
-    if proof.scheme != "kzg-nizk-init-v5-zkopen-h2c-crs-mock-bound" {
+    if proof.scheme != "kzg-nizk-init-v5-zkopen-h2c-crs-mock-bound"
+        && proof.scheme != "kzg-nizk-init-v5-zkopen-h2c-crs-eip6800-verkle-bound"
+    {
         return Err("init proof is not a production ZK proof; use verify_init_debug only for transparent local tests".to_string());
     }
     if proof.mode != "sp1" {

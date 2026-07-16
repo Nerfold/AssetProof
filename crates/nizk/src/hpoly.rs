@@ -307,7 +307,7 @@ mod tests {
 
     #[test]
     fn hpoly_commitment_hides_polynomial_and_hzkopen_verifies() {
-        let srs = Srs::setup_development(8, b"hpoly-test-srs");
+        let srs = Srs::setup_development_with_hiding(8, b"hpoly-test-srs");
         let polynomial =
             Polynomial::from_coeffs(vec![Fr::from(2u64), Fr::from(5u64), Fr::from(7u64)]);
         let hiding = commit_hiding_polynomial(&srs, &polynomial, 4).unwrap();

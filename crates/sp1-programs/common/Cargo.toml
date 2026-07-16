@@ -7,6 +7,7 @@ edition = "2021"
 path = "src/lib.rs"
 
 [dependencies]
+blake3 = { version = "1.8", default-features = false }
 sha3 = { version = "0.10", default-features = false }
 serde = { version = "1.0", default-features = false, features = ["derive", "alloc"] }
 slop-algebra = "6.2.4"

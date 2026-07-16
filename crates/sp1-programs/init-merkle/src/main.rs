@@ -9,22 +9,19 @@ use sha3::{Digest, Keccak256};
 use sp1_curves::params::FieldParameters;
 use sp1_curves::weierstrass::bls12_381::{Bls12381, Bls12381BaseField};
 use sp1_curves::AffinePoint;
+use sp1_programs_common::bls12_381_scalar::{
+    from_le_bytes as scalar_from_le_bytes, mul_mod, sub_mod, to_le_bytes as scalar_to_le_bytes,
+    Scalar,
+};
 use sp1_programs_common::io::{
-    Hash, Sp1ChainBalanceProof, Sp1G1Affine, Sp1InitPublicValues, Sp1InitReserveEntry,
-    Sp1InitStdin, Sp1OwnershipWitness,
+    init_shape_commitment, Hash, Sp1ChainBalanceProof, Sp1G1Affine, Sp1InitPublicValues,
+    Sp1InitReserveEntry, Sp1InitStdin, Sp1OwnershipWitness,
 };
 use sp1_zkvm::entrypoint;
 use verkle_spec::Hasher as VerkleKeyHasher;
 use verkle_trie::{proof::VerkleProof, Element};
 
 entrypoint!(main);
-
-const BLS12_381_FR_MODULUS_LE: [u64; 4] = [
-    0xffffffff00000001,
-    0x53bda402fffe5bfe,
-    0x3339d80809a1d805,
-    0x73eda753299d7d48,
-];
 
 fn main() {
     let input: Sp1InitStdin = sp1_zkvm::io::read();
@@ -109,23 +106,11 @@ fn verify_init(input: Sp1InitStdin) -> Sp1InitPublicValues {
 }
 
 fn verify_private_commitment_openings(input: &Sp1InitStdin) {
-    let expected_shape_base_count = input
-        .reserves
-        .len()
-        .checked_add(1)
-        .expect("shape commitment base count overflow");
-    assert_eq!(
-        input.shape_value_bases.len(),
-        expected_shape_base_count,
-        "shape commitment base count mismatch"
-    );
     let expected_params_digest = commitment_params_digest(
         &input.balance_value_base,
         &input.balance_blind_base,
         &input.eval_value_base,
         &input.eval_blind_base,
-        &input.shape_value_bases,
-        &input.shape_blind_base,
     );
     assert_eq!(
         expected_params_digest, input.commitment_params_digest_hex,
@@ -144,24 +129,18 @@ fn verify_private_commitment_openings(input: &Sp1InitStdin) {
         "initial balance commitment opening mismatch"
     );
 
-    let mut shape_values = Vec::with_capacity(input.reserves.len() + 1);
-    shape_values.push(BigUint::from_bytes_le(&input.alpha_le));
-    shape_values.extend(
-        input
-            .reserves
-            .iter()
-            .map(|reserve| BigUint::from_bytes_le(&reserve.encoded_address_le)),
-    );
-    let shape = commit_many(
-        &input.shape_value_bases,
-        &shape_values,
-        &input.shape_blind_base,
-        &BigUint::from_bytes_le(&input.shape_blind_le),
-    );
     assert_eq!(
-        point_to_io(&shape),
+        init_shape_commitment(
+            &input.shape_salt,
+            &input.alpha_le,
+            input.reserves.len(),
+            input
+                .reserves
+                .iter()
+                .map(|reserve| reserve.encoded_address_le),
+        ),
         input.shape_commitment,
-        "initial shape commitment opening mismatch"
+        "initial salted shape commitment mismatch"
     );
 
     let evaluation = commit_many(
@@ -273,22 +252,13 @@ fn commitment_params_digest(
     balance_blind: &Sp1G1Affine,
     eval_value: &Sp1G1Affine,
     eval_blind: &Sp1G1Affine,
-    shape_values: &[Sp1G1Affine],
-    shape_blind: &Sp1G1Affine,
 ) -> alloc::string::String {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"dynamic-poa-init-commitment-params-v1");
+    hasher.update(b"dynamic-poa-init-commitment-params-v2-salted-shape-hash");
     for point in [balance_value, balance_blind, eval_value, eval_blind] {
         hasher.update(&point.x_be);
         hasher.update(&point.y_be);
     }
-    hasher.update(&(shape_values.len() as u64).to_le_bytes());
-    for point in shape_values {
-        hasher.update(&point.x_be);
-        hasher.update(&point.y_be);
-    }
-    hasher.update(&shape_blind.x_be);
-    hasher.update(&shape_blind.y_be);
     hex_hash(hasher.finalize().as_bytes())
 }
 
@@ -557,88 +527,7 @@ fn hex_nibble(value: u8) -> u8 {
     }
 }
 
-fn scalar_from_le_bytes(bytes: [u8; 32]) -> [u64; 4] {
-    let mut out = [0u64; 4];
-    for index in 0..4 {
-        let mut word = [0u8; 8];
-        word.copy_from_slice(&bytes[index * 8..(index + 1) * 8]);
-        out[index] = u64::from_le_bytes(word);
-    }
-    assert!(
-        cmp_limbs(&out, &BLS12_381_FR_MODULUS_LE) < 0,
-        "scalar out of range"
-    );
-    out
-}
-
-fn scalar_to_le_bytes(value: [u64; 4]) -> [u8; 32] {
-    let mut out = [0u8; 32];
-    for index in 0..4 {
-        out[index * 8..(index + 1) * 8].copy_from_slice(&value[index].to_le_bytes());
-    }
-    out
-}
-
-fn sub_mod(left: [u64; 4], right: [u64; 4]) -> [u64; 4] {
-    if cmp_limbs(&left, &right) >= 0 {
-        sub_raw(left, right).0
-    } else {
-        let (tmp, _) = sub_raw(BLS12_381_FR_MODULUS_LE, right);
-        add_mod(tmp, left)
-    }
-}
-
-fn add_mod(left: [u64; 4], right: [u64; 4]) -> [u64; 4] {
-    let (sum, carry) = add_raw(left, right);
-    if carry || cmp_limbs(&sum, &BLS12_381_FR_MODULUS_LE) >= 0 {
-        sub_raw(sum, BLS12_381_FR_MODULUS_LE).0
-    } else {
-        sum
-    }
-}
-
-fn mul_mod(left: [u64; 4], right: [u64; 4]) -> [u64; 4] {
-    let mut acc = [0u64; 4];
-    let mut base = left;
-    for limb in right {
-        for bit in 0..64 {
-            if ((limb >> bit) & 1) == 1 {
-                acc = add_mod(acc, base);
-            }
-            base = add_mod(base, base);
-        }
-    }
-    acc
-}
-
-fn add_raw(left: [u64; 4], right: [u64; 4]) -> ([u64; 4], bool) {
-    let mut out = [0u64; 4];
-    let mut carry = 0u128;
-    for index in 0..4 {
-        let value = left[index] as u128 + right[index] as u128 + carry;
-        out[index] = value as u64;
-        carry = value >> 64;
-    }
-    (out, carry != 0)
-}
-
-fn sub_raw(left: [u64; 4], right: [u64; 4]) -> ([u64; 4], bool) {
-    let mut out = [0u64; 4];
-    let mut borrow = 0u128;
-    for index in 0..4 {
-        let rhs = right[index] as u128 + borrow;
-        if (left[index] as u128) >= rhs {
-            out[index] = (left[index] as u128 - rhs) as u64;
-            borrow = 0;
-        } else {
-            out[index] = ((1u128 << 64) + left[index] as u128 - rhs) as u64;
-            borrow = 1;
-        }
-    }
-    (out, borrow != 0)
-}
-
-fn cmp_limbs(left: &[u64; 4], right: &[u64; 4]) -> i8 {
+fn cmp_limbs(left: &Scalar, right: &Scalar) -> i8 {
     for index in (0..4).rev() {
         if left[index] < right[index] {
             return -1;

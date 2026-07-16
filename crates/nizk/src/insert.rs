@@ -1,27 +1,25 @@
 use ark_bls12_381::Fr;
-use ark_ff::{Field, One, PrimeField, UniformRand, Zero};
+use ark_ff::{BigInteger, Field, PrimeField, UniformRand, Zero};
+use std::sync::OnceLock;
 
-use common::crypto::{hash_to_scalar, point_g1_from_hex, point_g1_to_hex, scalar_to_hex};
+use common::crypto::{hex_decode, point_g1_from_hex, point_g1_to_hex, scalar_to_hex};
 use common::encoding::encode_address;
 use common::types::{ChainBalanceProofInput, OwnershipWitnessInput, PublicState, StoredState};
 
 use crate::bp::{prove_insert_relation_logic, verify_insert_relation_logic};
-use crate::commitment::commit_balance;
-use crate::commitment::derive_generator;
+use crate::commitment::{balance_generators, commit_balance, eval_generators};
 use crate::external::{
     ExternalProofAdapter, ExternalProofArtifact, MockExternalProofAdapter, Sp1NativeProofAdapter,
 };
-use crate::hpoly::{
-    commit_hiding_polynomial, prove_hiding_committed_opening, verify_hiding_committed_opening,
-};
 use crate::kzg::{commit_g1, Srs};
-use crate::polynomial::{product_from_roots, Polynomial};
+use crate::polynomial::Polynomial;
 use crate::threshold::{
-    prove_threshold, verify_threshold, ThresholdProof, ThresholdStatement, ThresholdWitness,
+    prove_threshold, verify_threshold_encoded, ThresholdStatement, ThresholdWitness,
     THRESHOLD_PROOF_SCHEME,
 };
 use crate::verifier::ChainPolicy;
 use crate::zkopen::{eval_commit, prove_committed_opening, verify_committed_opening};
+use rand::RngCore;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KzgInsertWitness {
@@ -134,7 +132,7 @@ pub struct KzgInsertProof {
     pub new_balance_commitment_hex: String,
     pub reserve_count_before: usize,
     pub reserve_count_after: usize,
-    pub c_q_h_hex: String,
+    pub quotient_commitment_hex: String,
     pub c_x_hex: String,
     pub c_beta_hex: String,
     pub c_y_x_hex: String,
@@ -144,7 +142,6 @@ pub struct KzgInsertProof {
     pub zeta: Fr,
     pub old_eval_opening_proof_hex: String,
     pub new_eval_opening_proof_hex: String,
-    pub quotient_eval_opening_proof_hex: String,
     pub balance_range_proof_hex: String,
     pub relation_bp_proof_hex: String,
     pub relation_bp_commitments_hex: String,
@@ -198,21 +195,11 @@ pub fn apply_insert_with_adapter(
             "stored reserve address and balance vectors have different lengths".to_string(),
         );
     }
-    if state.reserve_balances.iter().any(|balance| *balance < 0) {
-        return Err("stored reserve balances must be non-negative".to_string());
-    }
     let next_reserve_count = state
         .reserve_addresses
         .len()
         .checked_add(1)
         .ok_or_else(|| "insert reserve count overflow".to_string())?;
-    if state
-        .reserve_addresses
-        .iter()
-        .any(|addr| addr == &witness.address)
-    {
-        return Err("inserted address already exists in reserve set".to_string());
-    }
     if witness.balance < 0 {
         return Err("inserted balance must be non-negative".to_string());
     }
@@ -236,23 +223,10 @@ pub fn apply_insert_with_adapter(
         );
     }
     let x = encode_address(&witness.address)?;
-    let reserve_roots = state
-        .reserve_addresses
-        .iter()
-        .map(|address| encode_address(address))
-        .collect::<Result<Vec<_>, _>>()?;
-    if reserve_roots
-        .windows(2)
-        .any(|pair| pair[0].into_bigint() >= pair[1].into_bigint())
-    {
-        return Err("stored reserve addresses are not in canonical strict order".to_string());
+    if state.alpha.is_zero() {
+        return Err("stored accumulator mask must be non-zero".to_string());
     }
-    if state.alpha.is_zero() || product_from_roots(&reserve_roots).mul_scalar(state.alpha) != old_p
-    {
-        return Err(
-            "stored accumulator polynomial does not match reserve roots and mask".to_string(),
-        );
-    }
+    let insertion_index = encoded_address_insertion_index(&state.reserve_addresses, x)?;
     let y_x = old_p.evaluate(x);
     if y_x.is_zero() {
         return Err("inserted address is already a root of the accumulator polynomial".to_string());
@@ -277,29 +251,12 @@ pub fn apply_insert_with_adapter(
     let c_beta = eval_commit(beta, r_beta);
     let c_y_x = eval_commit(y_x, r_y_x);
 
-    let linear = Polynomial::from_coeffs(vec![-x, Fr::one()]);
-    let new_p = old_p.mul(&linear).mul_scalar(beta);
+    let new_p = old_p.mul_linear_scaled(x, beta);
     let new_accumulator = commit_g1(srs, &new_p)?;
     let old_accumulator = point_g1_from_hex(&state.accumulator_hex)?;
-    if old_accumulator != commit_g1(srs, &old_p)? {
-        return Err("old state accumulator does not match polynomial witness".to_string());
-    }
 
     let r_ins = Fr::rand(&mut rng);
     let old_balance_commitment = point_g1_from_hex(&state.balance_commitment_hex)?;
-    if old_balance_commitment != commit_balance(state.balance_total, state.balance_blind) {
-        return Err("stored balance opening does not match its commitment".to_string());
-    }
-    let recomputed_old_total = state
-        .reserve_balances
-        .iter()
-        .try_fold(0i128, |sum, balance| {
-            sum.checked_add(*balance)
-                .ok_or_else(|| "stored reserve balance total overflowed i128".to_string())
-        })?;
-    if recomputed_old_total != state.balance_total {
-        return Err("stored reserve balances do not match aggregate balance".to_string());
-    }
     let c_insert_balance = commit_balance(witness.balance, r_ins);
     let new_balance_commitment = old_balance_commitment + c_insert_balance;
     let next_balance_total = state
@@ -307,16 +264,20 @@ pub fn apply_insert_with_adapter(
         .checked_add(witness.balance)
         .ok_or_else(|| "inserted balance total overflow".to_string())?;
 
-    let q_poly = old_p.sub(&Polynomial::constant(y_x)).div_exact(&linear)?;
-    let quotient_degree_bound = state.reserve_addresses.len().saturating_sub(1);
-    let hiding_q = commit_hiding_polynomial(srs, &q_poly, quotient_degree_bound)?;
-    let c_q_h = hiding_q.commitment;
+    let q_poly = old_p.quotient_at(x, y_x)?;
+    if q_poly.coeffs.len() != state.reserve_addresses.len() {
+        return Err("insert quotient must have exactly n coefficients".to_string());
+    }
+    let mut quotient_salt = [0u8; 32];
+    rng.fill_bytes(&mut quotient_salt);
+    let quotient_commitment =
+        sp1_host::kzg_insert::quotient_commitment(&q_poly.coeffs, &quotient_salt);
 
     let old_accumulator_hex = point_g1_to_hex(&old_accumulator)?;
     let new_accumulator_hex = point_g1_to_hex(&new_accumulator)?;
     let old_balance_commitment_hex = state.balance_commitment_hex.clone();
     let new_balance_commitment_hex = point_g1_to_hex(&new_balance_commitment)?;
-    let c_q_h_hex = point_g1_to_hex(&c_q_h)?;
+    let quotient_commitment_hex = common::crypto::hex_encode(&quotient_commitment);
     let c_x_hex = point_g1_to_hex(&c_x)?;
     let c_beta_hex = point_g1_to_hex(&c_beta)?;
     let c_y_x_hex = point_g1_to_hex(&c_y_x)?;
@@ -326,7 +287,7 @@ pub fn apply_insert_with_adapter(
         &state.state_root,
         &old_accumulator_hex,
         &new_accumulator_hex,
-        &c_q_h_hex,
+        &quotient_commitment,
         &new_balance_commitment_hex,
         state.reserve_addresses.len(),
         &c_x_hex,
@@ -343,25 +304,11 @@ pub fn apply_insert_with_adapter(
     let c_y_prime = eval_commit(y_prime, r_y_prime);
     let c_q = eval_commit(q_zeta, r_q);
 
-    if y_prime != beta * y * (zeta - x) {
-        return Err("insert relation y' = beta*y*(zeta-x) failed".to_string());
-    }
-    if y - y_x != q_zeta * (zeta - x) {
-        return Err("insert relation y-y_x = q*(zeta-x) failed".to_string());
-    }
-    if y_x * z_x != Fr::one() || beta * z_beta != Fr::one() {
-        return Err("insert inverse relation failed".to_string());
-    }
-
     let c_y_hex = point_g1_to_hex(&c_y)?;
     let c_y_prime_hex = point_g1_to_hex(&c_y_prime)?;
     let c_q_hex = point_g1_to_hex(&c_q)?;
-    let old_opening_poly = old_p
-        .sub(&Polynomial::constant(y))
-        .div_exact(&Polynomial::from_coeffs(vec![-zeta, Fr::one()]))?;
-    let new_opening_poly = new_p
-        .sub(&Polynomial::constant(y_prime))
-        .div_exact(&Polynomial::from_coeffs(vec![-zeta, Fr::one()]))?;
+    let old_opening_poly = old_p.quotient_at(zeta, y)?;
+    let new_opening_poly = new_p.quotient_at(zeta, y_prime)?;
     let old_eval_opening = commit_g1(srs, &old_opening_poly)?;
     let new_eval_opening = commit_g1(srs, &new_opening_poly)?;
     let old_eval_opening_proof_hex = prove_committed_opening(
@@ -383,17 +330,6 @@ pub fn apply_insert_with_adapter(
         r_y_prime,
         &new_eval_opening,
         "dynamic-poa-insert-new-eval-zkopen",
-    )?;
-    let quotient_eval_opening_proof_hex = prove_hiding_committed_opening(
-        srs,
-        &c_q_h_hex,
-        zeta,
-        &c_q_hex,
-        q_zeta,
-        r_q,
-        &q_poly,
-        &hiding_q,
-        "dynamic-poa-insert-quotient-eval-hzkopen",
     )?;
     let relation_proof = prove_insert_relation_logic(
         x,
@@ -445,7 +381,7 @@ pub fn apply_insert_with_adapter(
         &state.state_root,
         &old_accumulator_hex,
         &new_accumulator_hex,
-        &c_q_h_hex,
+        &quotient_commitment_hex,
         &new_balance_commitment_hex,
         state.reserve_addresses.len(),
         &c_x_hex,
@@ -458,6 +394,8 @@ pub fn apply_insert_with_adapter(
         &ownership_artifact.proof_digest_hex,
         &chain_balance_artifact.proof_digest_hex,
     )?;
+    let (eval_value_base, eval_blind_base) = eval_generators();
+    let (balance_value_base, balance_blind_base) = balance_generators();
     let sp1_stdin = sp1_host::kzg_insert::build_stdin(
         &witness.chain_id,
         &state.state_root,
@@ -468,11 +406,18 @@ pub fn apply_insert_with_adapter(
         x,
         r_x,
         r_ins,
-        &derive_generator("eval-v", 0),
-        &derive_generator("eval-h", 0),
-        &derive_generator("balance-v", 0),
-        &derive_generator("balance-h", 0),
+        zeta,
+        quotient_salt,
+        &q_poly.coeffs,
+        quotient_commitment,
+        q_zeta,
+        r_q,
+        eval_value_base,
+        eval_blind_base,
+        balance_value_base,
+        balance_blind_base,
         &c_x,
+        &c_q,
         &c_insert_balance,
         &old_accumulator_hex,
         &new_accumulator_hex,
@@ -486,21 +431,24 @@ pub fn apply_insert_with_adapter(
         sp1_host::kzg_insert::prove(sp1_stdin)?;
     if sp1_public.chain_id != witness.chain_id
         || sp1_public.state_root != state.state_root
+        || sp1_public.zeta_le != fr_to_le_bytes(zeta)
         || !sp1_host::kzg_insert::point_matches(&sp1_public.c_x, &c_x)
+        || sp1_public.quotient_commitment != quotient_commitment
+        || !sp1_host::kzg_insert::point_matches(&sp1_public.c_quotient_eval, &c_q)
         || !sp1_host::kzg_insert::point_matches(&sp1_public.c_balance_delta, &c_insert_balance)
         || sp1_public.transcript_hex != transcript_hex
     {
         return Err("SP1 KZG insert public values do not bind the insertion".to_string());
     }
 
-    let insertion_index = reserve_roots
-        .binary_search_by(|candidate| candidate.into_bigint().cmp(&x.into_bigint()))
-        .err()
-        .ok_or_else(|| "inserted address already exists in reserve set".to_string())?;
-    let mut reserve_addresses = state.reserve_addresses.clone();
-    reserve_addresses.insert(insertion_index, witness.address.clone());
-    let mut reserve_balances = state.reserve_balances.clone();
-    reserve_balances.insert(insertion_index, witness.balance);
+    let mut reserve_addresses = Vec::with_capacity(next_reserve_count);
+    reserve_addresses.extend_from_slice(&state.reserve_addresses[..insertion_index]);
+    reserve_addresses.push(witness.address.clone());
+    reserve_addresses.extend_from_slice(&state.reserve_addresses[insertion_index..]);
+    let mut reserve_balances = Vec::with_capacity(next_reserve_count);
+    reserve_balances.extend_from_slice(&state.reserve_balances[..insertion_index]);
+    reserve_balances.push(witness.balance);
+    reserve_balances.extend_from_slice(&state.reserve_balances[insertion_index..]);
     let next_state = StoredState {
         state_root: state.state_root.clone(),
         srs_max_degree: state.srs_max_degree,
@@ -515,7 +463,7 @@ pub fn apply_insert_with_adapter(
     };
 
     let proof = KzgInsertProof {
-        scheme: "kzg-nizk-insert-v5-hpoly-bounded-range-mock-bound".to_string(),
+        scheme: "kzg-nizk-insert-v6-salted-quotient-hash-bounded-range-mock-bound".to_string(),
         chain_id: witness.chain_id.clone(),
         old_state_root: state.state_root.clone(),
         new_state_root: state.state_root.clone(),
@@ -525,7 +473,7 @@ pub fn apply_insert_with_adapter(
         new_balance_commitment_hex,
         reserve_count_before: state.reserve_addresses.len(),
         reserve_count_after: next_reserve_count,
-        c_q_h_hex,
+        quotient_commitment_hex,
         c_x_hex,
         c_beta_hex,
         c_y_x_hex,
@@ -535,7 +483,6 @@ pub fn apply_insert_with_adapter(
         zeta,
         old_eval_opening_proof_hex,
         new_eval_opening_proof_hex,
-        quotient_eval_opening_proof_hex,
         balance_range_proof_hex,
         relation_bp_proof_hex: relation_proof.bp_proof_hex,
         relation_bp_commitments_hex: relation_proof.bp_commitments_hex,
@@ -600,8 +547,6 @@ pub fn verify_insert_with_srs_and_policy(
 ) -> Result<(), String> {
     if !policy.allow_mock_proofs {
         srs.require_external_ceremony()?;
-    } else {
-        srs.validate_structure()?;
     }
     policy.check_chain_id(&proof.chain_id)?;
     policy.check_last_accepted(old_state)?;
@@ -616,15 +561,16 @@ pub fn verify_insert_with_srs_and_policy(
     {
         return Err("insert reserve count is outside the SRS-supported range".to_string());
     }
-    if proof.scheme != "kzg-nizk-insert-v5-hpoly-bounded-range-mock-bound" {
+    if proof.scheme != "kzg-nizk-insert-v6-salted-quotient-hash-bounded-range-mock-bound" {
         return Err("insert proof is not a production ZK proof".to_string());
     }
+    let quotient_commitment = parse_quotient_commitment(&proof.quotient_commitment_hex)?;
     let expected_zeta = derive_zeta(
         &proof.chain_id,
         &proof.old_state_root,
         &proof.old_accumulator_hex,
         &proof.new_accumulator_hex,
-        &proof.c_q_h_hex,
+        &quotient_commitment,
         &proof.new_balance_commitment_hex,
         proof.reserve_count_before,
         &proof.c_x_hex,
@@ -648,20 +594,15 @@ pub fn verify_insert_with_srs_and_policy(
     let new_balance = point_g1_from_hex(&proof.new_balance_commitment_hex)?;
     let c_balance_delta = new_balance - old_balance;
     let c_x = point_g1_from_hex(&proof.c_x_hex)?;
-    let eval_value_base = derive_generator("eval-v", 0);
-    let eval_blind_base = derive_generator("eval-h", 0);
-    let balance_value_base = derive_generator("balance-v", 0);
-    let balance_blind_base = derive_generator("balance-h", 0);
-    let expected_params_digest = sp1_host::kzg_insert::commitment_params_digest(
-        &eval_value_base,
-        &eval_blind_base,
-        &balance_value_base,
-        &balance_blind_base,
-    );
+    let c_q = point_g1_from_hex(&proof.c_q_hex)?;
+    let expected_params_digest = canonical_commitment_params_digest();
     if sp1_public.chain_id != proof.chain_id
         || sp1_public.state_root != proof.old_state_root
+        || sp1_public.zeta_le != fr_to_le_bytes(proof.zeta)
         || sp1_public.commitment_params_digest_hex != expected_params_digest
         || !sp1_host::kzg_insert::point_matches(&sp1_public.c_x, &c_x)
+        || sp1_public.quotient_commitment != quotient_commitment
+        || !sp1_host::kzg_insert::point_matches(&sp1_public.c_quotient_eval, &c_q)
         || !sp1_host::kzg_insert::point_matches(&sp1_public.c_balance_delta, &c_balance_delta)
         || sp1_public.old_accumulator_hex != proof.old_accumulator_hex
         || sp1_public.new_accumulator_hex != proof.new_accumulator_hex
@@ -673,15 +614,13 @@ pub fn verify_insert_with_srs_and_policy(
     {
         return Err("SP1 KZG insert public statement mismatch".to_string());
     }
-    verify_threshold(
+    verify_threshold_encoded(
         &ThresholdStatement {
             public_state: new_state.clone(),
             threshold: 0,
         },
-        &ThresholdProof {
-            scheme: THRESHOLD_PROOF_SCHEME.to_string(),
-            proof_hex: proof.balance_range_proof_hex.clone(),
-        },
+        THRESHOLD_PROOF_SCHEME,
+        &proof.balance_range_proof_hex,
     )
     .map_err(|err| format!("inserted aggregate balance range proof failed: {err}"))?;
     verify_committed_opening(
@@ -699,15 +638,6 @@ pub fn verify_insert_with_srs_and_policy(
         &proof.c_y_prime_hex,
         &proof.new_eval_opening_proof_hex,
         "dynamic-poa-insert-new-eval-zkopen",
-    )?;
-    verify_hiding_committed_opening(
-        srs,
-        &proof.c_q_h_hex,
-        proof.zeta,
-        &proof.c_q_hex,
-        proof.reserve_count_before.saturating_sub(1),
-        &proof.quotient_eval_opening_proof_hex,
-        "dynamic-poa-insert-quotient-eval-hzkopen",
     )?;
     verify_insert_relation_logic(
         proof.zeta,
@@ -727,7 +657,7 @@ pub fn verify_insert_with_srs_and_policy(
         &proof.old_state_root,
         &proof.old_accumulator_hex,
         &proof.new_accumulator_hex,
-        &proof.c_q_h_hex,
+        &proof.quotient_commitment_hex,
         &proof.new_balance_commitment_hex,
         proof.reserve_count_before,
         &proof.c_x_hex,
@@ -797,11 +727,12 @@ pub fn check_insert_metadata_debug(
     proof: &KzgInsertProof,
 ) -> Result<(), String> {
     verify_insert_state(old_state, new_state, proof)?;
+    parse_quotient_commitment(&proof.quotient_commitment_hex)?;
     let expected_transcript = build_transcript_hex(
         &proof.old_state_root,
         &proof.old_accumulator_hex,
         &proof.new_accumulator_hex,
-        &proof.c_q_h_hex,
+        &proof.quotient_commitment_hex,
         &proof.new_balance_commitment_hex,
         proof.reserve_count_before,
         &proof.c_x_hex,
@@ -825,7 +756,7 @@ fn derive_zeta(
     state_root: &str,
     old_accumulator_hex: &str,
     new_accumulator_hex: &str,
-    c_q_h_hex: &str,
+    quotient_commitment: &[u8; 32],
     new_balance_commitment_hex: &str,
     reserve_count: usize,
     c_x_hex: &str,
@@ -833,13 +764,13 @@ fn derive_zeta(
     c_y_x_hex: &str,
 ) -> Fr {
     derive_nonzero_scalar(
-        "insert-zeta",
+        "insert-zeta-v2-salted-quotient-hash",
         &[
             chain_id.as_bytes(),
             state_root.as_bytes(),
             old_accumulator_hex.as_bytes(),
             new_accumulator_hex.as_bytes(),
-            c_q_h_hex.as_bytes(),
+            quotient_commitment,
             new_balance_commitment_hex.as_bytes(),
             reserve_count.to_string().as_bytes(),
             c_x_hex.as_bytes(),
@@ -850,11 +781,12 @@ fn derive_zeta(
 }
 
 fn derive_nonzero_scalar(label: &str, chunks: &[&[u8]]) -> Fr {
-    let mut bytes = Vec::new();
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(label.as_bytes());
     for chunk in chunks {
-        bytes.extend_from_slice(chunk);
+        hasher.update(chunk);
     }
-    let mut scalar = hash_to_scalar(label, &bytes);
+    let mut scalar = Fr::from_le_bytes_mod_order(hasher.finalize().as_bytes());
     if scalar.is_zero() {
         scalar = Fr::from(37u64);
     }
@@ -865,7 +797,7 @@ fn build_transcript_hex(
     state_root: &str,
     old_accumulator_hex: &str,
     new_accumulator_hex: &str,
-    c_q_h_hex: &str,
+    quotient_commitment_hex: &str,
     new_balance_commitment_hex: &str,
     reserve_count: usize,
     c_x_hex: &str,
@@ -878,25 +810,78 @@ fn build_transcript_hex(
     ownership_artifact_digest_hex: &str,
     chain_balance_artifact_digest_hex: &str,
 ) -> Result<String, String> {
-    let payload = [
-        state_root.to_string(),
-        old_accumulator_hex.to_string(),
-        new_accumulator_hex.to_string(),
-        c_q_h_hex.to_string(),
-        new_balance_commitment_hex.to_string(),
-        reserve_count.to_string(),
-        c_x_hex.to_string(),
-        c_beta_hex.to_string(),
-        c_y_x_hex.to_string(),
-        scalar_to_hex(&zeta)?,
-        c_y_hex.to_string(),
-        c_y_prime_hex.to_string(),
-        c_q_hex.to_string(),
-        ownership_artifact_digest_hex.to_string(),
-        chain_balance_artifact_digest_hex.to_string(),
-    ]
-    .join("|");
-    Ok(common::crypto::hex_encode(
-        blake3::hash(payload.as_bytes()).as_bytes(),
-    ))
+    let count = reserve_count.to_string();
+    let zeta_hex = scalar_to_hex(&zeta)?;
+    let fields = [
+        state_root,
+        old_accumulator_hex,
+        new_accumulator_hex,
+        quotient_commitment_hex,
+        new_balance_commitment_hex,
+        &count,
+        c_x_hex,
+        c_beta_hex,
+        c_y_x_hex,
+        &zeta_hex,
+        c_y_hex,
+        c_y_prime_hex,
+        c_q_hex,
+        ownership_artifact_digest_hex,
+        chain_balance_artifact_digest_hex,
+    ];
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"dynamic-poa-insert-transcript-v2-salted-quotient-hash");
+    for (index, field) in fields.iter().enumerate() {
+        if index != 0 {
+            hasher.update(b"|");
+        }
+        hasher.update(field.as_bytes());
+    }
+    Ok(common::crypto::hex_encode(hasher.finalize().as_bytes()))
+}
+
+fn encoded_address_insertion_index(addresses: &[String], target: Fr) -> Result<usize, String> {
+    let target = target.into_bigint();
+    let mut left = 0usize;
+    let mut right = addresses.len();
+    while left < right {
+        let middle = left + (right - left) / 2;
+        let candidate = encode_address(&addresses[middle])?.into_bigint();
+        match candidate.cmp(&target) {
+            std::cmp::Ordering::Less => left = middle + 1,
+            std::cmp::Ordering::Greater => right = middle,
+            std::cmp::Ordering::Equal => {
+                return Err("inserted address already exists in reserve set".to_string());
+            }
+        }
+    }
+    Ok(left)
+}
+
+fn parse_quotient_commitment(value: &str) -> Result<[u8; 32], String> {
+    hex_decode(value)?
+        .try_into()
+        .map_err(|_| "insert salted quotient commitment must contain 32 bytes".to_string())
+}
+
+fn canonical_commitment_params_digest() -> &'static str {
+    static DIGEST: OnceLock<String> = OnceLock::new();
+    DIGEST.get_or_init(|| {
+        let (eval_value, eval_blind) = eval_generators();
+        let (balance_value, balance_blind) = balance_generators();
+        sp1_host::kzg_insert::commitment_params_digest(
+            eval_value,
+            eval_blind,
+            balance_value,
+            balance_blind,
+        )
+    })
+}
+
+fn fr_to_le_bytes(value: Fr) -> [u8; 32] {
+    let raw = value.into_bigint().to_bytes_le();
+    let mut out = [0u8; 32];
+    let len = raw.len().min(32);
+    out[..len].copy_from_slice(&raw[..len]);
+    out
 }

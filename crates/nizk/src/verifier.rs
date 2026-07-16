@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use std::env;
 use std::time::Instant;
 
-use common::crypto::{point_g1_from_hex, scalar_to_hex};
+use common::crypto::point_g1_from_hex;
 use common::encoding::encode_address;
 use common::types::{Delta, PublicState, StoredInitProof, StoredProof, StoredState, SyncProof};
 
@@ -14,9 +14,7 @@ use crate::init_proof::{verify_init_proof, verify_init_public_proof};
 use crate::kzg::{commit_g2, verify_batch, Srs};
 use crate::polynomial::product_from_roots;
 use crate::range::{check_public_delta_range, RangePolicy};
-use crate::threshold::{
-    verify_threshold, ThresholdProof, ThresholdStatement, THRESHOLD_PROOF_SCHEME,
-};
+use crate::threshold::{verify_threshold_encoded, ThresholdStatement, THRESHOLD_PROOF_SCHEME};
 use crate::update::{build_transcript_hex, delta_list_commitment, EMPTY_UPDATE_MARKER};
 
 #[derive(Clone, Debug)]
@@ -188,8 +186,6 @@ pub fn verify_init_with_policy(
 ) -> Result<(), String> {
     if !policy.allow_mock_proofs {
         srs.require_external_ceremony()?;
-    } else {
-        srs.validate_structure()?;
     }
     policy.check_chain_id(&proof.chain_id)?;
     policy.check_finalized(&public_state.state_root)?;
@@ -236,8 +232,6 @@ pub fn verify_update_production(
 ) -> Result<(), String> {
     if !policy.allow_mock_proofs {
         srs.require_external_ceremony()?;
-    } else {
-        srs.validate_structure()?;
     }
     policy.check_chain_id(&sync_proof.chain_id)?;
     policy.check_last_accepted(old_state)?;
@@ -420,15 +414,13 @@ fn verify_update_with_adapter_and_sync_proof(
     if new_balance_commitment != old_balance_commitment + c_d {
         return Err("claimed balance commitment does not match homomorphic update".to_string());
     }
-    verify_threshold(
+    verify_threshold_encoded(
         &ThresholdStatement {
             public_state: new_state.clone(),
             threshold: 0,
         },
-        &ThresholdProof {
-            scheme: THRESHOLD_PROOF_SCHEME.to_string(),
-            proof_hex: proof.balance_range_proof_hex.clone(),
-        },
+        THRESHOLD_PROOF_SCHEME,
+        &proof.balance_range_proof_hex,
     )
     .map_err(|err| format!("updated balance range proof failed: {err}"))?;
 
@@ -596,9 +588,7 @@ pub fn verify_update_from_prover_states(
 fn ensure_distinct(points: &[Fr]) -> Result<(), String> {
     let mut seen = HashSet::with_capacity(points.len());
     for point in points {
-        if !seen
-            .insert(scalar_to_hex(point).map_err(|err| format!("distinct check encode: {err}"))?)
-        {
+        if !seen.insert(*point) {
             return Err("duplicate encoded query point".to_string());
         }
     }

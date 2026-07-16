@@ -173,6 +173,8 @@ pub struct StoredInitProof {
     pub session_id: String,
     pub accumulator_hex: String,
     pub balance_commitment_hex: String,
+    /// A 32-byte salted BLAKE3 commitment to `(alpha, ordered address roots)`.
+    /// The private salt and preimage are checked inside the SP1 initialization proof.
     pub c_shape_hex: String,
     pub c_y_hex: String,
     pub reserve_count: usize,

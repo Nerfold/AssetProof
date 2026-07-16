@@ -175,25 +175,25 @@ pub fn write_srs_binary<W: IoWrite>(
     writer
         .write_all(&encoded_g1_len.to_le_bytes())
         .map_err(|err| format!("write srs g1 len: {err}"))?;
+    let mut g1_bytes = vec![0u8; G1Affine::identity().compressed_size()];
     for point in tau_g1_powers {
-        let mut bytes = Vec::new();
         point
-            .serialize_compressed(&mut bytes)
+            .serialize_compressed(&mut g1_bytes[..])
             .map_err(|err| format!("write srs g1 point: {err}"))?;
         writer
-            .write_all(&bytes)
+            .write_all(&g1_bytes)
             .map_err(|err| format!("write srs g1 bytes: {err}"))?;
     }
     writer
         .write_all(&encoded_g2_len.to_le_bytes())
         .map_err(|err| format!("write srs g2 len: {err}"))?;
+    let mut g2_bytes = vec![0u8; G2Affine::identity().compressed_size()];
     for point in tau_g2_powers {
-        let mut bytes = Vec::new();
         point
-            .serialize_compressed(&mut bytes)
+            .serialize_compressed(&mut g2_bytes[..])
             .map_err(|err| format!("write srs g2 point: {err}"))?;
         writer
-            .write_all(&bytes)
+            .write_all(&g2_bytes)
             .map_err(|err| format!("write srs g2 bytes: {err}"))?;
     }
     Ok(())
@@ -212,10 +212,10 @@ pub fn write_srs_binary_with_hiding<W: IoWrite>(
     writer
         .write_all(&encoded_hiding_len.to_le_bytes())
         .map_err(|err| format!("write hiding srs g1 len: {err}"))?;
+    let mut bytes = vec![0u8; G1Affine::identity().compressed_size()];
     for point in hiding_tau_g1_powers {
-        let mut bytes = Vec::new();
         point
-            .serialize_compressed(&mut bytes)
+            .serialize_compressed(&mut bytes[..])
             .map_err(|err| format!("write hiding srs g1 point: {err}"))?;
         writer
             .write_all(&bytes)
@@ -241,13 +241,13 @@ pub fn read_srs_binary<R: Read>(
     tau_g1_powers
         .try_reserve_exact(g1_len)
         .map_err(|err| format!("reserve SRS G1 powers: {err}"))?;
+    let mut g1_bytes = vec![0u8; G1Affine::identity().compressed_size()];
     for _ in 0..g1_len {
-        let mut bytes = vec![0u8; G1Affine::identity().compressed_size()];
         reader
-            .read_exact(&mut bytes)
+            .read_exact(&mut g1_bytes)
             .map_err(|err| format!("read srs g1 bytes: {err}"))?;
         tau_g1_powers.push(
-            G1Affine::deserialize_compressed(&bytes[..])
+            G1Affine::deserialize_compressed(&g1_bytes[..])
                 .map_err(|err| format!("read srs g1 point: {err}"))?,
         );
     }
@@ -260,13 +260,13 @@ pub fn read_srs_binary<R: Read>(
     tau_g2_powers
         .try_reserve_exact(g2_len)
         .map_err(|err| format!("reserve SRS G2 powers: {err}"))?;
+    let mut g2_bytes = vec![0u8; G2Affine::identity().compressed_size()];
     for _ in 0..g2_len {
-        let mut bytes = vec![0u8; G2Affine::identity().compressed_size()];
         reader
-            .read_exact(&mut bytes)
+            .read_exact(&mut g2_bytes)
             .map_err(|err| format!("read srs g2 bytes: {err}"))?;
         tau_g2_powers.push(
-            G2Affine::deserialize_compressed(&bytes[..])
+            G2Affine::deserialize_compressed(&g2_bytes[..])
                 .map_err(|err| format!("read srs g2 point: {err}"))?,
         );
     }
@@ -302,8 +302,8 @@ pub fn read_srs_binary_with_hiding<R: Read>(
     hiding_tau_g1_powers
         .try_reserve_exact(len)
         .map_err(|err| format!("reserve hiding SRS G1 powers: {err}"))?;
+    let mut bytes = vec![0u8; G1Affine::identity().compressed_size()];
     for _ in 0..len {
-        let mut bytes = vec![0u8; G1Affine::identity().compressed_size()];
         reader
             .read_exact(&mut bytes)
             .map_err(|err| format!("read hiding srs g1 bytes: {err}"))?;
@@ -346,8 +346,8 @@ pub fn read_srs_g1_prefix_binary<R: Read + Seek>(
     tau_g1_powers
         .try_reserve_exact(needed_g1_len)
         .map_err(|err| format!("reserve SRS G1 prefix: {err}"))?;
+    let mut bytes = vec![0u8; g1_point_size as usize];
     for _ in 0..needed_g1_len {
-        let mut bytes = vec![0u8; g1_point_size as usize];
         reader
             .read_exact(&mut bytes)
             .map_err(|err| format!("read srs g1 bytes: {err}"))?;
@@ -398,13 +398,13 @@ pub fn read_srs_prefix_binary<R: Read + Seek>(
     tau_g1_powers
         .try_reserve_exact(needed_g1_len)
         .map_err(|err| format!("reserve SRS G1 prefix: {err}"))?;
+    let mut g1_bytes = vec![0u8; g1_point_size as usize];
     for _ in 0..needed_g1_len {
-        let mut bytes = vec![0u8; g1_point_size as usize];
         reader
-            .read_exact(&mut bytes)
+            .read_exact(&mut g1_bytes)
             .map_err(|err| format!("read srs g1 bytes: {err}"))?;
         tau_g1_powers.push(
-            G1Affine::deserialize_compressed(&bytes[..])
+            G1Affine::deserialize_compressed(&g1_bytes[..])
                 .map_err(|err| format!("read srs g1 point: {err}"))?,
         );
     }
@@ -432,18 +432,17 @@ pub fn read_srs_prefix_binary<R: Read + Seek>(
         ));
     }
 
-    let g2_point_size = G2Affine::identity().compressed_size() as usize;
     let mut tau_g2_powers = Vec::new();
     tau_g2_powers
         .try_reserve_exact(needed_g2_len)
         .map_err(|err| format!("reserve SRS G2 prefix: {err}"))?;
+    let mut g2_bytes = vec![0u8; G2Affine::identity().compressed_size()];
     for _ in 0..needed_g2_len {
-        let mut bytes = vec![0u8; g2_point_size];
         reader
-            .read_exact(&mut bytes)
+            .read_exact(&mut g2_bytes)
             .map_err(|err| format!("read srs g2 bytes: {err}"))?;
         tau_g2_powers.push(
-            G2Affine::deserialize_compressed(&bytes[..])
+            G2Affine::deserialize_compressed(&g2_bytes[..])
                 .map_err(|err| format!("read srs g2 point: {err}"))?,
         );
     }

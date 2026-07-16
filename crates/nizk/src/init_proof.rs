@@ -2,7 +2,7 @@ use ark_bls12_381::Fr;
 use ark_ec::PrimeGroup;
 use ark_ff::{BigInteger, PrimeField, UniformRand, Zero};
 use common::crypto::{
-    hash_bytes, hash_to_scalar, point_g1_from_hex, point_g1_to_hex, scalar_to_hex,
+    hash_bytes, hash_to_scalar, hex_decode, point_g1_from_hex, point_g1_to_hex, scalar_to_hex,
 };
 use common::types::{
     EthereumVerkleBatchProofInput, InitProvingContext, InitReserveWitness,
@@ -10,11 +10,12 @@ use common::types::{
 };
 
 use crate::commitment::commit_balance;
-use crate::commitment::{commit_linear, derive_generator, generator_window};
+use crate::commitment::derive_generator;
 use crate::external::{ExternalProofAdapter, MockExternalProofAdapter};
 use crate::kzg::{commit_g1, open as kzg_open, Srs};
 use crate::polynomial::product_from_roots;
 use crate::zkopen::{prove_committed_opening, verify_committed_opening};
+use rand::RngCore;
 
 #[derive(Clone, Debug)]
 pub struct InitProofResult {
@@ -254,8 +255,9 @@ fn initialize_core(
     })?;
     let balance_blind = Fr::rand(&mut rng);
     let balance_commitment = commit_balance(balance_total, balance_blind);
-    let r_shape = Fr::rand(&mut rng);
-    let c_shape = commit_shape(alpha, &roots, r_shape)?;
+    let mut shape_salt = [0u8; 32];
+    rng.fill_bytes(&mut shape_salt);
+    let c_shape = sp1_host::init::shape_commitment(alpha, &roots, &shape_salt);
 
     let zeta = derive_zeta(
         &ctx.chain_id,
@@ -288,7 +290,7 @@ fn initialize_core(
         reserve_entries.len(),
         &point_g1_to_hex(&accumulator)?,
         &point_g1_to_hex(&balance_commitment)?,
-        &point_g1_to_hex(&c_shape)?,
+        &common::crypto::hex_encode(&c_shape),
         &point_g1_to_hex(&c_y)?,
         zeta,
     );
@@ -297,15 +299,6 @@ fn initialize_core(
     let balance_blind_base = derive_generator("balance-h", 0);
     let eval_value_base = derive_generator("eval-v", 0);
     let eval_blind_base = derive_generator("eval-h", 0);
-    let shape_width = roots
-        .len()
-        .checked_add(1)
-        .ok_or_else(|| "initialization shape width overflow".to_string())?;
-    let shape_value_bases = generator_window("init-shape-w", shape_width)
-        .into_iter()
-        .map(Into::into)
-        .collect::<Vec<ark_bls12_381::G1Projective>>();
-    let shape_blind_base = derive_generator("init-shape-h", 0);
     let sp1_stdin = sp1_host::init::build_init_stdin(
         &ctx.chain_id,
         &ctx.state_root,
@@ -316,16 +309,14 @@ fn initialize_core(
         product_zeta,
         balance_total,
         balance_blind,
-        r_shape,
+        shape_salt,
+        c_shape,
         r_y,
         &balance_value_base,
         &balance_blind_base,
         &eval_value_base,
         &eval_blind_base,
-        &shape_value_bases,
-        &shape_blind_base,
         &balance_commitment,
-        &c_shape,
         &c_y,
         &reserve_addresses,
         &roots,
@@ -338,9 +329,9 @@ fn initialize_core(
 
     let proof = StoredInitProof {
         scheme: if ethereum_verkle_batch_proof.is_some() {
-            "kzg-nizk-init-v5-zkopen-h2c-crs-eip6800-verkle-bound"
+            "kzg-nizk-init-v6-zkopen-salted-shape-hash-eip6800-verkle-bound"
         } else {
-            "kzg-nizk-init-v5-zkopen-h2c-crs-mock-bound"
+            "kzg-nizk-init-v6-zkopen-salted-shape-hash-mock-bound"
         }
         .to_string(),
         mode: "sp1".to_string(),
@@ -349,7 +340,7 @@ fn initialize_core(
         session_id: ctx.session_id.clone(),
         accumulator_hex: point_g1_to_hex(&accumulator)?,
         balance_commitment_hex: point_g1_to_hex(&balance_commitment)?,
-        c_shape_hex: point_g1_to_hex(&c_shape)?,
+        c_shape_hex: common::crypto::hex_encode(&c_shape),
         c_y_hex: point_g1_to_hex(&c_y)?,
         reserve_count: reserve_entries.len(),
         zeta,
@@ -475,8 +466,8 @@ pub(crate) fn verify_init_public_proof(
     if proof.srs_hash_hex != point_hash_srs(srs)? {
         return Err("SRS hash mismatch".to_string());
     }
-    if proof.scheme != "kzg-nizk-init-v5-zkopen-h2c-crs-mock-bound"
-        && proof.scheme != "kzg-nizk-init-v5-zkopen-h2c-crs-eip6800-verkle-bound"
+    if proof.scheme != "kzg-nizk-init-v6-zkopen-salted-shape-hash-mock-bound"
+        && proof.scheme != "kzg-nizk-init-v6-zkopen-salted-shape-hash-eip6800-verkle-bound"
     {
         return Err("init proof is not a production ZK proof; use verify_init_debug only for transparent local tests".to_string());
     }
@@ -491,7 +482,7 @@ pub(crate) fn verify_init_public_proof(
     }
     let accumulator = point_g1_from_hex(&proof.accumulator_hex)?;
     let balance_commitment = point_g1_from_hex(&proof.balance_commitment_hex)?;
-    let c_shape = point_g1_from_hex(&proof.c_shape_hex)?;
+    let c_shape = parse_shape_commitment(&proof.c_shape_hex)?;
     let c_y = point_g1_from_hex(&proof.c_y_hex)?;
     let expected_zeta = derive_zeta(
         &proof.chain_id,
@@ -519,22 +510,11 @@ pub(crate) fn verify_init_public_proof(
     let balance_blind_base = derive_generator("balance-h", 0);
     let eval_value_base = derive_generator("eval-v", 0);
     let eval_blind_base = derive_generator("eval-h", 0);
-    let shape_width = proof
-        .reserve_count
-        .checked_add(1)
-        .ok_or_else(|| "initialization shape width overflow".to_string())?;
-    let shape_value_bases = generator_window("init-shape-w", shape_width)
-        .into_iter()
-        .map(Into::into)
-        .collect::<Vec<ark_bls12_381::G1Projective>>();
-    let shape_blind_base = derive_generator("init-shape-h", 0);
     let expected_params_digest = sp1_host::init::commitment_params_digest(
         &balance_value_base,
         &balance_blind_base,
         &eval_value_base,
         &eval_blind_base,
-        &shape_value_bases,
-        &shape_blind_base,
     );
     if sp1_public.chain_id != proof.chain_id
         || sp1_public.state_root != proof.state_root
@@ -542,7 +522,7 @@ pub(crate) fn verify_init_public_proof(
         || sp1_public.reserve_count != proof.reserve_count
         || sp1_public.zeta_le != fr_to_le_bytes(proof.zeta)
         || !sp1_host::kzg_insert::point_matches(&sp1_public.balance_commitment, &balance_commitment)
-        || !sp1_host::kzg_insert::point_matches(&sp1_public.shape_commitment, &c_shape)
+        || sp1_public.shape_commitment != c_shape
         || !sp1_host::kzg_insert::point_matches(&sp1_public.eval_commitment, &c_y)
         || sp1_public.commitment_params_digest_hex != expected_params_digest
     {
@@ -566,22 +546,6 @@ pub(crate) fn verify_init_public_proof(
     Ok(sp1_public.uses_mock_inputs)
 }
 
-fn commit_shape(alpha: Fr, roots: &[Fr], blind: Fr) -> Result<ark_bls12_381::G1Projective, String> {
-    let width = roots
-        .len()
-        .checked_add(1)
-        .ok_or_else(|| "initialization shape width overflow".to_string())?;
-    let mut values = Vec::with_capacity(width);
-    values.push(alpha);
-    values.extend_from_slice(roots);
-    Ok(commit_linear(
-        &values,
-        "init-shape-w",
-        "init-shape-h",
-        blind,
-    ))
-}
-
 fn commit_eval(value: Fr, blind: Fr) -> ark_bls12_381::G1Projective {
     derive_generator("eval-v", 0).mul_bigint(value.into_bigint())
         + derive_generator("eval-h", 0).mul_bigint(blind.into_bigint())
@@ -600,7 +564,7 @@ fn derive_zeta(
     reserve_count: usize,
     accumulator: &ark_bls12_381::G1Projective,
     balance_commitment: &ark_bls12_381::G1Projective,
-    c_shape: &ark_bls12_381::G1Projective,
+    c_shape: &[u8; 32],
 ) -> Result<Fr, String> {
     let payload = [
         chain_id.as_bytes(),
@@ -609,10 +573,10 @@ fn derive_zeta(
         &reserve_count.to_le_bytes(),
         point_g1_to_hex(accumulator)?.as_bytes(),
         point_g1_to_hex(balance_commitment)?.as_bytes(),
-        point_g1_to_hex(c_shape)?.as_bytes(),
+        c_shape,
     ]
     .concat();
-    let mut zeta = hash_to_scalar("init-zeta", &payload);
+    let mut zeta = hash_to_scalar("init-zeta-v2-salted-shape-hash", &payload);
     if zeta.is_zero() {
         zeta = Fr::from(41u64);
     }
@@ -642,7 +606,16 @@ fn build_transcript_hex(
         scalar_to_hex(&zeta).unwrap_or_default().as_bytes(),
     ]
     .concat();
-    common::crypto::hex_encode(&hash_bytes("init-transcript", &[&payload]))
+    common::crypto::hex_encode(&hash_bytes(
+        "init-transcript-v2-salted-shape-hash",
+        &[&payload],
+    ))
+}
+
+fn parse_shape_commitment(value: &str) -> Result<[u8; 32], String> {
+    hex_decode(value)?
+        .try_into()
+        .map_err(|_| "initialization salted shape commitment must contain 32 bytes".to_string())
 }
 
 fn point_hash_srs(srs: &Srs) -> Result<String, String> {

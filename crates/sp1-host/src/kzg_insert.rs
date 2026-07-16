@@ -36,11 +36,18 @@ pub fn build_stdin(
     encoded_address: Fr,
     encoded_address_blind: Fr,
     balance_blind_delta: Fr,
+    zeta: Fr,
+    quotient_salt: [u8; 32],
+    quotient_coefficients: &[Fr],
+    quotient_commitment: [u8; 32],
+    quotient_eval: Fr,
+    quotient_eval_blind: Fr,
     eval_value_base: &G1Projective,
     eval_blind_base: &G1Projective,
     balance_value_base: &G1Projective,
     balance_blind_base: &G1Projective,
     c_x: &G1Projective,
+    c_quotient_eval: &G1Projective,
     c_balance_delta: &G1Projective,
     old_accumulator_hex: &str,
     new_accumulator_hex: &str,
@@ -60,11 +67,22 @@ pub fn build_stdin(
         encoded_address_le: fr_to_le_bytes(encoded_address),
         encoded_address_blind_le: fr_to_le_bytes(encoded_address_blind),
         balance_blind_delta_le: fr_to_le_bytes(balance_blind_delta),
+        zeta_le: fr_to_le_bytes(zeta),
+        quotient_salt,
+        quotient_coefficients_le: quotient_coefficients
+            .iter()
+            .copied()
+            .map(fr_to_le_bytes)
+            .collect(),
+        quotient_commitment,
+        quotient_eval_le: fr_to_le_bytes(quotient_eval),
+        quotient_eval_blind_le: fr_to_le_bytes(quotient_eval_blind),
         eval_value_base: point_to_io(eval_value_base),
         eval_blind_base: point_to_io(eval_blind_base),
         balance_value_base: point_to_io(balance_value_base),
         balance_blind_base: point_to_io(balance_blind_base),
         c_x: point_to_io(c_x),
+        c_quotient_eval: point_to_io(c_quotient_eval),
         c_balance_delta: point_to_io(c_balance_delta),
         old_accumulator_hex: old_accumulator_hex.to_string(),
         new_accumulator_hex: new_accumulator_hex.to_string(),
@@ -76,19 +94,24 @@ pub fn build_stdin(
     })
 }
 
+pub fn quotient_commitment(coefficients: &[Fr], salt: &[u8; 32]) -> [u8; 32] {
+    sp1_programs_common::io::insert_quotient_commitment(
+        salt,
+        coefficients.len(),
+        coefficients.iter().copied().map(fr_to_le_bytes),
+    )
+}
+
 pub fn commitment_params_digest(
     eval_value: &G1Projective,
     eval_blind: &G1Projective,
     balance_value: &G1Projective,
     balance_blind: &G1Projective,
 ) -> String {
-    let points = [eval_value, eval_blind, balance_value, balance_blind]
-        .into_iter()
-        .map(point_to_io)
-        .collect::<Vec<_>>();
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"dynamic-poa-insert-commitment-params-v1");
-    for point in points {
+    for point in [eval_value, eval_blind, balance_value, balance_blind] {
+        let point = point_to_io(point);
         hasher.update(&point.x_be);
         hasher.update(&point.y_be);
     }

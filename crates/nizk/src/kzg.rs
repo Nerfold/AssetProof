@@ -2,11 +2,11 @@ use ark_bls12_381::{g1, Bls12_381, Fr, G1Affine, G1Projective, G2Affine, G2Proje
 use ark_ec::{
     hashing::{curve_maps::wb::WBMap, map_to_curve_hasher::MapToCurveBasedHasher, HashToCurve},
     pairing::Pairing,
+    scalar_mul::ScalarMul,
     AffineRepr, CurveGroup, PrimeGroup, VariableBaseMSM,
 };
 use ark_ff::field_hashers::DefaultFieldHasher;
 use ark_ff::{PrimeField, UniformRand, Zero};
-use rayon::prelude::*;
 use sha2::Sha256;
 
 use common::crypto::hash_to_scalar;
@@ -40,8 +40,9 @@ impl Srs {
         Self::setup_development_with_g2_degree(max_degree, max_degree, seed)
     }
 
-    /// Builds a development SRS with full ordinary/hiding G1 powers and only the
-    /// G2 prefix required by the largest verifier-side polynomial.
+    /// Builds a development SRS with ordinary G1 powers and only the G2 prefix
+    /// required by the largest verifier-side polynomial. Insert quotient
+    /// binding uses a salted hash, so the default SRS has no hiding-G1 powers.
     ///
     /// A KZG commitment to a degree-`max_degree` polynomial needs all G1
     /// powers, while an opening check needs only `[1]G2` and `[tau]G2`. This
@@ -78,39 +79,55 @@ impl Srs {
             scalar_powers.push(tau_power);
             tau_power *= tau;
         }
-
         eprintln!(
-            "SRS stage 1/3: deriving {} ordinary G1 powers (parallel)",
-            scalar_powers.len()
-        );
-        let tau_g1_powers = parallel_g1_powers(G1Projective::generator(), &scalar_powers);
-        eprintln!(
-            "SRS stage 2/3: deriving {} G2 powers (parallel)",
+            "SRS stage 1/2: deriving {} G2 powers (parallel)",
             g2_powers_len
         );
         let tau_g2_powers =
             parallel_g2_powers(G2Projective::generator(), &scalar_powers[..g2_powers_len]);
-        let hiding_base = hiding_base().expect("hash-to-curve for hiding KZG base");
         eprintln!(
-            "SRS stage 3/3: deriving {} hiding G1 powers (parallel)",
+            "SRS stage 2/2: deriving {} ordinary G1 powers (parallel)",
             scalar_powers.len()
         );
-        let hiding_tau_g1_powers = parallel_g1_powers(hiding_base, &scalar_powers);
+        let tau_g1_powers = parallel_g1_powers(G1Projective::generator(), &scalar_powers);
 
         Self {
             max_degree,
             tau_g1_powers,
             tau_g2_powers,
-            hiding_tau_g1_powers,
+            hiding_tau_g1_powers: Vec::new(),
             provenance: SrsProvenance::Development,
         }
+    }
+
+    /// Legacy helper retained for isolated HPolyCom compatibility tests. New
+    /// protocol proofs and normal setup must use `setup_development` instead.
+    pub fn setup_development_with_hiding(max_degree: usize, seed: &[u8]) -> Self {
+        let mut srs = Self::setup_development(max_degree, seed);
+        let mut tau = hash_to_scalar("srs-tau", seed);
+        if tau.is_zero() {
+            tau = Fr::from(7u64);
+        }
+        let mut tau_power = Fr::from(1u64);
+        let scalar_powers = (0..=max_degree)
+            .map(|_| {
+                let current = tau_power;
+                tau_power *= tau;
+                current
+            })
+            .collect::<Vec<_>>();
+        srs.hiding_tau_g1_powers = parallel_g1_powers(
+            hiding_base().expect("hash-to-curve for legacy hiding KZG base"),
+            &scalar_powers,
+        );
+        srs
     }
 
     pub fn from_external_ceremony(
         max_degree: usize,
         tau_g1_powers: Vec<G1Affine>,
         tau_g2_powers: Vec<G2Affine>,
-        hiding_tau_g1_powers: Vec<G1Affine>,
+        _legacy_hiding_tau_g1_powers: Vec<G1Affine>,
         ceremony_id: impl Into<String>,
     ) -> Result<Self, String> {
         let ceremony_id = ceremony_id.into();
@@ -128,7 +145,7 @@ impl Srs {
             max_degree,
             tau_g1_powers,
             tau_g2_powers,
-            hiding_tau_g1_powers,
+            hiding_tau_g1_powers: Vec::new(),
             provenance: SrsProvenance::ExternalCeremony { ceremony_id },
         };
         srs.validate_complete_structure()?;
@@ -154,10 +171,6 @@ impl Srs {
         }
         if self.tau_g1_powers.iter().any(|point| point.is_zero())
             || self.tau_g2_powers.iter().any(|point| point.is_zero())
-            || self
-                .hiding_tau_g1_powers
-                .iter()
-                .any(|point| point.is_zero())
         {
             return Err("KZG SRS must not contain identity points".to_string());
         }
@@ -165,11 +178,6 @@ impl Srs {
             || self.tau_g2_powers[0] != G2Affine::generator()
         {
             return Err("KZG SRS tau^0 powers are not the standard generators".to_string());
-        }
-        if !self.hiding_tau_g1_powers.is_empty()
-            && self.hiding_tau_g1_powers[0] != hiding_base()?.into_affine()
-        {
-            return Err("HPolyCom SRS uses an unexpected independent hiding base".to_string());
         }
 
         let mut rng = rand::rngs::OsRng;
@@ -192,37 +200,39 @@ impl Srs {
                 self.tau_g1_powers[1],
             )?;
         }
-        if self.hiding_tau_g1_powers.len() > 1 {
-            validate_g1_power_sequence(
-                &self.hiding_tau_g1_powers,
-                challenge,
-                self.tau_g2_powers[0],
-                self.tau_g2_powers[1],
-                "hiding G1",
-            )?;
-        }
         Ok(())
     }
 
     pub fn validate_complete_structure(&self) -> Result<(), String> {
+        self.ensure_complete_layout()?;
+        self.validate_structure()
+    }
+
+    /// Checks only the declared vector lengths. This is suitable for loading an
+    /// already authenticated prover artifact and does not audit powers of tau.
+    pub fn ensure_complete_layout(&self) -> Result<(), String> {
         let expected_len = self
             .max_degree
             .checked_add(1)
             .ok_or_else(|| "KZG SRS max_degree overflow".to_string())?;
+        let hiding_is_supported_legacy_length =
+            self.hiding_tau_g1_powers.is_empty() || self.hiding_tau_g1_powers.len() == expected_len;
         if self.tau_g1_powers.len() != expected_len
             || self.tau_g2_powers.len() != expected_len
-            || self.hiding_tau_g1_powers.len() != expected_len
+            || !hiding_is_supported_legacy_length
         {
             return Err(format!(
-                "complete extended KZG SRS for degree {} must contain exactly {} ordinary G1, G2, and hiding G1 powers",
+                "complete KZG SRS for degree {} must contain exactly {} ordinary G1/G2 powers; legacy hiding G1 powers must be absent or complete",
                 self.max_degree, expected_len
             ));
         }
-        self.validate_structure()
+        Ok(())
     }
 
+    /// Checks ceremony provenance only. The application loader must authenticate
+    /// the SRS artifact (for example with the digest written by setup/import).
+    /// Proof verification deliberately does not audit the power sequence.
     pub fn require_external_ceremony(&self) -> Result<(), String> {
-        self.validate_structure()?;
         match &self.provenance {
             SrsProvenance::ExternalCeremony { ceremony_id } if !ceremony_id.trim().is_empty() => {
                 Ok(())
@@ -235,38 +245,12 @@ impl Srs {
     }
 }
 
-const SRS_NORMALIZATION_CHUNK: usize = 8_192;
-
 fn parallel_g1_powers(base: G1Projective, scalars: &[Fr]) -> Vec<G1Affine> {
-    scalars
-        .par_chunks(SRS_NORMALIZATION_CHUNK)
-        .map(|chunk| {
-            let projective = chunk
-                .iter()
-                .map(|scalar| base.mul_bigint(scalar.into_bigint()))
-                .collect::<Vec<_>>();
-            G1Projective::normalize_batch(&projective)
-        })
-        .collect::<Vec<_>>()
-        .into_iter()
-        .flatten()
-        .collect()
+    base.batch_mul(scalars)
 }
 
 fn parallel_g2_powers(base: G2Projective, scalars: &[Fr]) -> Vec<G2Affine> {
-    scalars
-        .par_chunks(SRS_NORMALIZATION_CHUNK)
-        .map(|chunk| {
-            let projective = chunk
-                .iter()
-                .map(|scalar| base.mul_bigint(scalar.into_bigint()))
-                .collect::<Vec<_>>();
-            G2Projective::normalize_batch(&projective)
-        })
-        .collect::<Vec<_>>()
-        .into_iter()
-        .flatten()
-        .collect()
+    base.batch_mul(scalars)
 }
 
 fn challenge_powers(challenge: Fr, len: usize) -> Vec<Fr> {

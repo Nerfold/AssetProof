@@ -64,6 +64,16 @@ impl Polynomial {
         Self::from_coeffs(coeffs)
     }
 
+    /// Computes `self + scale * other` in one allocation.
+    pub fn add_scaled(&self, other: &Self, scale: Fr) -> Self {
+        let mut coeffs = self.coeffs.clone();
+        coeffs.resize(self.coeffs.len().max(other.coeffs.len()), Fr::zero());
+        for (slot, value) in coeffs.iter_mut().zip(other.coeffs.iter()) {
+            *slot += *value * scale;
+        }
+        Self::from_coeffs(coeffs)
+    }
+
     pub fn sub(&self, other: &Self) -> Self {
         let mut coeffs = vec![Fr::zero(); self.coeffs.len().max(other.coeffs.len())];
         for (slot, value) in coeffs.iter_mut().zip(self.coeffs.iter()) {
@@ -77,6 +87,47 @@ impl Polynomial {
 
     pub fn mul_scalar(&self, scalar: Fr) -> Self {
         Self::from_coeffs(self.coeffs.iter().map(|value| *value * scalar).collect())
+    }
+
+    /// Computes `scale * self * (X - root)` without constructing the linear
+    /// polynomial or an intermediate product.
+    pub fn mul_linear_scaled(&self, root: Fr, scale: Fr) -> Self {
+        if self.coeffs.is_empty() || scale.is_zero() {
+            return Self::zero();
+        }
+        let mut coeffs = vec![Fr::zero(); self.coeffs.len() + 1];
+        for (index, value) in self.coeffs.iter().enumerate() {
+            let scaled = *value * scale;
+            coeffs[index] -= scaled * root;
+            coeffs[index + 1] += scaled;
+        }
+        Self::from_coeffs(coeffs)
+    }
+
+    /// Synthetic division of `(self - value) / (X - point)`. The caller
+    /// normally supplies `value = self(point)`; the remainder check protects
+    /// against accidental misuse without allocating the subtracted polynomial.
+    pub fn quotient_at(&self, point: Fr, value: Fr) -> Result<Self, String> {
+        if self.coeffs.len() <= 1 {
+            let remainder = self.coeffs.first().copied().unwrap_or_else(Fr::zero) - value;
+            return if remainder.is_zero() {
+                Ok(Self::zero())
+            } else {
+                Err("evaluation does not match polynomial at opening point".to_string())
+            };
+        }
+
+        let mut quotient = vec![Fr::zero(); self.coeffs.len() - 1];
+        let last = quotient.len() - 1;
+        quotient[last] = *self.coeffs.last().expect("non-constant polynomial");
+        for index in (1..=last).rev() {
+            quotient[index - 1] = self.coeffs[index] + point * quotient[index];
+        }
+        let remainder = self.coeffs[0] - value + point * quotient[0];
+        if !remainder.is_zero() {
+            return Err("evaluation does not match polynomial at opening point".to_string());
+        }
+        Ok(Self::from_coeffs(quotient))
     }
 
     pub fn mul(&self, other: &Self) -> Self {
@@ -106,6 +157,10 @@ impl Polynomial {
 
     pub fn as_dense(&self) -> DensePolynomial<Fr> {
         DensePolynomial::from_coefficients_vec(self.coeffs.clone())
+    }
+
+    pub fn into_dense(self) -> DensePolynomial<Fr> {
+        DensePolynomial::from_coefficients_vec(self.coeffs)
     }
 
     pub fn from_dense(poly: DensePolynomial<Fr>) -> Self {
@@ -170,6 +225,27 @@ impl QueryContext {
             });
         }
         let dense = poly.as_dense();
+        self.evaluate_dense_with_quotient(dense)
+    }
+
+    pub fn evaluate_with_quotient_owned(
+        &self,
+        poly: Polynomial,
+    ) -> Result<EvaluationWithQuotient, String> {
+        if self.points.is_empty() {
+            return Ok(EvaluationWithQuotient {
+                values: Vec::new(),
+                remainder: Polynomial::zero(),
+                quotient: poly,
+            });
+        }
+        self.evaluate_dense_with_quotient(poly.into_dense())
+    }
+
+    fn evaluate_dense_with_quotient(
+        &self,
+        dense: DensePolynomial<Fr>,
+    ) -> Result<EvaluationWithQuotient, String> {
         let (quotient, remainder) = fast_divide_with_q_and_r(&dense, &self.tree.poly)?;
         let values = evaluate_on_tree(&remainder, &self.tree)?;
         Ok(EvaluationWithQuotient {

@@ -1296,7 +1296,7 @@ mod init_privacy_tests {
     #[test]
     fn public_init_proof_encoding_omits_private_openings() {
         let proof = StoredInitProof {
-            scheme: "kzg-nizk-init-v5-zkopen-h2c-crs-mock-bound".to_string(),
+            scheme: "kzg-nizk-init-v6-zkopen-salted-shape-hash-mock-bound".to_string(),
             mode: "sp1".to_string(),
             chain_id: "0x1".to_string(),
             state_root: "root".to_string(),

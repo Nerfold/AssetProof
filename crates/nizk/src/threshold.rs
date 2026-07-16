@@ -77,11 +77,21 @@ pub fn verify_threshold(
     statement: &ThresholdStatement,
     proof: &ThresholdProof,
 ) -> Result<(), String> {
-    ensure_scheme(proof)?;
+    verify_threshold_encoded(statement, &proof.scheme, &proof.proof_hex)
+}
+
+/// Verifies an encoded threshold proof without copying its (potentially large)
+/// proof string into a temporary `ThresholdProof`.
+pub fn verify_threshold_encoded(
+    statement: &ThresholdStatement,
+    scheme: &str,
+    proof_hex: &str,
+) -> Result<(), String> {
+    ensure_scheme_name(scheme)?;
     let slack_commitment = public_threshold_difference_commitment(statement)?;
     verify_bounded_i128(
         &slack_commitment,
-        &proof.proof_hex,
+        proof_hex,
         &public_threshold_binding(statement),
     )
 }
@@ -201,7 +211,11 @@ fn bounded_range_binding(statement_binding: &[u8], side: &[u8]) -> [u8; 32] {
 }
 
 fn ensure_scheme(proof: &ThresholdProof) -> Result<(), String> {
-    if proof.scheme != THRESHOLD_PROOF_SCHEME {
+    ensure_scheme_name(&proof.scheme)
+}
+
+fn ensure_scheme_name(scheme: &str) -> Result<(), String> {
+    if scheme != THRESHOLD_PROOF_SCHEME {
         return Err("unexpected threshold proof scheme".to_string());
     }
     Ok(())

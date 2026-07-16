@@ -9,9 +9,12 @@ use sha3::{Digest, Keccak256};
 use sp1_curves::params::FieldParameters;
 use sp1_curves::weierstrass::bls12_381::{Bls12381, Bls12381BaseField};
 use sp1_curves::AffinePoint;
+use sp1_programs_common::bls12_381_scalar::{
+    add_mod, from_le_bytes, mul_by_montgomery, to_le_bytes, to_montgomery,
+};
 use sp1_programs_common::io::{
-    Hash, Sp1ChainBalanceProof, Sp1G1Affine, Sp1KzgInsertPublicValues, Sp1KzgInsertStdin,
-    Sp1OwnershipWitness,
+    insert_quotient_commitment, Hash, Sp1ChainBalanceProof, Sp1G1Affine, Sp1KzgInsertPublicValues,
+    Sp1KzgInsertStdin, Sp1OwnershipWitness,
 };
 use sp1_zkvm::entrypoint;
 use verkle_spec::Hasher as VerkleKeyHasher;
@@ -64,6 +67,50 @@ fn verify_insert(input: Sp1KzgInsertStdin) -> Sp1KzgInsertPublicValues {
         &BigUint::from_bytes_le(&input.balance_blind_delta_le),
     );
     assert_eq!(point_to_io(&c_x), input.c_x, "C_x opening mismatch");
+
+    assert_eq!(
+        input.quotient_coefficients_le.len(),
+        input.reserve_count_before,
+        "insert quotient must have exactly n coefficients"
+    );
+    assert_eq!(
+        insert_quotient_commitment(
+            &input.quotient_salt,
+            input.quotient_coefficients_le.len(),
+            input.quotient_coefficients_le.iter().copied(),
+        ),
+        input.quotient_commitment,
+        "insert salted quotient commitment mismatch"
+    );
+    let zeta = from_le_bytes(input.zeta_le);
+    let zeta_montgomery = to_montgomery(zeta);
+    let quotient_eval =
+        input
+            .quotient_coefficients_le
+            .iter()
+            .rev()
+            .fold([0u64; 4], |acc, coefficient| {
+                add_mod(
+                    mul_by_montgomery(acc, zeta_montgomery),
+                    from_le_bytes(*coefficient),
+                )
+            });
+    assert_eq!(
+        to_le_bytes(quotient_eval),
+        input.quotient_eval_le,
+        "insert quotient evaluation mismatch"
+    );
+    let c_quotient_eval = commit_two(
+        &input.eval_value_base,
+        &BigUint::from_bytes_le(&input.quotient_eval_le),
+        &input.eval_blind_base,
+        &BigUint::from_bytes_le(&input.quotient_eval_blind_le),
+    );
+    assert_eq!(
+        point_to_io(&c_quotient_eval),
+        input.c_quotient_eval,
+        "insert quotient evaluation commitment opening mismatch"
+    );
     assert_eq!(
         point_to_io(&c_balance_delta),
         input.c_balance_delta,
@@ -79,6 +126,7 @@ fn verify_insert(input: Sp1KzgInsertStdin) -> Sp1KzgInsertPublicValues {
     Sp1KzgInsertPublicValues {
         chain_id: input.chain_id,
         state_root: input.state_root,
+        zeta_le: input.zeta_le,
         commitment_params_digest_hex: commitment_params_digest(
             &input.eval_value_base,
             &input.eval_blind_base,
@@ -87,6 +135,8 @@ fn verify_insert(input: Sp1KzgInsertStdin) -> Sp1KzgInsertPublicValues {
         ),
         uses_mock_inputs,
         c_x: input.c_x,
+        quotient_commitment: input.quotient_commitment,
+        c_quotient_eval: input.c_quotient_eval,
         c_balance_delta: input.c_balance_delta,
         old_accumulator_hex: input.old_accumulator_hex,
         new_accumulator_hex: input.new_accumulator_hex,

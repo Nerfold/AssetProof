@@ -4936,6 +4936,7 @@ dependencies = [
 name = "sp1-programs-common"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "serde",
  "sha3",
  "slop-algebra",

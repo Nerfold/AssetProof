@@ -89,16 +89,14 @@ pub fn build_init_stdin(
     product_zeta: Fr,
     balance_total: i128,
     balance_blind: Fr,
-    shape_blind: Fr,
+    shape_salt: [u8; 32],
+    shape_commitment: [u8; 32],
     eval_blind: Fr,
     balance_value_base: &G1Projective,
     balance_blind_base: &G1Projective,
     eval_value_base: &G1Projective,
     eval_blind_base: &G1Projective,
-    shape_value_bases: &[G1Projective],
-    shape_blind_base: &G1Projective,
     balance_commitment: &G1Projective,
-    shape_commitment: &G1Projective,
     eval_commitment: &G1Projective,
     addresses: &[String],
     encoded_addresses: &[Fr],
@@ -138,27 +136,20 @@ pub fn build_init_stdin(
         product_zeta_le: fr_to_le_bytes(product_zeta),
         balance_total,
         balance_blind_le: fr_to_le_bytes(balance_blind),
-        shape_blind_le: fr_to_le_bytes(shape_blind),
+        shape_salt,
         eval_blind_le: fr_to_le_bytes(eval_blind),
         balance_value_base: crate::kzg_insert::point_to_io(balance_value_base),
         balance_blind_base: crate::kzg_insert::point_to_io(balance_blind_base),
         eval_value_base: crate::kzg_insert::point_to_io(eval_value_base),
         eval_blind_base: crate::kzg_insert::point_to_io(eval_blind_base),
-        shape_value_bases: shape_value_bases
-            .iter()
-            .map(crate::kzg_insert::point_to_io)
-            .collect(),
-        shape_blind_base: crate::kzg_insert::point_to_io(shape_blind_base),
         balance_commitment: crate::kzg_insert::point_to_io(balance_commitment),
-        shape_commitment: crate::kzg_insert::point_to_io(shape_commitment),
+        shape_commitment,
         eval_commitment: crate::kzg_insert::point_to_io(eval_commitment),
         commitment_params_digest_hex: commitment_params_digest(
             balance_value_base,
             balance_blind_base,
             eval_value_base,
             eval_blind_base,
-            shape_value_bases,
-            shape_blind_base,
         ),
         ethereum_verkle_batch_proof: ethereum_verkle_batch_proof.map(|proof| {
             Sp1EthereumVerkleBatchProof {
@@ -174,32 +165,27 @@ pub fn commitment_params_digest(
     balance_blind: &G1Projective,
     eval_value: &G1Projective,
     eval_blind: &G1Projective,
-    shape_values: &[G1Projective],
-    shape_blind: &G1Projective,
 ) -> String {
     let points = [balance_value, balance_blind, eval_value, eval_blind]
         .into_iter()
         .map(crate::kzg_insert::point_to_io)
         .collect::<Vec<Sp1G1Affine>>();
-    let shape_values = shape_values
-        .iter()
-        .map(crate::kzg_insert::point_to_io)
-        .collect::<Vec<_>>();
-    let shape_blind = crate::kzg_insert::point_to_io(shape_blind);
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"dynamic-poa-init-commitment-params-v1");
+    hasher.update(b"dynamic-poa-init-commitment-params-v2-salted-shape-hash");
     for point in &points {
         hasher.update(&point.x_be);
         hasher.update(&point.y_be);
     }
-    hasher.update(&(shape_values.len() as u64).to_le_bytes());
-    for point in &shape_values {
-        hasher.update(&point.x_be);
-        hasher.update(&point.y_be);
-    }
-    hasher.update(&shape_blind.x_be);
-    hasher.update(&shape_blind.y_be);
     hex_encode(hasher.finalize().as_bytes())
+}
+
+pub fn shape_commitment(alpha: Fr, roots: &[Fr], salt: &[u8; 32]) -> [u8; 32] {
+    sp1_programs_common::io::init_shape_commitment(
+        salt,
+        &fr_to_le_bytes(alpha),
+        roots.len(),
+        roots.iter().copied().map(fr_to_le_bytes),
+    )
 }
 
 pub(crate) fn convert_ownership(

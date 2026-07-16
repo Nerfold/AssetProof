@@ -1,12 +1,12 @@
 use ark_bls12_381::{Fr, G1Projective, G2Projective};
 use ark_ec::PrimeGroup;
 use ark_ff::{One, PrimeField, UniformRand, Zero};
-use std::collections::HashSet;
 use std::env;
 use std::thread;
 use std::time::Instant;
 
-use common::crypto::{hash_bytes, hex_encode, point_g1_from_hex, point_g1_to_hex, scalar_to_hex};
+use common::crypto::{hex_encode, point_g1_from_hex, point_g1_to_hex, scalar_to_hex};
+use common::encoding::encode_address;
 use common::types::{Delta, StoredProof, StoredState};
 
 use crate::bp::{commit_membership_vector, prove_optimized_zero_test_logic, prove_projection_ipa};
@@ -50,9 +50,6 @@ pub fn apply_update(
     if state.reserve_addresses.len() > srs.max_degree {
         return Err("stored reserve set exceeds the SRS degree bound".to_string());
     }
-    if state.reserve_balances.iter().any(|balance| *balance < 0) {
-        return Err("stored reserve balances must be non-negative".to_string());
-    }
     if deltas.is_empty() {
         return apply_empty_update(state, new_state_root);
     }
@@ -70,7 +67,6 @@ pub fn apply_update(
     }
     let query_context_start = Instant::now();
     let x_values = encode_delta_points(deltas)?;
-    ensure_distinct(&x_values)?;
     let query_ctx = QueryContext::new(&x_values)?;
     if emit_timing {
         eprintln!(
@@ -79,7 +75,7 @@ pub fn apply_update(
         );
     }
     let evaluation_start = Instant::now();
-    let evaluation = query_ctx.evaluate_with_quotient(&polynomial)?;
+    let evaluation = query_ctx.evaluate_with_quotient_owned(polynomial)?;
     if emit_timing {
         eprintln!(
             "stage=update_fft_divide_and_evaluate millis={}",
@@ -103,11 +99,11 @@ pub fn apply_update(
 
     let kzg_start = Instant::now();
     let kzg_polynomial_start = Instant::now();
-    let z_poly = query_ctx.z_poly().clone();
+    let z_poly = query_ctx.z_poly();
     let i_y = evaluation.remainder;
     let mut rng = rand::rngs::OsRng;
     let rho_y = Fr::rand(&mut rng);
-    let j_y = i_y.add(&z_poly.mul_scalar(rho_y));
+    let j_y = i_y.add_scaled(z_poly, rho_y);
     let mut quotient = evaluation.quotient;
     quotient.sub_constant_assign(rho_y);
     if emit_timing {
@@ -141,26 +137,9 @@ pub fn apply_update(
         return Err("updated balance total is negative".to_string());
     }
     let next_balance_blind = state.balance_blind + r_d;
-    if old_balance_commitment != commit_balance(state.balance_total, state.balance_blind) {
-        return Err("stored balance opening does not match its commitment".to_string());
-    }
-
-    let reserve_roots = state
-        .reserve_addresses
-        .iter()
-        .map(|address| common::encoding::encode_address(address))
-        .collect::<Result<Vec<_>, _>>()?;
-    if reserve_roots
-        .windows(2)
-        .any(|pair| pair[0].into_bigint() >= pair[1].into_bigint())
-    {
-        return Err("stored reserve addresses are not in canonical strict order".to_string());
-    }
     let mut next_reserve_balances = state.reserve_balances.clone();
     for (point, delta) in witness.x_values.iter().zip(deltas.iter()) {
-        if let Ok(index) = reserve_roots
-            .binary_search_by(|candidate| candidate.into_bigint().cmp(&point.into_bigint()))
-        {
+        if let Some(index) = find_encoded_address(&state.reserve_addresses, *point)? {
             let next_balance = next_reserve_balances[index]
                 .checked_add(delta.delta)
                 .ok_or_else(|| "updated reserve balance overflowed i128".to_string())?;
@@ -172,15 +151,6 @@ pub fn apply_update(
             }
             next_reserve_balances[index] = next_balance;
         }
-    }
-    let recomputed_total = next_reserve_balances
-        .iter()
-        .try_fold(0i128, |sum, balance| {
-            sum.checked_add(*balance)
-                .ok_or_else(|| "updated reserve balance total overflowed i128".to_string())
-        })?;
-    if recomputed_total != next_balance_total {
-        return Err("updated private reserve balances do not match aggregate balance".to_string());
     }
 
     let next_state = StoredState {
@@ -350,7 +320,7 @@ pub fn apply_update(
 
     #[cfg(debug_assertions)]
     if env::var("POA_DEBUG_INTERNAL_VERIFY").ok().as_deref() == Some("1") {
-        let z_commit_g2 = crate::kzg::commit_g2(srs, &z_poly)?;
+        let z_commit_g2 = crate::kzg::commit_g2(srs, z_poly)?;
         verify_internal(
             srs,
             state,
@@ -358,7 +328,7 @@ pub fn apply_update(
             &next_state,
             &proof,
             &witness,
-            &z_poly,
+            z_poly,
             &z_commit_g2,
             &j_y,
             rho_y,
@@ -373,32 +343,6 @@ pub fn apply_update(
 }
 
 fn apply_empty_update(state: &StoredState, new_state_root: &str) -> Result<UpdateResult, String> {
-    let balance_commitment = point_g1_from_hex(&state.balance_commitment_hex)?;
-    if balance_commitment != commit_balance(state.balance_total, state.balance_blind) {
-        return Err("stored balance opening does not match its commitment".to_string());
-    }
-    let balance_total = state
-        .reserve_balances
-        .iter()
-        .try_fold(0i128, |sum, balance| {
-            sum.checked_add(*balance)
-                .ok_or_else(|| "stored reserve balance total overflowed i128".to_string())
-        })?;
-    if balance_total != state.balance_total {
-        return Err("stored reserve balances do not match aggregate balance".to_string());
-    }
-    let reserve_roots = state
-        .reserve_addresses
-        .iter()
-        .map(|address| common::encoding::encode_address(address))
-        .collect::<Result<Vec<_>, _>>()?;
-    if reserve_roots
-        .windows(2)
-        .any(|pair| pair[0].into_bigint() >= pair[1].into_bigint())
-    {
-        return Err("stored reserve addresses are not in canonical strict order".to_string());
-    }
-
     let delta_list_commitment_hex = delta_list_commitment(&[]);
     let theta = Fr::zero();
     let transcript_hex = build_transcript_hex(
@@ -512,18 +456,6 @@ fn verify_internal(
     Ok(())
 }
 
-fn ensure_distinct(points: &[Fr]) -> Result<(), String> {
-    let mut seen = HashSet::with_capacity(points.len());
-    for point in points {
-        if !seen
-            .insert(scalar_to_hex(point).map_err(|err| format!("distinct check encode: {err}"))?)
-        {
-            return Err("duplicate encoded query point".to_string());
-        }
-    }
-    Ok(())
-}
-
 pub(crate) fn build_transcript_hex(
     old_root: &str,
     new_root: &str,
@@ -538,7 +470,7 @@ pub(crate) fn build_transcript_hex(
     theta_opening_proof_hex: &str,
 ) -> String {
     let theta_hex = scalar_to_hex(&theta).unwrap_or_else(|_| "invalid-theta".to_string());
-    let payload = [
+    let fields = [
         old_root,
         new_root,
         accumulator_hex,
@@ -550,22 +482,40 @@ pub(crate) fn build_transcript_hex(
         c_v_hex,
         &theta_hex,
         theta_opening_proof_hex,
-    ]
-    .join("|");
-    common::crypto::hex_encode(blake3::hash(payload.as_bytes()).as_bytes())
+    ];
+    let mut hasher = blake3::Hasher::new();
+    for (index, field) in fields.iter().enumerate() {
+        if index != 0 {
+            hasher.update(b"|");
+        }
+        hasher.update(field.as_bytes());
+    }
+    common::crypto::hex_encode(hasher.finalize().as_bytes())
 }
 
 pub fn delta_list_commitment(deltas: &[Delta]) -> String {
-    let mut chunks = Vec::new();
-    let len = deltas.len().to_string();
-    chunks.push(len.into_bytes());
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"dynamic-poa-canonical-delta-list");
+    hasher.update(deltas.len().to_string().as_bytes());
     for delta in deltas {
-        chunks.push(delta.address.as_bytes().to_vec());
-        chunks.push(delta.delta.to_le_bytes().to_vec());
+        hasher.update(delta.address.as_bytes());
+        hasher.update(&delta.delta.to_le_bytes());
     }
-    let refs = chunks
-        .iter()
-        .map(|chunk| chunk.as_slice())
-        .collect::<Vec<_>>();
-    hex_encode(&hash_bytes("dynamic-poa-canonical-delta-list", &refs))
+    hex_encode(hasher.finalize().as_bytes())
+}
+
+fn find_encoded_address(addresses: &[String], target: Fr) -> Result<Option<usize>, String> {
+    let target = target.into_bigint();
+    let mut left = 0usize;
+    let mut right = addresses.len();
+    while left < right {
+        let middle = left + (right - left) / 2;
+        let candidate = encode_address(&addresses[middle])?.into_bigint();
+        match candidate.cmp(&target) {
+            std::cmp::Ordering::Less => left = middle + 1,
+            std::cmp::Ordering::Greater => right = middle,
+            std::cmp::Ordering::Equal => return Ok(Some(middle)),
+        }
+    }
+    Ok(None)
 }

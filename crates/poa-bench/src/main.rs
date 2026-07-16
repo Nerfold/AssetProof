@@ -24,7 +24,7 @@ use nizk_fixed_set::verifier::{
 
 mod ethereum_fixture;
 
-const FIXTURE_VERSION: &str = "ethereum-eip6800-verkle-v2";
+const FIXTURE_VERSION: &str = "ethereum-eip6800-verkle-v3-master";
 
 fn main() {
     if let Err(err) = run() {
@@ -40,6 +40,7 @@ struct Config {
     output_dir: PathBuf,
     srs_dir: PathBuf,
     fixture_dir: PathBuf,
+    master_n: usize,
     n_sizes: Vec<usize>,
     m_sizes: Vec<usize>,
     samples: usize,
@@ -117,6 +118,7 @@ fn run() -> Result<(), String> {
     let mut summaries = Vec::new();
 
     let (max_n, srs_degree, max_g2_degree) = benchmark_srs_spec(&config)?;
+    let master_dir = master_fixture_dir(&config.fixture_dir, config.master_n);
     let prepared_srs_path = srs_path(&config.srs_dir, srs_degree, max_g2_degree);
     if config.require_existing {
         require_existing(&prepared_srs_path, "benchmark SRS")?;
@@ -143,19 +145,33 @@ fn run() -> Result<(), String> {
             ));
         }
 
-        let reserve_path = fixture_path(&config.fixture_dir, n);
+        let reserve_path = ethereum_fixture::init_proof_path(&master_dir, n);
         if config.require_existing {
             require_existing(&reserve_path, "Ethereum Verkle initialization fixture")?;
+            require_existing(
+                &ethereum_fixture::master_accounts_path(&master_dir),
+                "master Ethereum account store",
+            )?;
+            require_existing(
+                &ethereum_fixture::insert_proof_path(&master_dir),
+                "master Ethereum insertion proof",
+            )?;
         }
-        let (fixture, fixture_time, reserve_load, fixture_reused) =
-            ethereum_fixture::ensure_init_fixture(&reserve_path, n)?;
+        let reserve_load_start = Instant::now();
+        let fixture = ethereum_fixture::load_init_fixture(
+            &master_dir,
+            config.master_n,
+            n,
+            ethereum_fixture::FixtureValidation::None,
+        )?;
+        let reserve_load = reserve_load_start.elapsed();
         loads.push(LoadRecord {
             n,
             m: 0,
             phase: "ethereum_state_fixture_generation",
-            elapsed: fixture_time,
-            bytes: file_len(&reserve_path)?,
-            reused: fixture_reused,
+            elapsed: Duration::ZERO,
+            bytes: ethereum_fixture::fixture_persisted_bytes(&master_dir, n)?,
+            reused: true,
         });
         if fixture.witnesses.len() != n {
             return Err(format!(
@@ -167,9 +183,9 @@ fn run() -> Result<(), String> {
         loads.push(LoadRecord {
             n,
             m: 0,
-            phase: "ethereum_state_fixture_load_and_key_validation",
+            phase: "ethereum_state_fixture_load",
             elapsed: reserve_load,
-            bytes: file_len(&reserve_path)?,
+            bytes: ethereum_fixture::fixture_persisted_bytes(&master_dir, n)?,
             reused: true,
         });
 
@@ -202,7 +218,7 @@ fn run() -> Result<(), String> {
             if m > n {
                 return Err(format!("m={m} cannot exceed n={n}"));
             }
-            let delta_path = delta_fixture_path(&config.fixture_dir, n, m);
+            let delta_path = ethereum_fixture::delta_fixture_path(&master_dir, n, m);
             if config.require_existing {
                 require_existing(&delta_path, "Ethereum Verkle transition fixture")?;
             }
@@ -289,23 +305,61 @@ fn prepare_benchmark_inputs(config: &Config) -> Result<(), String> {
     manifest.push(format!("srs_max_g2_degree={max_g2_degree}"));
     manifest.push(format!("srs_bytes={}", file_len(&prepared_srs_path)?));
 
+    let master_dir = master_fixture_dir(&config.fixture_dir, config.master_n);
+    println!(
+        "\n== generating one shared master Verkle tree master_n={} ==",
+        config.master_n
+    );
+    let (master_generation, master_reused) = ethereum_fixture::ensure_master_fixture(
+        &master_dir,
+        config.master_n,
+        &config.n_sizes,
+        &config.m_sizes,
+    )?;
+    println!(
+        "   master tree: generation={} accounts={} reused={master_reused}",
+        human_duration(master_generation),
+        human_bytes(file_len(&ethereum_fixture::master_accounts_path(&master_dir))? as usize),
+    );
+    manifest.push(format!("master.max_n={}", config.master_n));
+    manifest.push(format!("master.dir={}", master_dir.display()));
+    manifest.push(format!(
+        "master.accounts_path={}",
+        ethereum_fixture::master_accounts_path(&master_dir).display()
+    ));
+    manifest.push(format!(
+        "master.accounts_bytes={}",
+        file_len(&ethereum_fixture::master_accounts_path(&master_dir))?
+    ));
+
+    let largest_n = config.n_sizes.iter().copied().max().unwrap_or_default();
     for &n in &config.n_sizes {
-        println!("\n== generating and validating n={n} ==");
+        println!("\n== loading persisted master-tree prefix n={n} ==");
         manifest.push(format!("n.{n}.srs_path={}", prepared_srs_path.display()));
         manifest.push(format!("n.{n}.srs_max_degree={srs_degree}"));
 
-        let init_path = fixture_path(&config.fixture_dir, n);
-        let (fixture, generation, load, reused) =
-            ethereum_fixture::ensure_init_fixture(&init_path, n)?;
+        let init_path = ethereum_fixture::init_proof_path(&master_dir, n);
+        let load_start = Instant::now();
+        let validation = if n == largest_n {
+            ethereum_fixture::FixtureValidation::Full
+        } else {
+            ethereum_fixture::FixtureValidation::Proofs
+        };
+        let fixture =
+            ethereum_fixture::load_init_fixture(&master_dir, config.master_n, n, validation)?;
+        let load = load_start.elapsed();
         println!(
-            "   init: generation={} validation={} bytes={} reused={reused}",
-            human_duration(generation),
+            "   init: generation={} validation={} bytes={} reused=true",
+            human_duration(Duration::ZERO),
             human_duration(load),
-            human_bytes(file_len(&init_path)? as usize),
+            human_bytes(ethereum_fixture::fixture_persisted_bytes(&master_dir, n)? as usize),
         );
         manifest.push(format!("n.{n}.state_root={}", fixture.state_root));
         manifest.push(format!("n.{n}.init_path={}", init_path.display()));
-        manifest.push(format!("n.{n}.init_bytes={}", file_len(&init_path)?));
+        manifest.push(format!(
+            "n.{n}.input_bytes={}",
+            ethereum_fixture::fixture_persisted_bytes(&master_dir, n)?
+        ));
         manifest.push(format!(
             "n.{n}.init_verkle_proof_bytes={}",
             fixture.verkle_proof.proof.len()
@@ -319,7 +373,7 @@ fn prepare_benchmark_inputs(config: &Config) -> Result<(), String> {
             if m > n {
                 return Err(format!("m={m} cannot exceed n={n}"));
             }
-            let delta_path = delta_fixture_path(&config.fixture_dir, n, m);
+            let delta_path = ethereum_fixture::delta_fixture_path(&master_dir, n, m);
             let (_, new_root, generation, validation, reused) =
                 ethereum_fixture::ensure_delta_fixture(&delta_path, &fixture, m)?;
             println!(
@@ -345,27 +399,14 @@ fn prepare_benchmark_inputs(config: &Config) -> Result<(), String> {
     Ok(())
 }
 
-fn fixture_path(fixture_dir: &Path, n: usize) -> PathBuf {
+fn master_fixture_dir(fixture_dir: &Path, max_n: usize) -> PathBuf {
     fixture_dir
-        .join(format!("n_{n}"))
+        .join(format!("master_n_{max_n}"))
         .join(FIXTURE_VERSION)
-        .join("ethereum-init.bin")
-}
-
-fn delta_fixture_path(fixture_dir: &Path, n: usize, m: usize) -> PathBuf {
-    fixture_dir
-        .join(format!("n_{n}"))
-        .join(FIXTURE_VERSION)
-        .join(format!("deltas_m_{m}.csv"))
 }
 
 fn benchmark_srs_spec(config: &Config) -> Result<(usize, usize, usize), String> {
-    let max_n = config
-        .n_sizes
-        .iter()
-        .copied()
-        .max()
-        .ok_or_else(|| "n size list must not be empty".to_string())?;
+    let max_n = config.master_n;
     let max_degree = max_n
         .checked_add(1)
         .ok_or_else(|| format!("n={max_n} cannot be represented as an SRS degree"))?;
@@ -399,19 +440,19 @@ fn ensure_initialized_state_matches_fixture(
     state: &StoredState,
     fixture: &ethereum_fixture::EthereumInitFixture,
 ) -> Result<(), String> {
-    let expected_addresses = fixture
-        .witnesses
-        .iter()
-        .map(|witness| witness.address.clone())
-        .collect::<Vec<_>>();
-    let expected_balances = fixture
-        .witnesses
-        .iter()
-        .map(|witness| witness.balance)
-        .collect::<Vec<_>>();
     if state.state_root != fixture.state_root
-        || state.reserve_addresses != expected_addresses
-        || state.reserve_balances != expected_balances
+        || state.reserve_addresses.len() != fixture.witnesses.len()
+        || state.reserve_balances.len() != fixture.witnesses.len()
+        || state
+            .reserve_addresses
+            .iter()
+            .zip(&fixture.witnesses)
+            .any(|(actual, expected)| actual != &expected.address)
+        || state
+            .reserve_balances
+            .iter()
+            .zip(&fixture.witnesses)
+            .any(|(actual, expected)| *actual != expected.balance)
     {
         return Err(
             "initialization output does not preserve the canonical Verkle fixture state"
@@ -433,6 +474,13 @@ fn benchmark_init(
     raw: &mut Vec<SampleRecord>,
 ) -> Result<(StoredState, SummaryRecord), String> {
     println!("-- initialization n={n}");
+    let policy = ChainPolicy::development(
+        ethereum_fixture::CHAIN_ID,
+        [state_root.to_string()],
+        None,
+        None,
+        srs.max_degree,
+    )?;
     for warmup in 0..config.warmup {
         println!("   warmup {}/{}", warmup + 1, config.warmup);
         let ctx = InitProvingContext {
@@ -446,13 +494,6 @@ fn benchmark_init(
             verkle_proof,
             srs,
             &Sp1NativeProofAdapter,
-        )?;
-        let policy = ChainPolicy::development(
-            ethereum_fixture::CHAIN_ID,
-            [result.state.state_root.clone()],
-            None,
-            None,
-            srs.max_degree,
         )?;
         verify_init_with_policy(srs, &result.state.public_state(), &result.proof, &policy)?;
         black_box(result);
@@ -479,13 +520,6 @@ fn benchmark_init(
         let prover = prove_start.elapsed();
 
         let verify_start = Instant::now();
-        let policy = ChainPolicy::development(
-            ethereum_fixture::CHAIN_ID,
-            [result.state.state_root.clone()],
-            None,
-            None,
-            srs.max_degree,
-        )?;
         verify_init_with_policy(srs, &result.state.public_state(), &result.proof, &policy)?;
         let verifier = verify_start.elapsed();
 
@@ -732,10 +766,8 @@ fn prepare_srs(
 ) -> Result<(Srs, Duration, Vec<LoadRecord>), String> {
     let path = srs_path(srs_dir, degree, max_g2_degree);
     let mut records = Vec::new();
-    if !path.exists() {
-        println!(
-            "   generating shared SRS: G1/hiding-G1 degree={degree}, G2 degree={max_g2_degree}"
-        );
+    let generated_srs = if !path.exists() {
+        println!("   generating shared SRS: G1 degree={degree}, G2 degree={max_g2_degree}");
         let setup_start = Instant::now();
         let srs = Srs::setup_development_with_g2_degree(
             degree,
@@ -776,27 +808,66 @@ fn prepare_srs(
             bytes: file_len(&path)?,
             reused: false,
         });
-        drop(srs);
-    }
+        Some(srs)
+    } else {
+        None
+    };
 
-    let load_start = Instant::now();
-    let (max_degree, tau_g1_powers, tau_g2_powers, hiding_tau_g1_powers) = read_srs(&path)?;
-    let load_elapsed = load_start.elapsed();
+    let generated_now = generated_srs.is_some();
+    let (srs, load_elapsed, legacy_hiding_tau_g1_powers) = if let Some(srs) = generated_srs {
+        (srs, Duration::ZERO, Vec::new())
+    } else {
+        let load_start = Instant::now();
+        let (max_degree, tau_g1_powers, tau_g2_powers, legacy_hiding_tau_g1_powers) =
+            read_srs(&path)?;
+        (
+            Srs {
+                max_degree,
+                tau_g1_powers,
+                tau_g2_powers,
+                hiding_tau_g1_powers: Vec::new(),
+                provenance: SrsProvenance::Development,
+            },
+            load_start.elapsed(),
+            legacy_hiding_tau_g1_powers,
+        )
+    };
     let needed_powers = degree
         .checked_add(1)
         .ok_or_else(|| "benchmark SRS degree overflow".to_string())?;
     let needed_g2_powers = max_g2_degree
         .checked_add(1)
         .ok_or_else(|| "benchmark G2 SRS degree overflow".to_string())?;
-    if max_degree != degree
-        || tau_g1_powers.len() < needed_powers
-        || tau_g2_powers.len() < needed_g2_powers
-        || hiding_tau_g1_powers.len() < needed_powers
+    if srs.max_degree != degree
+        || srs.tau_g1_powers.len() < needed_powers
+        || srs.tau_g2_powers.len() < needed_g2_powers
     {
         return Err(format!(
-            "benchmark SRS {} is incomplete for G1/hiding degree {degree} and G2 degree {max_g2_degree}",
+            "benchmark SRS {} is incomplete for G1 degree {degree} and G2 degree {max_g2_degree}",
             path.display()
         ));
+    }
+    if !legacy_hiding_tau_g1_powers.is_empty() {
+        let compact_path = path.with_extension("bin.compact.tmp");
+        write_srs(
+            &compact_path,
+            srs.max_degree,
+            &srs.tau_g1_powers,
+            &srs.tau_g2_powers,
+            &[],
+        )?;
+        fs::rename(&compact_path, &path).map_err(|err| {
+            format!(
+                "install compacted benchmark SRS {} -> {}: {err}",
+                compact_path.display(),
+                path.display()
+            )
+        })?;
+        println!(
+            "   removed {} unused legacy hiding-G1 powers from {}",
+            legacy_hiding_tau_g1_powers.len(),
+            path.display()
+        );
     }
     records.push(LoadRecord {
         n,
@@ -804,19 +875,9 @@ fn prepare_srs(
         phase: "srs_load",
         elapsed: load_elapsed,
         bytes: file_len(&path)?,
-        reused: true,
+        reused: !generated_now,
     });
-    Ok((
-        Srs {
-            max_degree,
-            tau_g1_powers,
-            tau_g2_powers,
-            hiding_tau_g1_powers,
-            provenance: SrsProvenance::Development,
-        },
-        load_elapsed,
-        records,
-    ))
+    Ok((srs, load_elapsed, records))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -992,6 +1053,8 @@ fn write_summary_markdown(
     body.push_str("\n## Methodology notes\n\n");
     body.push_str("- The release binary is compiled before the benchmark process starts.\n");
     body.push_str("- SP1 setup is performed by the wrapper script before timing.\n");
+    body.push_str("- KZG ceremony and power-sequence validation belong to setup/import. Runtime loading authenticates the fixed SRS artifact; proof verification does not scan SRS powers.\n");
+    body.push_str("- All n sizes use prefixes of one persisted max-n Ethereum account store and proofs under one shared Verkle root; the tree is not rebuilt per n.\n");
     body.push_str("- Initialization uses valid secp256k1 EOA witnesses and one EIP-6800 Banderwagon/IPA multiproof under a computed Verkle root.\n");
     body.push_str("- Initialization verification uses a development policy because the benchmark SRS is deterministic.\n");
     body.push_str("- Insert authenticates an additional EOA against the same Verkle root with a self-contained Verkle proof.\n");
@@ -1028,6 +1091,7 @@ fn write_environment(config: &Config) -> Result<(), String> {
     values.insert("uname", command_output("uname", &["-a"]));
     values.insert("n_sizes", format!("{:?}", config.n_sizes));
     values.insert("m_sizes", format!("{:?}", config.m_sizes));
+    values.insert("master_n", config.master_n.to_string());
     values.insert("samples", config.samples.to_string());
     values.insert("warmup", config.warmup.to_string());
     let body = values
@@ -1067,7 +1131,7 @@ fn encode_insert_proof_text(proof: &KzgInsertProof) -> Result<String, String> {
         ),
         format!("reserve_count_before={}", proof.reserve_count_before),
         format!("reserve_count_after={}", proof.reserve_count_after),
-        format!("c_q_h_hex={}", proof.c_q_h_hex),
+        format!("quotient_commitment_hex={}", proof.quotient_commitment_hex),
         format!("c_x_hex={}", proof.c_x_hex),
         format!("c_beta_hex={}", proof.c_beta_hex),
         format!("c_y_x_hex={}", proof.c_y_x_hex),
@@ -1082,10 +1146,6 @@ fn encode_insert_proof_text(proof: &KzgInsertProof) -> Result<String, String> {
         format!(
             "new_eval_opening_proof_hex={}",
             proof.new_eval_opening_proof_hex
-        ),
-        format!(
-            "quotient_eval_opening_proof_hex={}",
-            proof.quotient_eval_opening_proof_hex
         ),
         format!("balance_range_proof_hex={}", proof.balance_range_proof_hex),
         format!("relation_bp_proof_hex={}", proof.relation_bp_proof_hex),
@@ -1141,6 +1201,15 @@ fn parse_config() -> Result<Config, String> {
     let fixture_dir = PathBuf::from(required(&values, "--fixture-dir")?);
     let n_sizes = parse_sizes(required(&values, "--n")?, "n")?;
     let m_sizes = parse_sizes(required(&values, "--m")?, "m")?;
+    let master_n = values
+        .get("--master-n")
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .map_err(|err| format!("master-n: {err}"))
+        })
+        .transpose()?
+        .unwrap_or_else(|| n_sizes.iter().copied().max().unwrap_or(0));
     let samples = required(&values, "--samples")?
         .parse::<usize>()
         .map_err(|err| format!("samples: {err}"))?;
@@ -1153,12 +1222,16 @@ fn parse_config() -> Result<Config, String> {
     if n_sizes.is_empty() || m_sizes.is_empty() {
         return Err("n and m size lists must not be empty".to_string());
     }
+    if master_n == 0 || n_sizes.iter().any(|&n| n > master_n) {
+        return Err("master-n must be positive and at least max(n)".to_string());
+    }
     Ok(Config {
         mode,
         require_existing,
         output_dir,
         srs_dir,
         fixture_dir,
+        master_n,
         n_sizes,
         m_sizes,
         samples,

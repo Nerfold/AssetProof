@@ -4,7 +4,6 @@ use ark_ff::{PrimeField, UniformRand, Zero};
 
 use common::crypto::{point_g1_from_hex, point_g1_to_hex, scalar_from_hex, scalar_to_hex};
 
-use crate::commitment::derive_generator;
 use crate::kzg::Srs;
 
 #[derive(Clone, Debug)]
@@ -106,8 +105,8 @@ pub fn verify_committed_opening(
 }
 
 pub fn eval_commit(value: Fr, blind: Fr) -> G1Projective {
-    derive_generator("eval-v", 0).mul_bigint(value.into_bigint())
-        + derive_generator("eval-h", 0).mul_bigint(blind.into_bigint())
+    let (v, h) = crate::commitment::eval_generators();
+    v.mul_bigint(value.into_bigint()) + h.mul_bigint(blind.into_bigint())
 }
 
 fn ensure_kzg_statement(

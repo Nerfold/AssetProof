@@ -3,7 +3,7 @@
 Rust 原型，实现论文中的动态隐私资产证明流程。当前仓库包含两条路径：
 
 - `nizk-fixed-set`：基于集合多项式、KZG、Pedersen commitment、ZKOpen、
-  HPolyCom/HZKOpen 和 Bulletproofs 的固定集合 NIZK；
+  salted witness commitment 和 Bulletproofs 的固定集合 NIZK；
 - `smt` + `sp1-host`：Sparse Merkle Tree 与 SP1 guest/host 的更新和插入路径；
 - `eth-sync`：把执行完成且已最终确认的 Ethereum state diff 转换为协议需要的
   地址向量和余额变化向量。
@@ -73,7 +73,7 @@ cargo run -p poa-cli --
 │   ├── mock/                  mock CSV、SMT fixture、生成数据和 benchmark 输入
 │   └── ethereum/              真实 Ethereum 执行状态变化输入
 ├── params/
-│   ├── srs/                   KZG SRS，包括 HPolyCom hiding powers
+│   ├── srs/                   KZG powers-of-tau SRS
 │   ├── crs/                   Pedersen CRS 派生标签和说明
 │   └── sp1/                   SP1 setup / verifying-key 缓存
 ├── artifacts/
@@ -173,8 +173,8 @@ state diff，并且区块已最终确认。Geth `prestateTracer` diff mode 可�
 
 三类参数物理隔离，不能混用：
 
-1. `params/srs/` 保存 KZG powers-of-tau。当前 SRS 同时包含普通 G1/G2 powers
-   与 HPolyCom 使用的独立 hiding G1 powers。
+1. `params/srs/` 保存普通 KZG powers-of-tau G1/G2 powers。insert quotient 已改用
+   salted hash + SP1 evaluation，因此默认 SRS 不再生成百万级 hiding G1 powers。
 2. `params/crs/` 保存 Pedersen commitment 和 Sigma ZKOpen 所用透明 CRS 的派生约定。
    基点使用标准 BLS12-381 G1 `XMD:SHA-256_SSWU_RO` hash-to-curve、独立 domain
    label 和 index 派生，不再使用已知离散对数的 `hash_to_scalar * G`。
@@ -194,8 +194,9 @@ state diff，并且区块已最终确认。Geth `prestateTracer` diff mode 可�
 ./poa import-srs ceremony.srs.bin <ceremony-id>
 ```
 
-导入器使用 subgroup-checked 反序列化，并用批量 pairing 关系检查普通 G1/G2 powers
-和 HPolyCom hiding powers；导入后在 SRS 旁写入 provenance `.meta` 文件。
+导入器使用 subgroup-checked 反序列化，并用批量 pairing 关系检查普通 G1/G2 powers；
+如果导入旧扩展格式中存在 legacy hiding powers，会在导入时丢弃它们。导入后在 SRS
+旁写入 provenance `.meta` 文件。
 
 `setup` **不会生成单独的 Pedersen CRS 文件**。Pedersen CRS 是透明 CRS：验证者
 按照 `params/crs/domains.json` 记录的 suite、DST、label 和 index 重新 hash-to-curve。
@@ -204,16 +205,16 @@ state diff，并且区块已最终确认。Geth `prestateTracer` diff mode 可�
 本次 CRS 升级与旧的 `hash_to_scalar * G` 基点不兼容。旧 state 中的 balance
 commitment、旧 initialization/update/insert proof 都必须从 initialization 开始重新生成；
 不能在旧 state 上继续 update。初始化 scheme 已升级为
-`kzg-nizk-init-v5-zkopen-h2c-crs-mock-bound`，insert scheme 为
-`kzg-nizk-insert-v5-hpoly-bounded-range-mock-bound`。修改过 SP1 guest 后也必须重新运行 `./poa sp1-setup`；
+`kzg-nizk-init-v6-zkopen-salted-shape-hash-mock-bound`（真实 Verkle 输入对应
+`...-eip6800-verkle-bound`），insert scheme 为
+`kzg-nizk-insert-v6-salted-quotient-hash-bounded-range-mock-bound`。修改过 SP1 guest 后也必须重新运行 `./poa sp1-setup`；
 loader 会比较 artifact 中记录的 ELF digest，旧 artifact 会 fail-closed 并提示重新 setup。
 本轮只修改代码、未重新生成 SP1 artifact，因此首次运行前必须执行一次该命令。
 
-SRS 文件格式已经扩展：旧格式为 `G1 powers + G2 powers`，新格式在末尾追加
-HPolyCom 的 hiding G1 powers。读取器仍能读取旧格式，因此普通 KZG 初始化/更新
-不一定立即失效；但依赖 HPolyCom/HZKOpen 的 insert 必须使用新格式。`./poa setup`
-会检查默认 `params/srs/dev.srs.bin`，发现旧格式时自动按原 degree 重新生成完整 SRS。
-只要实际替换了 SRS，最安全的做法仍是重新生成依赖它的 state 和 proof。
+SRS 读取器兼容两种文件：普通 `G1 powers + G2 powers`，以及末尾带 legacy hiding
+G1 powers 的旧扩展格式。新生成的 SRS 将 hiding-power 长度写为零；`setup` 和 benchmark
+准备阶段会在保留普通 powers/provenance 的前提下自动压缩旧扩展文件。替换实际
+powers-of-tau 后仍必须重新生成依赖它的 state 和 proof。
 
 底层 `gen-srs` 只生成明确标记的开发 SRS：
 
@@ -221,15 +222,28 @@ HPolyCom 的 hiding G1 powers。读取器仍能读取旧格式，因此普通 KZ
 ./poa gen-srs 10000 params/srs/custom-10000.bin
 ```
 
-## 初始化、ZKOpen 与 HPolyCom
+## 初始化、ZKOpen 与 salted witness commitment
 
 初始化会生成 private prover state、public state companion 和 init proof。当前
 初始化的 KZG evaluation 使用 Fiat–Shamir 非交互化的 Sigma ZKOpen，因此不会
 把 evaluation 和 Pedersen blinding 直接写入 proof。
 
-insert 路径对旧/新 accumulator evaluation 使用 ZKOpen；商多项式使用
-HPolyCom 与 HZKOpen。HPolyCom 通过隐藏多项式对多项式 commitment 本身做隐藏，
-它依赖 KZG SRS 中单独的 hiding powers。
+论文中的 initialization `C_shape` 是一个长度随最大集合规模增长的向量 Pedersen
+commitment。当前 SP1 后端改用 domain-separated salted BLAKE3 commitment：prover
+先以 32-byte 私有随机 salt 提交 `(alpha, n, ordered address roots)`，再把 32-byte
+摘要放入 Fiat–Shamir transcript 派生 `zeta`；SP1 guest 使用私有 salt 和地址 witness
+重算摘要并检查相等。它保留 commit-before-challenge 的绑定关系（依赖 BLAKE3 的碰撞
+抗性，隐藏性依赖私有高熵 salt），同时避免在 SP1 内进行约 `n` 次 BLS12-381
+variable-base multiplication，也不再需要 initialization shape 的百万级 Pedersen 基点。
+余额 commitment、evaluation commitment 和 KZG ZKOpen 不受此替换影响，仍分别
+使用透明 Pedersen CRS 与普通 KZG SRS。
+
+论文中的 insert 使用 `HPolyCom(Q)` 与 `HZKOpen` 绑定 quotient。当前 SP1 后端改为
+先用独立 32-byte 私有 salt 提交 quotient 的有序系数，再派生 `zeta`。SP1 内检查系数
+数量/degree bound、重算 hash、用 Horner 计算 `Q(zeta)`，并验证其 Pedersen commitment
+`C_q` 的 opening；现有 Bulletproof 再用同一个 `C_q` 检查 insertion relation。这样仍然
+在挑战前绑定唯一的 degree-bounded `Q`，但删除了多次线性规模 HPolyCom MSM 和整套
+hiding-G1 SRS。旧/新 accumulator 的 evaluation 仍使用 KZG Sigma ZKOpen。
 
 快捷初始化默认读取 `data/mock/reserves.csv`：
 
@@ -373,19 +387,24 @@ POA_TIMING=1 ./poa prove-update \
 模式运行，否则 debug 编译会严重扭曲密码学运算耗时。
 
 完整协议矩阵由 `scripts/benchmark_protocol.sh` 运行。其 initialization fixture 在
-SP1 外生成：确定性的有效 secp256k1 私钥、未压缩公钥、由 Keccak 派生的 Ethereum
-地址、随机化余额、EIP-6800 basic-data leaves，以及一棵 256 叉 Banderwagon Verkle
-tree。前 `n` 个账户作为初始化储备，第 `n+1` 个账户只存在于同一个 Ethereum state
-中，供 insert benchmark 使用。SP1 内实际执行私钥到地址验证、EIP-6800 tree-key 与
-basic-data 编码检查、Banderwagon commitment 解析和 IPA opening 验证，不再使用
+SP1 外一次性生成 `10^6+1` 个确定性的有效 secp256k1 私钥、未压缩公钥、由 Keccak
+派生的 Ethereum 地址、随机化余额、EIP-6800 basic-data leaves，以及一棵固定的 256 叉
+Banderwagon Verkle tree。各规模使用同一 canonical account store 的前 `n` 个账户；
+最后一个账户只存在于同一个 Ethereum state 中，供所有 insert benchmark 使用。SP1
+内实际执行私钥到地址验证、EIP-6800 tree-key 与 basic-data 编码检查、Banderwagon
+commitment 解析和 IPA opening 验证，不再使用
 `mock-private-key:<address>` / `mock-balance-proof:<address>` 标签。fixture 生成、磁盘
-加载和密钥一致性检查单独记录，不计入 prover/verifier time。
+加载不计入 prover/verifier time。准备脚本会对持久化账户、密钥和 Verkle proof 做一次
+完整密码学校验；正式 benchmark 只检查文件格式、规模、root 和 canonical 顺序，不再在
+每轮加载时重复同一套 host 校验，协议要求的检查仍由 SP1 guest 在 initialization/insert
+证明中执行。
 
 初始化不会把同一份证明复制 `n` 次：每个账户有独立的 key/value opening，密码学上
 按 Verkle witness 的标准方式聚合为一份 multiproof，并在 SP1 guest 中验证一次。
-Insert 使用同一 state root 下的单账户 Verkle proof。Update fixture 对随机 delta 应用
-新余额后重新构建 Verkle tree，以真实的新 root 作为协议输入；Sync/finality 证明仍按
-论文中的独立抽象处理，不计入 debug update verifier。
+每个配置的 `n` 会从这棵主树导出一份独立 multiproof，因为 Verkle multiproof 不能直接
+截断；但账户、叶子和树只生成并持久化一份。Insert 使用同一 state root 下的固定单账户
+Verkle proof。准备阶段在主树上应用随机 delta、记录真实的新 root 后恢复原叶子；
+Sync/finality 证明仍按论文中的独立抽象处理，不计入 debug update verifier。
 
 该后端固定使用 `crate-crypto/rust-verkle` commit
 `e27b8b4edf1992b4afa636c2fc7983bcc27ddb88`，其 Pedersen basis、31-byte stem/1-byte
@@ -400,24 +419,33 @@ benchmark 依赖，不应被描述为当前 Ethereum 主网共识状态树实现
 
 默认会准备以下矩阵：
 
-- `n = 10^4, 10^5, 10^6`：每个规模都有独立的 `n+1` 账户 Verkle tree、初始化
-  multiproof 和 insert proof；
+- `n = 10^4, 10^5, 10^6`：共享一份 `10^6+1` 账户文件、一棵主 Verkle tree、同一个
+  state root 和 insert proof；每个 `n` 只额外持久化针对账户前缀的 initialization multiproof；
 - `m = 10^2, 10^3`：每个 `n` 先确定性生成最大 `10^3` 个互不重复的随机更新，
   `10^2` 是同一更新序列的前缀；两种规模分别持久化 canonical delta list 及其重建后
   的新 Verkle root；
-- 一套由全部规模共享的 development benchmark SRS。普通 G1 和 HPolyCom hiding-G1
-  powers 覆盖 `max(n)+1`（insert 会增加一个账户），G2 powers 只覆盖 verifier 实际会
+- 一套由全部规模共享的 development benchmark SRS。普通 G1 powers 覆盖
+  `MASTER_N+1`（insert 会增加一个账户），G2 powers 只覆盖 verifier 实际会
   提交的最大更新消失多项式 `max(m)`。这与 KZG 关系一致，并避免生成约一百万个协议
   完全不会使用的 G2 powers。
+
+主树规模由 `MASTER_N` 控制，默认固定为 `1000000`，不随本次选取的 `N_SIZES` 缩小。
+因此后续只测部分规模时可以继续读取同一份百万账户数据，例如
+`MASTER_N=1000000 N_SIZES=10000,100000 ./scripts/benchmark_protocol.sh`。
 
 文件默认持久化在：
 
 ```text
 data/mock/bench/generated/
   preparation-manifest.txt
-  n_10000/ethereum-eip6800-verkle-v2/
-  n_100000/ethereum-eip6800-verkle-v2/
-  n_1000000/ethereum-eip6800-verkle-v2/
+  master_n_1000000/ethereum-eip6800-verkle-v3-master/
+    accounts.bin
+    master-manifest.txt
+    insert-proof.bin
+    init-multiproof-n-10000.bin
+    init-multiproof-n-100000.bin
+    init-multiproof-n-1000000.bin
+    deltas-n-*-m-*.csv
 
 params/srs/bench/
 ```
@@ -437,12 +465,17 @@ SAMPLES=5 WARMUP=1 POA_SP1_PROOF_MODE=groth16 \
   ./scripts/benchmark_protocol.sh
 ```
 
-初始化脚本会在宿主侧验证账户、公私钥、basic-data、初始化 multiproof、insert proof、
-delta 的旧 root 和重建后的新 root；initialization/insert 的 SP1 guest 随后还会在证明
+KZG ceremony、subgroup 和 power-sequence 检查属于 `setup/import-srs` 参数认证阶段；
+`.meta` 文件中的 BLAKE3 digest 绑定认证后的完整 SRS artifact。proof verifier 不重新
+审计 SRS，也不会扫描百万个 powers；benchmark 的 verifier time 只包含当前 proof 的验证。
+
+初始化脚本只构建一次最大规模主树，并在宿主侧验证各账户前缀的公私钥、basic-data、
+初始化 multiproof、共享 insert proof、delta 的旧 root 和生成的新 root；
+initialization/insert 的 SP1 guest 随后还会在证明
 过程中再次验证对应的 Verkle opening。百万规模准备过程本身可能消耗大量内存、磁盘和
-时间，但这些时间不会进入 protocol prover/verifier 统计。SRS 会按三个阶段显示进度，
+时间，但这些时间不会进入 protocol prover/verifier 统计。SRS 会按两个阶段显示进度，
 默认使用全部逻辑 CPU；可用 `SRS_THREADS=8 ./scripts/initialize_benchmark_data.sh` 限制
-并行度。文件名同时绑定最大 G1/hiding-G1 degree 和最大 G2 degree，参数矩阵不变时会
+并行度。文件名同时绑定最大 G1 degree 和最大 G2 degree，参数矩阵不变时会
 直接复用，不会重新生成。
 
 ## 测试

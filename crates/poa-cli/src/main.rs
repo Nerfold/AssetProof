@@ -1193,15 +1193,15 @@ fn real_main() -> Result<(), String> {
 }
 
 fn load_srs(path: &Path) -> Result<Srs, String> {
-    let (max_degree, tau_g1_powers, tau_g2_powers, hiding_tau_g1_powers) = read_srs(path)?;
+    let (max_degree, tau_g1_powers, tau_g2_powers, _legacy_hiding_tau_g1_powers) = read_srs(path)?;
     let srs = Srs {
         max_degree,
         tau_g1_powers,
         tau_g2_powers,
-        hiding_tau_g1_powers,
+        hiding_tau_g1_powers: Vec::new(),
         provenance: read_srs_provenance(path)?,
     };
-    srs.validate_complete_structure()?;
+    srs.ensure_complete_layout()?;
     Ok(srs)
 }
 
@@ -1329,8 +1329,30 @@ fn quick_setup(args: &[String]) -> Result<(), String> {
             .ok_or_else(|| "declared SRS degree overflow".to_string())?;
         let has_standard_powers = srs.tau_g1_powers.len() == declared_powers
             && srs.tau_g2_powers.len() == declared_powers;
-        let has_hiding_powers = srs.hiding_tau_g1_powers.len() == declared_powers;
-        if srs.max_degree >= requested_degree && has_standard_powers && has_hiding_powers {
+        if srs.max_degree >= requested_degree && has_standard_powers {
+            if !srs.hiding_tau_g1_powers.is_empty() {
+                let compact_path = path.with_extension("bin.compact.tmp");
+                write_srs(
+                    &compact_path,
+                    srs.max_degree,
+                    &srs.tau_g1_powers,
+                    &srs.tau_g2_powers,
+                    &[],
+                )?;
+                fs::rename(&compact_path, path).map_err(|err| {
+                    format!(
+                        "install compacted SRS {} -> {}: {err}",
+                        compact_path.display(),
+                        path.display()
+                    )
+                })?;
+                write_srs_provenance(path, &srs.provenance)?;
+                println!(
+                    "removed {} unused legacy hiding-G1 powers from {}",
+                    srs.hiding_tau_g1_powers.len(),
+                    path.display()
+                );
+            }
             let provenance = match &srs.provenance {
                 SrsProvenance::Development => "development-only",
                 SrsProvenance::ExternalCeremony { .. } => "external-ceremony",
@@ -1349,20 +1371,12 @@ fn quick_setup(args: &[String]) -> Result<(), String> {
                 path.display(), requested_degree
             ));
         }
-        if !has_hiding_powers {
-            println!(
-                "replacing legacy development SRS {} with the extended HPolyCom format (degree={})",
-                path.display(),
-                generation_degree
-            );
-        } else {
-            println!(
-                "upgrading {} from degree {} to {}",
-                path.display(),
-                srs.max_degree,
-                generation_degree
-            );
-        }
+        println!(
+            "upgrading {} from degree {} to {}",
+            path.display(),
+            srs.max_degree,
+            generation_degree
+        );
     }
     let srs = Srs::setup_development(generation_degree, b"dynamic-poa-srs");
     write_srs(

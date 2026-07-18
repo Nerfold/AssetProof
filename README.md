@@ -12,7 +12,44 @@ Rust 原型，实现论文中的动态隐私资产证明流程。当前仓库包
 
 ## 快速开始
 
-要求 Rust stable。所有命令都从仓库根目录运行。
+所有命令都从仓库根目录运行。新设备推荐只执行一个入口：
+
+```bash
+./poa bootstrap
+```
+
+该命令会检查或安装 Rust、固定版本 SP1 toolchain、Docker，断点续传并校验 SP1
+Groth16 circuit artifacts，然后构建项目、生成开发 KZG SRS 和三个协议 guest 的 SP1
+setup。macOS 自动安装 Docker 需要 Homebrew；Docker Desktop 首次启动仍可能弹出系统授权。
+Linux 自动安装可能请求 `sudo`，首次加入 `docker` group 后如果当前 shell 尚未取得权限，
+需要重新登录一次。
+
+如果只想先运行不依赖 BN254 wrapper 的 compressed proof，可完全跳过 Docker 和大型
+Groth16 artifacts：
+
+```bash
+POA_SP1_PROOF_MODE=compressed ./poa bootstrap
+```
+
+任何时候都可以运行环境诊断：
+
+```bash
+./poa doctor
+```
+
+这里有三种容易混淆的 artifact：
+
+1. SP1 guest ELF：由 `cargo +succinct` 从仓库源码编译；
+2. `params/sp1/*.bin`：本项目 guest 对应的 verification-key setup，由
+   `./poa sp1-setup` 生成；
+3. `~/.sp1/circuits/{groth16,plonk}/v6.1.0/`：SP1 官方 BN254 wrapper circuit、PK、VK，
+   仅 Groth16/Plonk 需要。下载中断后只剩 `artifacts.tar.gz` 会触发
+   `artifact not found`，`./poa bootstrap` 会识别并原子重装。
+
+Docker **不参与 guest 编译和 `sp1-setup`**；当前 SP1 依赖配置只在最终
+Groth16/Plonk gnark wrapping/verification 时调用 Docker。compressed 模式不需要 Docker。
+
+手动安装时要求 Rust stable，并确保 `~/.cargo/bin` 与 `~/.sp1/bin` 在 `PATH` 中。
 
 ```bash
 cargo build --release -p poa-cli

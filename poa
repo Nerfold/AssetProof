@@ -1,9 +1,19 @@
 #!/usr/bin/env sh
 set -eu
 
-if [ "${1:-}" = "sp1-setup" ]; then
-    shift
-    exec cargo run --quiet --release -p sp1-host --bin poa-protocol-sp1-setup -- "$@"
-fi
+case "${1:-}" in
+    bootstrap)
+        shift
+        exec ./scripts/bootstrap.sh "$@"
+        ;;
+    doctor)
+        shift
+        exec ./scripts/doctor.sh "$@"
+        ;;
+    sp1-setup)
+        shift
+        exec cargo run --quiet --release -p sp1-host --bin poa-protocol-sp1-setup -- "$@"
+        ;;
+esac
 
 exec cargo run --quiet --release -p poa-cli -- "$@"

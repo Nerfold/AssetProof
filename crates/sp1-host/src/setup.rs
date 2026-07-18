@@ -126,7 +126,7 @@ fn load_setup_file(setup_dir: &Path, elf_name: &str, elf: Elf) -> Result<SP1Veri
     let path = setup_file_path(setup_dir, elf_name);
     if !path.exists() {
         return Err(format!(
-            "missing SP1 setup artifact {}. Run `poa-cli sp1-setup {}` first.",
+            "missing SP1 setup artifact {}. Run `./poa sp1-setup {}` first.",
             path.display(),
             setup_dir.display()
         ));
@@ -135,7 +135,7 @@ fn load_setup_file(setup_dir: &Path, elf_name: &str, elf: Elf) -> Result<SP1Veri
     let digest = elf_digest(&elf);
     if stored.elf_digest != digest {
         return Err(format!(
-            "stale SP1 setup artifact {} for {}. Re-run `poa-cli sp1-setup {}`.",
+            "stale SP1 setup artifact {} for {}. Re-run `./poa sp1-setup {}`.",
             path.display(),
             elf_name,
             setup_dir.display()

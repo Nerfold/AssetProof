@@ -8,14 +8,14 @@ use common::crypto::point_g1_from_hex;
 use common::encoding::encode_address;
 use common::types::{Delta, PublicState, StoredInitProof, StoredProof, StoredState, SyncProof};
 
-use crate::bp::{verify_optimized_zero_test_logic, verify_projection_ipa};
+use crate::bp::{verify_direct_zero_test_logic, verify_projection_ipa};
 use crate::external::{ExternalProofAdapter, MockExternalProofAdapter};
 use crate::init_proof::{verify_init_proof, verify_init_public_proof};
-use crate::kzg::{commit_g2, verify_batch, Srs};
-use crate::polynomial::product_from_roots;
+use crate::kzg::Srs;
+use crate::multizkopen::verify_multi_zkopen;
 use crate::range::{check_public_delta_range, RangePolicy};
 use crate::threshold::{verify_threshold_encoded, ThresholdStatement, THRESHOLD_PROOF_SCHEME};
-use crate::update::{build_transcript_hex, delta_list_commitment, EMPTY_UPDATE_MARKER};
+use crate::update::{build_multi_zkopen_context, build_transcript_hex, delta_list_commitment};
 
 #[derive(Clone, Debug)]
 pub struct ChainPolicy {
@@ -317,11 +317,8 @@ fn verify_update_production_with_adapter_and_sync_proof(
     let sync_proof = sync_proof.ok_or_else(|| {
         "production update verification requires a canonical Sync proof".to_string()
     })?;
-    if !deltas.is_empty()
-        && (proof.theta_opening_proof_hex.is_empty()
-            || !proof.theta_opening_proof_hex.starts_with("zkopen:"))
-    {
-        return Err("update proof is missing a production committed-opening proof for ZKOpen(C_Y, theta, C_v); use verify_update_debug only for transparent local tests".to_string());
+    if !deltas.is_empty() && proof.multi_zkopen_proof_hex.is_empty() {
+        return Err("update proof is missing the production MultiZKOpen proof".to_string());
     }
     verify_update_with_adapter_and_sync_proof(
         srs,
@@ -382,12 +379,9 @@ fn verify_update_with_adapter_and_sync_proof(
         &old_state.accumulator_hex,
         &proof.delta_list_commitment_hex,
         &proof.c_u_hex,
-        &proof.c_y_hex,
+        &proof.d_y_hex,
         &proof.c_d_hex,
-        &proof.eval_proof_hex,
-        &proof.c_v_hex,
-        proof.theta,
-        &proof.theta_opening_proof_hex,
+        &proof.multi_zkopen_proof_hex,
     );
     if proof.transcript_hex != expected_transcript {
         return Err("update transcript mismatch".to_string());
@@ -450,48 +444,46 @@ fn verify_update_with_adapter_and_sync_proof(
         block_data_start,
     );
 
-    let z_poly_start = Instant::now();
-    let z_poly = product_from_roots(&x_values);
-    emit_verify_timing(emit_timing, "verify_query_vanishing_poly", z_poly_start);
-
-    let z_commit_start = Instant::now();
-    let z_commit_g2 = commit_g2(srs, &z_poly)?;
-    emit_verify_timing(emit_timing, "verify_query_z_commit_g2", z_commit_start);
-
     let kzg_parse_start = Instant::now();
     let accumulator = point_g1_from_hex(&old_state.accumulator_hex)?;
-    let c_y = point_g1_from_hex(&proof.c_y_hex)?;
-    let eval_proof = point_g1_from_hex(&proof.eval_proof_hex)?;
+    let d_y = point_g1_from_hex(&proof.d_y_hex)?;
     emit_verify_timing(emit_timing, "verify_kzg_parse_points", kzg_parse_start);
 
+    let multi_zkopen_context = build_multi_zkopen_context(
+        &old_state.state_root,
+        &new_state.state_root,
+        &old_state.accumulator_hex,
+        &old_state.balance_commitment_hex,
+        &new_state.balance_commitment_hex,
+        &proof.delta_list_commitment_hex,
+        &proof.c_u_hex,
+        &proof.d_y_hex,
+        &proof.c_d_hex,
+    );
     let kzg_pairing_start = Instant::now();
-    if !verify_batch(&accumulator, &c_y, &eval_proof, &z_commit_g2) {
-        return Err("KZG batch equation failed".to_string());
-    }
-    emit_verify_timing(emit_timing, "verify_kzg_pairing_check", kzg_pairing_start);
+    verify_multi_zkopen(
+        srs,
+        &accumulator,
+        &x_values,
+        &d_y,
+        &proof.multi_zkopen_proof_hex,
+        &multi_zkopen_context,
+    )?;
+    emit_verify_timing(emit_timing, "verify_multizkopen", kzg_pairing_start);
 
     let logic_start = Instant::now();
-    verify_optimized_zero_test_logic(
-        srs,
+    verify_direct_zero_test_logic(
         deltas,
-        &x_values,
         &proof.old_state_root,
         &proof.new_state_root,
         &old_state.accumulator_hex,
         &old_state.balance_commitment_hex,
         &new_state.balance_commitment_hex,
         &proof.c_u_hex,
-        &proof.c_y_hex,
-        &proof.c_v_hex,
+        &proof.d_y_hex,
         &proof.c_d_hex,
-        proof.theta,
-        &proof.theta_opening_proof_hex,
         &proof.bp_proof_hex,
-        &proof.witness_vector_commitment_hex,
-        &proof.rho_bp_commitment_hex,
-        &proof.v_bp_commitment_hex,
-        &proof.witness_link_ipa_proof,
-        &proof.v_link_proof,
+        &proof.committed_input_link_ipa_proof,
     )?;
     verify_projection_ipa(
         deltas,
@@ -514,20 +506,13 @@ fn verify_empty_update(
     if old_state.balance_commitment_hex != new_state.balance_commitment_hex {
         return Err("empty update changed the aggregate balance commitment".to_string());
     }
-    if proof.theta != Fr::from(0u64)
-        || proof.theta_opening_proof_hex != EMPTY_UPDATE_MARKER
-        || proof.gate_count != 0
+    if proof.gate_count != 0
         || !proof.c_u_hex.is_empty()
-        || !proof.c_y_hex.is_empty()
+        || !proof.d_y_hex.is_empty()
         || !proof.c_d_hex.is_empty()
-        || !proof.eval_proof_hex.is_empty()
-        || !proof.c_v_hex.is_empty()
+        || !proof.multi_zkopen_proof_hex.is_empty()
         || !proof.bp_proof_hex.is_empty()
-        || !proof.witness_vector_commitment_hex.is_empty()
-        || !proof.rho_bp_commitment_hex.is_empty()
-        || !proof.v_bp_commitment_hex.is_empty()
-        || !proof.witness_link_ipa_proof.is_empty()
-        || !proof.v_link_proof.is_empty()
+        || !proof.committed_input_link_ipa_proof.is_empty()
         || !proof.projection_ipa_proof.is_empty()
         || !proof.balance_range_proof_hex.is_empty()
     {
@@ -842,7 +827,7 @@ mod tests {
             delta: 7,
         }];
         let mut updated = apply_update(&srs, &init.state, &deltas, "root-1").unwrap();
-        updated.proof.c_y_hex.push('0');
+        updated.proof.d_y_hex.push('0');
         let err = verify_update_debug(
             &srs,
             &init.state.public_state(),
@@ -855,8 +840,8 @@ mod tests {
     }
 
     #[test]
-    fn rejects_tampered_random_link_commitment() {
-        let srs = Srs::setup_development(8, b"test-srs-random-link");
+    fn rejects_tampered_committed_input_link() {
+        let srs = Srs::setup_development(8, b"test-srs-committed-input-link");
         let entries = vec![ReserveEntry {
             address: "0x1111111111111111111111111111111111111111".to_string(),
             balance: 100,
@@ -867,7 +852,7 @@ mod tests {
             delta: 7,
         }];
         let mut updated = apply_update(&srs, &init.state, &deltas, "root-1").unwrap();
-        updated.proof.c_v_hex = updated.proof.c_u_hex.clone();
+        updated.proof.committed_input_link_ipa_proof[0] ^= 1;
         let err = verify_update_debug(
             &srs,
             &init.state.public_state(),

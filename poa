@@ -1,4 +1,9 @@
 #!/usr/bin/env sh
 set -eu
 
+if [ "${1:-}" = "sp1-setup" ]; then
+    shift
+    exec cargo run --quiet --release -p sp1-host --bin poa-protocol-sp1-setup -- "$@"
+fi
+
 exec cargo run --quiet --release -p poa-cli -- "$@"

@@ -3,8 +3,16 @@ name = "sp1-host"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = []
+smt-sp1 = ["dep:smt"]
+
 [lib]
 path = "src/lib.rs"
+
+[[bin]]
+name = "poa-protocol-sp1-setup"
+path = "src/bin/protocol_setup.rs"
 
 [dependencies]
 ark-bls12-381 = "0.6"
@@ -16,7 +24,7 @@ common = { path = "../common" }
 serde = { version = "1.0", features = ["derive"] }
 sp1-sdk = { version = "6.2.2", features = ["blocking"] }
 sp1-programs-common = { path = "../sp1-programs/common" }
-smt = { path = "../smt" }
+smt = { path = "../smt", optional = true }
 
 [build-dependencies]
 sp1-build = "6.2.2"

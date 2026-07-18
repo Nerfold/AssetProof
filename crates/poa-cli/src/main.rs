@@ -37,10 +37,11 @@ use serde::Deserialize;
 use smt::insert::build_insert_witness;
 use smt::leaf::Leaf;
 use smt::state::SmtState;
+use sp1_host::init::ensure_sp1_setup as ensure_protocol_sp1_setup;
 use sp1_host::insert::{build_and_execute_insert, prove_insert, verify_insert_proof};
 use sp1_host::setup::default_setup_dir;
 use sp1_host::update::{
-    build_and_execute_update, build_and_prove_update, ensure_sp1_setup,
+    build_and_execute_update, build_and_prove_update, ensure_sp1_setup as ensure_smt_sp1_setup,
     verify_update_proof as verify_smt_update_proof,
 };
 
@@ -148,8 +149,22 @@ fn real_main() -> Result<(), String> {
             } else {
                 return Err("usage: poa-cli sp1-setup [setup-dir]".to_string());
             };
-            ensure_sp1_setup(&setup_dir)?;
-            println!("wrote SP1 setup artifacts to {}", setup_dir.display());
+            ensure_protocol_sp1_setup(&setup_dir)?;
+            println!(
+                "protocol SP1 setup complete (init + KZG insert): {}",
+                setup_dir.display()
+            );
+        }
+        "sp1-smt-setup" => {
+            let setup_dir = if args.len() == 3 {
+                Path::new(&args[2]).to_path_buf()
+            } else if args.len() == 2 {
+                default_setup_dir()
+            } else {
+                return Err("usage: poa-cli sp1-smt-setup [setup-dir]".to_string());
+            };
+            ensure_smt_sp1_setup(&setup_dir)?;
+            println!("SMT SP1 setup complete: {}", setup_dir.display());
         }
         "gen-srs" => {
             if args.len() != 4 {
@@ -1931,7 +1946,8 @@ fn print_usage() {
 
 fn print_advanced_usage() {
     println!("advanced commands:");
-    println!("  poa-cli sp1-setup [setup-dir]");
+    println!("  poa-cli sp1-setup [setup-dir]          # protocol init + KZG insert");
+    println!("  poa-cli sp1-smt-setup [setup-dir]      # separate SMT implementation");
     println!("  poa-cli gen-srs <max-degree> <srs.bin>");
     println!("  poa-cli init <srs.bin> <reserves.csv> <state-root> <state.txt> <init-proof.txt>");
     println!("  poa-cli init-mock-owned <srs.bin> <init-witness.csv> <chain-id> <state-root> <session-id> <state.txt> <init-proof.txt>");

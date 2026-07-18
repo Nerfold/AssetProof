@@ -19,12 +19,10 @@ use sp1_sdk::blocking::{ProveRequest, Prover as BlockingProver, ProverClient};
 use sp1_sdk::include_elf;
 use sp1_sdk::{ProvingKey, SP1ProofWithPublicValues, SP1Stdin};
 
-use crate::setup::{default_setup_dir, ensure_all_setups, load_update_vk};
+use crate::setup::{default_setup_dir, ensure_smt_setups, load_update_vk};
 
 const SMT_UPDATE_ELF: sp1_sdk::Elf = include_elf!("sp1-smt-update");
 const SMT_INSERT_ELF: sp1_sdk::Elf = include_elf!("sp1-smt-insert");
-const INIT_ELF: sp1_sdk::Elf = include_elf!("sp1-init-merkle");
-const KZG_INSERT_ELF: sp1_sdk::Elf = include_elf!("sp1-kzg-insert");
 
 #[derive(Clone)]
 struct Sp1Context {
@@ -66,13 +64,7 @@ fn sp1_context_with_setup_dir(setup_dir: &Path) -> Result<Sp1Context, String> {
 }
 
 pub fn ensure_sp1_setup(setup_dir: &Path) -> Result<(), String> {
-    ensure_all_setups(
-        setup_dir,
-        SMT_UPDATE_ELF,
-        SMT_INSERT_ELF,
-        INIT_ELF,
-        KZG_INSERT_ELF,
-    )
+    ensure_smt_setups(setup_dir, SMT_UPDATE_ELF, SMT_INSERT_ELF)
 }
 
 pub fn prove_update(

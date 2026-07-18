@@ -300,17 +300,16 @@ fn prepare_ownership(
                 ],
             ),
         },
-        OwnershipWitnessInput::EthereumEoaPrivateKeyHex { private_key_hex } => {
+        OwnershipWitnessInput::EthereumEoaSignatureHex { signature_hex } => {
             PreparedOwnershipWitness {
-                scheme: "ethereum-eoa-secp256k1".to_string(),
+                scheme: "ethereum-eoa-ecdsa-recoverable-v1".to_string(),
                 proof_digest_hex: hex_hash(
-                    "ethereum-eoa-private-key-binding",
+                    "ethereum-eoa-ownership-signature",
                     &[
                         ctx.chain_id.as_bytes(),
                         ctx.state_root.as_bytes(),
-                        ctx.session_id.as_bytes(),
                         witness.address.as_bytes(),
-                        private_key_hex.as_bytes(),
+                        signature_hex.as_bytes(),
                     ],
                 ),
             }

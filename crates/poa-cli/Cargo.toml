@@ -14,4 +14,4 @@ blake3 = "1.8"
 mock-chain = { path = "../mock-chain" }
 nizk-fixed-set = { path = "../nizk" }
 smt = { path = "../smt" }
-sp1-host = { path = "../sp1-host" }
+sp1-host = { path = "../sp1-host", features = ["smt-sp1"] }

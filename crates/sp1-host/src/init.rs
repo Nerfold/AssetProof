@@ -17,11 +17,9 @@ use sp1_sdk::include_elf;
 use sp1_sdk::{ProvingKey, SP1ProofWithPublicValues, SP1Stdin};
 
 use crate::proof_mode::{configured_proof_mode, ensure_trusted_vk, ConfiguredProofMode};
-use crate::setup::{default_setup_dir, ensure_all_setups, load_init_vk};
+use crate::setup::{default_setup_dir, ensure_protocol_setups, load_init_vk};
 
 const INIT_ELF: sp1_sdk::Elf = include_elf!("sp1-init-merkle");
-const SMT_UPDATE_ELF: sp1_sdk::Elf = include_elf!("sp1-smt-update");
-const SMT_INSERT_ELF: sp1_sdk::Elf = include_elf!("sp1-smt-insert");
 const KZG_INSERT_ELF: sp1_sdk::Elf = include_elf!("sp1-kzg-insert");
 
 #[derive(Clone)]
@@ -33,13 +31,7 @@ struct Sp1InitContext {
 static SP1_INIT_CONTEXT: OnceLock<Mutex<Option<Sp1InitContext>>> = OnceLock::new();
 
 pub fn ensure_sp1_setup(setup_dir: &Path) -> Result<(), String> {
-    ensure_all_setups(
-        setup_dir,
-        SMT_UPDATE_ELF,
-        SMT_INSERT_ELF,
-        INIT_ELF,
-        KZG_INSERT_ELF,
-    )
+    ensure_protocol_setups(setup_dir, INIT_ELF, KZG_INSERT_ELF)
 }
 
 pub fn prove_init(
@@ -197,12 +189,23 @@ pub(crate) fn convert_ownership(
                 private_key: mock_private_key.clone(),
             })
         }
-        OwnershipWitnessInput::EthereumEoaPrivateKeyHex { private_key_hex } => {
-            let bytes = hex_decode(private_key_hex)?;
-            let private_key: [u8; 32] = bytes
+        OwnershipWitnessInput::EthereumEoaSignatureHex { signature_hex } => {
+            let bytes = hex_decode(signature_hex)?;
+            if bytes.len() != 65 {
+                return Err("Ethereum ownership signature must contain 65 bytes".to_string());
+            }
+            let r: [u8; 32] = bytes[..32]
                 .try_into()
-                .map_err(|_| "Ethereum private key must contain 32 bytes".to_string())?;
-            Ok(Sp1OwnershipWitness::EthereumEoaPrivateKey { private_key })
+                .map_err(|_| "invalid Ethereum ownership signature r".to_string())?;
+            let s: [u8; 32] = bytes[32..64]
+                .try_into()
+                .map_err(|_| "invalid Ethereum ownership signature s".to_string())?;
+            let recovery_id = match bytes[64] {
+                0 | 1 => bytes[64],
+                27 | 28 => bytes[64] - 27,
+                _ => return Err("Ethereum signature recovery id must be 0/1 or 27/28".to_string()),
+            };
+            Ok(Sp1OwnershipWitness::EthereumEoaSignature { r, s, recovery_id })
         }
         OwnershipWitnessInput::ExternalOwnershipProof { scheme, .. } => {
             Ok(Sp1OwnershipWitness::UnsupportedExternal {

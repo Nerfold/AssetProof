@@ -36,9 +36,19 @@ impl InitReserveWitness {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OwnershipWitnessInput {
-    MockPrivateKey { mock_private_key: String },
-    EthereumEoaPrivateKeyHex { private_key_hex: String },
-    ExternalOwnershipProof { scheme: String, proof_hex: String },
+    MockPrivateKey {
+        mock_private_key: String,
+    },
+    /// A canonical Ethereum recoverable ECDSA signature encoded as
+    /// `r[32] || s[32] || y_parity[1]`. The signed statement is reconstructed
+    /// from the protocol operation, chain id, state root, and account address.
+    EthereumEoaSignatureHex {
+        signature_hex: String,
+    },
+    ExternalOwnershipProof {
+        scheme: String,
+        proof_hex: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -193,20 +203,17 @@ pub struct StoredProof {
     pub new_state_root: String,
     pub delta_list_commitment_hex: String,
     pub c_u_hex: String,
-    pub c_y_hex: String,
+    /// The unique Pedersen commitment D_Y to all hidden KZG evaluations.
+    /// MultiZKOpen and the Bulletproof relation consume this same group element.
+    pub d_y_hex: String,
     pub c_d_hex: String,
-    pub eval_proof_hex: String,
-    pub c_v_hex: String,
-    pub theta: Fr,
-    pub theta_opening_proof_hex: String,
+    /// Fiat--Shamir MultiZKOpen proof encoded as canonical binary hex.
+    pub multi_zkopen_proof_hex: String,
     pub gate_count: usize,
     pub transcript_hex: String,
     pub bp_proof_hex: String,
-    pub witness_vector_commitment_hex: String,
-    pub rho_bp_commitment_hex: String,
-    pub v_bp_commitment_hex: String,
-    pub witness_link_ipa_proof: Vec<u8>,
-    pub v_link_proof: Vec<u8>,
+    /// Links D_Y and C_U directly to the Bulletproof phase-one witness wires.
+    pub committed_input_link_ipa_proof: Vec<u8>,
     pub projection_ipa_proof: Vec<u8>,
     /// Bulletproof proving that the updated aggregate balance commitment opens
     /// to a value in the protocol's accepted nonnegative integer range.

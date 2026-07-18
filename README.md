@@ -181,11 +181,22 @@ state diff，并且区块已最终确认。Geth `prestateTracer` diff mode 可�
 3. `params/sp1/` 保存 SP1 guest 对应的 setup/verifying-key 缓存。它们不是 KZG
    参数，也不是 Pedersen CRS。
 
-`./poa setup [degree]` 只生成默认开发 KZG SRS。SP1 setup 较慢，按需单独执行：
+`./poa setup [degree]` 只生成默认开发 KZG SRS。协议 benchmark 只需为
+initialization 和 KZG insert 生成 SP1 setup：
 
 ```bash
 ./poa sp1-setup
 ```
+
+独立的 SMT 实现不参与 protocol benchmark；只有测试 SMT 路径时才执行：
+
+```bash
+./poa sp1-smt-setup
+```
+
+`scripts/benchmark_protocol.sh` 默认使用适合工作站的 SP1 分片与 trace-buffer
+上限（`SHARD_SIZE=1048576`、两个 trace slots），以控制 Groth16 峰值内存。这些值
+都会写入 benchmark 的 `environment.txt`，也可在命令前显式覆盖。
 
 默认位置是 `params/sp1/`。开发 SRS 由确定性 seed 生成，不代表可信仪式，并会被
 生产验证器拒绝。生产 SRS 必须由外部 ceremony 生成并导入：
@@ -258,8 +269,12 @@ proof label 当作 Ethereum 账户证明。EthereumAccountProof 与链上 Merkle
 
 真实单地址插入可通过库接口 `KzgInsertWitness::ethereum(...)` 构造。默认
 `apply_insert` 会选择 `Sp1NativeProofAdapter`：host 只把 artifact 标签绑定进外层
-transcript，私钥所有权、地址派生以及 Ethereum account MPT balance proof 都在
-SP1 guest 内验证；它不会把 host-side 标签误当成链证明本身。
+transcript，ECDSA ownership signature、公钥恢复、地址派生以及 Ethereum account MPT
+balance proof 都在 SP1 guest 内验证；私钥不进入 SP1 stdin。签名采用
+`r || s || yParity` 的 65-byte Ethereum 格式，绑定 operation、chain id、state root
+和账户地址。真实钱包应对 `ownership_statement_hash(...)` 返回的 32-byte message
+调用 `personal_sign`；guest 会重建 EIP-191 前缀摘要。它不会把 host-side 标签误当成
+链证明本身。
 
 ## Range proof 与阈值证明
 
@@ -271,8 +286,17 @@ slack 或 blinding。
 
 每个固定集合 update proof 都内嵌新总余额的非负 range proof；验证器还限制每个
 公开 delta 以及全部公开 delta 的绝对值之和。这两部分共同排除有限域模数回绕。
-update proof 的持久化格式因此升级为 `DPOAUPD5`：旧 update proof 必须重新生成，
-KZG SRS 不需要因此重建。
+普通 update 采用直接 `MultiZKOpen`：`D_Y` 一次性承诺全部隐藏 KZG evaluation，
+Sigma protocol 证明这些 opening 来自旧 set digest；同一个 `D_Y` 再通过 committed-input
+IPA 直接绑定到 Bulletproof 的零测试 witness wires。实现不再生成随机点 `theta`、
+`C_v`、单点 `ZKOpen` 或第二份 evaluation-vector commitment。
+
+update proof 的持久化格式因此升级为 `DPOAUPD6`：旧 update proof 必须重新生成，
+KZG SRS 不需要因此重建；Pedersen CRS 会按域分离标签派生 `D_Y` 的向量基点和独立
+blinding base。
+
+`parallel-*` 命令属于独立的 legacy 分片实验，使用自己的 shard proof 类型，不是
+`DPOAUPD6` 普通 update 路径，也不包含在 protocol benchmark 中。
 
 insert proof 也内嵌插入后 aggregate balance commitment 的非负 range proof，避免
 状态经过插入后离开协议接受的整数范围。
@@ -388,10 +412,11 @@ POA_TIMING=1 ./poa prove-update \
 
 完整协议矩阵由 `scripts/benchmark_protocol.sh` 运行。其 initialization fixture 在
 SP1 外一次性生成 `10^6+1` 个确定性的有效 secp256k1 私钥、未压缩公钥、由 Keccak
-派生的 Ethereum 地址、随机化余额、EIP-6800 basic-data leaves，以及一棵固定的 256 叉
+派生的 Ethereum 地址、ECDSA ownership signatures、随机化余额、EIP-6800 basic-data leaves，以及一棵固定的 256 叉
 Banderwagon Verkle tree。各规模使用同一 canonical account store 的前 `n` 个账户；
 最后一个账户只存在于同一个 Ethereum state 中，供所有 insert benchmark 使用。SP1
-内实际执行私钥到地址验证、EIP-6800 tree-key 与 basic-data 编码检查、Banderwagon
+内使用 secp256k1 预编译恢复签名公钥、用 Keccak 预编译派生并核对地址，然后执行
+EIP-6800 tree-key 与 basic-data 编码检查、Banderwagon
 commitment 解析和 IPA opening 验证，不再使用
 `mock-private-key:<address>` / `mock-balance-proof:<address>` 标签。fixture 生成、磁盘
 加载不计入 prover/verifier time。准备脚本会对持久化账户、密钥和 Verkle proof 做一次
@@ -438,7 +463,7 @@ benchmark 依赖，不应被描述为当前 Ethereum 主网共识状态树实现
 ```text
 data/mock/bench/generated/
   preparation-manifest.txt
-  master_n_1000000/ethereum-eip6800-verkle-v3-master/
+  master_n_1000000/ethereum-eip6800-verkle-v4-ecdsa/
     accounts.bin
     master-manifest.txt
     insert-proof.bin

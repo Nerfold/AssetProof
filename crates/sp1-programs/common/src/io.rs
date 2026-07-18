@@ -177,9 +177,17 @@ pub struct Sp1InitReserveEntry {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Sp1OwnershipWitness {
-    MockPrivateKey { private_key: String },
-    EthereumEoaPrivateKey { private_key: [u8; 32] },
-    UnsupportedExternal { scheme: String },
+    MockPrivateKey {
+        private_key: String,
+    },
+    EthereumEoaSignature {
+        r: [u8; 32],
+        s: [u8; 32],
+        recovery_id: u8,
+    },
+    UnsupportedExternal {
+        scheme: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

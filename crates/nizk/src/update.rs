@@ -1,21 +1,21 @@
-use ark_bls12_381::{Fr, G1Projective, G2Projective};
-use ark_ec::PrimeGroup;
-use ark_ff::{One, PrimeField, UniformRand, Zero};
+use ark_bls12_381::Fr;
+use ark_ff::{PrimeField, UniformRand};
 use std::env;
 use std::thread;
 use std::time::Instant;
 
-use common::crypto::{hex_encode, point_g1_from_hex, point_g1_to_hex, scalar_to_hex};
+use common::crypto::{hex_encode, point_g1_from_hex, point_g1_to_hex};
 use common::encoding::encode_address;
 use common::types::{Delta, StoredProof, StoredState};
 
-use crate::bp::{commit_membership_vector, prove_optimized_zero_test_logic, prove_projection_ipa};
+use crate::bp::{commit_membership_vector, prove_direct_zero_test_logic, prove_projection_ipa};
 use crate::commitment::commit_balance;
-use crate::kzg::{commit_g1, verify_batch, Srs};
-use crate::polynomial::{lagrange_basis, Polynomial, QueryContext};
+use crate::kzg::{commit_g1, Srs};
+use crate::multizkopen::{commit_evaluation_vector, prove_multi_zkopen};
+use crate::polynomial::{Polynomial, QueryContext};
 use crate::range::{check_public_delta_range, RangePolicy};
 use crate::threshold::{prove_threshold, ThresholdStatement, ThresholdWitness};
-use crate::witness::{build_update_witness_from_evaluations, encode_delta_points, UpdateWitness};
+use crate::witness::{build_update_witness_from_evaluations, encode_delta_points};
 
 #[derive(Clone, Debug)]
 pub struct UpdateResult {
@@ -23,8 +23,6 @@ pub struct UpdateResult {
     pub proof: StoredProof,
     pub aggregate_delta: i128,
 }
-
-pub(crate) const EMPTY_UPDATE_MARKER: &str = "dpoa-empty-update-v1";
 
 pub fn apply_update(
     srs: &Srs,
@@ -99,13 +97,9 @@ pub fn apply_update(
 
     let kzg_start = Instant::now();
     let kzg_polynomial_start = Instant::now();
-    let z_poly = query_ctx.z_poly();
-    let i_y = evaluation.remainder;
     let mut rng = rand::rngs::OsRng;
-    let rho_y = Fr::rand(&mut rng);
-    let j_y = i_y.add_scaled(z_poly, rho_y);
-    let mut quotient = evaluation.quotient;
-    quotient.sub_constant_assign(rho_y);
+    let r_y = Fr::rand(&mut rng);
+    let quotient = evaluation.quotient;
     if emit_timing {
         eprintln!(
             "stage=update_kzg_polynomial_prepare millis={}",
@@ -113,12 +107,12 @@ pub fn apply_update(
         );
     }
 
-    let c_y_start = Instant::now();
-    let c_y = commit_g1(srs, &j_y)?;
+    let d_y_start = Instant::now();
+    let d_y = commit_evaluation_vector(&witness.y_values, r_y)?;
     if emit_timing {
         eprintln!(
-            "stage=update_kzg_c_y_msm millis={}",
-            c_y_start.elapsed().as_millis()
+            "stage=update_d_y_vector_msm millis={}",
+            d_y_start.elapsed().as_millis()
         );
     }
     let r_u = Fr::rand(&mut rng);
@@ -167,24 +161,45 @@ pub fn apply_update(
     };
 
     let c_u_hex = point_g1_to_hex(&c_u)?;
-    let c_y_hex = point_g1_to_hex(&c_y)?;
+    let d_y_hex = point_g1_to_hex(&d_y)?;
     let c_d_hex = point_g1_to_hex(&c_d)?;
+    let delta_list_commitment_hex = delta_list_commitment(deltas);
+    let multi_zkopen_context = build_multi_zkopen_context(
+        &state.state_root,
+        new_state_root,
+        &state.accumulator_hex,
+        &state.balance_commitment_hex,
+        &next_balance_commitment_hex,
+        &delta_list_commitment_hex,
+        &c_u_hex,
+        &d_y_hex,
+        &c_d_hex,
+    );
     let parallel_phase_start = Instant::now();
-    let prove_kzg = || -> Result<G1Projective, String> {
+    let prove_kzg = || -> Result<String, String> {
         let quotient_msm_start = Instant::now();
-        let result = commit_g1(srs, &quotient);
+        let batch_opening = commit_g1(srs, &quotient)?;
         if emit_timing {
             eprintln!(
                 "stage=update_kzg_quotient_msm millis={}",
                 quotient_msm_start.elapsed().as_millis()
             );
         }
-        result
+        let accumulator = point_g1_from_hex(&state.accumulator_hex)?;
+        prove_multi_zkopen(
+            srs,
+            &accumulator,
+            &witness.x_values,
+            &witness.y_values,
+            &d_y,
+            r_y,
+            &batch_opening,
+            &multi_zkopen_context,
+        )
     };
     let prove_logic = || -> Result<(_, _), String> {
         let logic_start = Instant::now();
-        let zero_test_proof = prove_optimized_zero_test_logic(
-            srs,
+        let zero_test_proof = prove_direct_zero_test_logic(
             &witness,
             deltas,
             &state.state_root,
@@ -193,12 +208,10 @@ pub fn apply_update(
             &state.balance_commitment_hex,
             &next_balance_commitment_hex,
             &c_u_hex,
-            &c_y_hex,
+            &d_y_hex,
             &c_d_hex,
             r_u,
-            rho_y,
-            &query_ctx,
-            &j_y,
+            r_y,
         )?;
         let projection_ipa_proof =
             prove_projection_ipa(&witness.u_values, deltas, &c_u_hex, &c_d_hex, r_u, r_d)?;
@@ -231,13 +244,13 @@ pub fn apply_update(
         Ok(range_proof.proof_hex)
     };
     let parallel_enabled = env::var("POA_DISABLE_PROVER_PARALLEL").ok().as_deref() != Some("1");
-    let (eval_proof, zero_test_proof, projection_ipa_proof, balance_range_proof_hex) =
+    let (multi_zkopen_proof_hex, zero_test_proof, projection_ipa_proof, balance_range_proof_hex) =
         if parallel_enabled {
             thread::scope(|scope| -> Result<_, String> {
                 let kzg_handle = scope.spawn(prove_kzg);
                 let logic_handle = scope.spawn(prove_logic);
                 let range_handle = scope.spawn(prove_balance_range);
-                let eval_proof = kzg_handle
+                let multi_zkopen_proof_hex = kzg_handle
                     .join()
                     .map_err(|_| "KZG prover worker panicked".to_string())??;
                 let (zero_test_proof, projection_ipa_proof) = logic_handle
@@ -247,18 +260,18 @@ pub fn apply_update(
                     .join()
                     .map_err(|_| "balance range prover worker panicked".to_string())??;
                 Ok((
-                    eval_proof,
+                    multi_zkopen_proof_hex,
                     zero_test_proof,
                     projection_ipa_proof,
                     balance_range_proof_hex,
                 ))
             })?
         } else {
-            let eval_proof = prove_kzg()?;
+            let multi_zkopen_proof_hex = prove_kzg()?;
             let (zero_test_proof, projection_ipa_proof) = prove_logic()?;
             let balance_range_proof_hex = prove_balance_range()?;
             (
-                eval_proof,
+                multi_zkopen_proof_hex,
                 zero_test_proof,
                 projection_ipa_proof,
                 balance_range_proof_hex,
@@ -275,21 +288,15 @@ pub fn apply_update(
             kzg_start.elapsed().as_millis()
         );
     }
-    let eval_proof_hex = point_g1_to_hex(&eval_proof)?;
-
-    let delta_list_commitment_hex = delta_list_commitment(deltas);
     let transcript_hex = build_transcript_hex(
         &state.state_root,
         new_state_root,
         &state.accumulator_hex,
         &delta_list_commitment_hex,
         &c_u_hex,
-        &c_y_hex,
+        &d_y_hex,
         &c_d_hex,
-        &eval_proof_hex,
-        &zero_test_proof.c_v_hex,
-        zero_test_proof.theta,
-        &zero_test_proof.theta_opening_proof_hex,
+        &multi_zkopen_proof_hex,
     );
 
     let proof = StoredProof {
@@ -297,43 +304,19 @@ pub fn apply_update(
         new_state_root: new_state_root.to_string(),
         delta_list_commitment_hex,
         c_u_hex,
-        c_y_hex,
+        d_y_hex,
         c_d_hex,
-        eval_proof_hex,
-        c_v_hex: zero_test_proof.c_v_hex,
-        theta: zero_test_proof.theta,
-        theta_opening_proof_hex: zero_test_proof.theta_opening_proof_hex,
+        multi_zkopen_proof_hex,
         gate_count: deltas
             .len()
             .checked_mul(2)
             .ok_or_else(|| "update gate count overflow".to_string())?,
         transcript_hex,
         bp_proof_hex: zero_test_proof.bp_proof_hex,
-        witness_vector_commitment_hex: zero_test_proof.witness_vector_commitment_hex,
-        rho_bp_commitment_hex: zero_test_proof.rho_bp_commitment_hex,
-        v_bp_commitment_hex: zero_test_proof.v_bp_commitment_hex,
-        witness_link_ipa_proof: zero_test_proof.witness_link_ipa_proof,
-        v_link_proof: zero_test_proof.v_link_proof,
+        committed_input_link_ipa_proof: zero_test_proof.committed_input_link_ipa_proof,
         projection_ipa_proof,
         balance_range_proof_hex,
     };
-
-    #[cfg(debug_assertions)]
-    if env::var("POA_DEBUG_INTERNAL_VERIFY").ok().as_deref() == Some("1") {
-        let z_commit_g2 = crate::kzg::commit_g2(srs, z_poly)?;
-        verify_internal(
-            srs,
-            state,
-            deltas,
-            &next_state,
-            &proof,
-            &witness,
-            z_poly,
-            &z_commit_g2,
-            &j_y,
-            rho_y,
-        )?;
-    }
 
     Ok(UpdateResult {
         next_state,
@@ -344,7 +327,6 @@ pub fn apply_update(
 
 fn apply_empty_update(state: &StoredState, new_state_root: &str) -> Result<UpdateResult, String> {
     let delta_list_commitment_hex = delta_list_commitment(&[]);
-    let theta = Fr::zero();
     let transcript_hex = build_transcript_hex(
         &state.state_root,
         new_state_root,
@@ -354,9 +336,6 @@ fn apply_empty_update(state: &StoredState, new_state_root: &str) -> Result<Updat
         "",
         "",
         "",
-        "",
-        theta,
-        EMPTY_UPDATE_MARKER,
     );
     let mut next_state = state.clone();
     next_state.state_root = new_state_root.to_string();
@@ -367,93 +346,18 @@ fn apply_empty_update(state: &StoredState, new_state_root: &str) -> Result<Updat
             new_state_root: new_state_root.to_string(),
             delta_list_commitment_hex,
             c_u_hex: String::new(),
-            c_y_hex: String::new(),
+            d_y_hex: String::new(),
             c_d_hex: String::new(),
-            eval_proof_hex: String::new(),
-            c_v_hex: String::new(),
-            theta,
-            theta_opening_proof_hex: EMPTY_UPDATE_MARKER.to_string(),
+            multi_zkopen_proof_hex: String::new(),
             gate_count: 0,
             transcript_hex,
             bp_proof_hex: String::new(),
-            witness_vector_commitment_hex: String::new(),
-            rho_bp_commitment_hex: String::new(),
-            v_bp_commitment_hex: String::new(),
-            witness_link_ipa_proof: Vec::new(),
-            v_link_proof: Vec::new(),
+            committed_input_link_ipa_proof: Vec::new(),
             projection_ipa_proof: Vec::new(),
             balance_range_proof_hex: String::new(),
         },
         aggregate_delta: 0,
     })
-}
-
-fn verify_internal(
-    srs: &Srs,
-    state: &StoredState,
-    deltas: &[Delta],
-    next_state: &StoredState,
-    proof: &StoredProof,
-    witness: &UpdateWitness,
-    z_poly: &Polynomial,
-    z_commit_g2: &G2Projective,
-    j_y: &Polynomial,
-    rho_y: Fr,
-) -> Result<(), String> {
-    let c_y = point_g1_from_hex(&proof.c_y_hex)?;
-    let eval_proof = point_g1_from_hex(&proof.eval_proof_hex)?;
-    let accumulator = point_g1_from_hex(&state.accumulator_hex)?;
-    if !verify_batch(&accumulator, &c_y, &eval_proof, z_commit_g2) {
-        return Err("KZG batch verification failed during internal consistency check".to_string());
-    }
-
-    let lagrange = lagrange_basis(&witness.x_values)?;
-    let mut structured = G1Projective::zero();
-    for (basis, y) in lagrange.iter().zip(witness.y_values.iter()) {
-        let basis_commit = commit_g1(srs, basis)?;
-        structured += basis_commit.mul_bigint(y.into_bigint());
-    }
-    let h_y = commit_g1(srs, z_poly)?;
-    structured += h_y.mul_bigint(rho_y.into_bigint());
-    if structured != c_y {
-        return Err("structured C_Y opening mismatch".to_string());
-    }
-
-    let reopened_j = commit_g1(srs, j_y)?;
-    if reopened_j != c_y {
-        return Err("J_Y commitment mismatch".to_string());
-    }
-
-    let expected_transcript = build_transcript_hex(
-        &state.state_root,
-        &next_state.state_root,
-        &state.accumulator_hex,
-        &proof.delta_list_commitment_hex,
-        &proof.c_u_hex,
-        &proof.c_y_hex,
-        &proof.c_d_hex,
-        &proof.eval_proof_hex,
-        &proof.c_v_hex,
-        proof.theta,
-        &proof.theta_opening_proof_hex,
-    );
-    if proof.transcript_hex != expected_transcript {
-        return Err("Fiat-Shamir transcript mismatch".to_string());
-    }
-
-    let projected_delta =
-        deltas
-            .iter()
-            .zip(witness.u_values.iter())
-            .try_fold(0i128, |sum, (delta, bit)| {
-                let contribution = if *bit == Fr::one() { delta.delta } else { 0 };
-                sum.checked_add(contribution)
-                    .ok_or_else(|| "delta projection overflowed i128".to_string())
-            })?;
-    if projected_delta != witness.d_value {
-        return Err("delta projection mismatch".to_string());
-    }
-    Ok(())
 }
 
 pub(crate) fn build_transcript_hex(
@@ -462,26 +366,19 @@ pub(crate) fn build_transcript_hex(
     accumulator_hex: &str,
     delta_list_commitment_hex: &str,
     c_u_hex: &str,
-    c_y_hex: &str,
+    d_y_hex: &str,
     c_d_hex: &str,
-    eval_proof_hex: &str,
-    c_v_hex: &str,
-    theta: Fr,
-    theta_opening_proof_hex: &str,
+    multi_zkopen_proof_hex: &str,
 ) -> String {
-    let theta_hex = scalar_to_hex(&theta).unwrap_or_else(|_| "invalid-theta".to_string());
     let fields = [
         old_root,
         new_root,
         accumulator_hex,
         delta_list_commitment_hex,
         c_u_hex,
-        c_y_hex,
+        d_y_hex,
         c_d_hex,
-        eval_proof_hex,
-        c_v_hex,
-        &theta_hex,
-        theta_opening_proof_hex,
+        multi_zkopen_proof_hex,
     ];
     let mut hasher = blake3::Hasher::new();
     for (index, field) in fields.iter().enumerate() {
@@ -491,6 +388,38 @@ pub(crate) fn build_transcript_hex(
         hasher.update(field.as_bytes());
     }
     common::crypto::hex_encode(hasher.finalize().as_bytes())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_multi_zkopen_context(
+    old_root: &str,
+    new_root: &str,
+    accumulator_hex: &str,
+    old_balance_commitment_hex: &str,
+    new_balance_commitment_hex: &str,
+    delta_list_commitment_hex: &str,
+    c_u_hex: &str,
+    d_y_hex: &str,
+    c_d_hex: &str,
+) -> Vec<u8> {
+    let fields = [
+        old_root.as_bytes(),
+        new_root.as_bytes(),
+        accumulator_hex.as_bytes(),
+        old_balance_commitment_hex.as_bytes(),
+        new_balance_commitment_hex.as_bytes(),
+        delta_list_commitment_hex.as_bytes(),
+        c_u_hex.as_bytes(),
+        d_y_hex.as_bytes(),
+        c_d_hex.as_bytes(),
+    ];
+    let mut context = Vec::new();
+    context.extend_from_slice(b"dynamic-poa-update-multizkopen-context-v1");
+    for field in fields {
+        context.extend_from_slice(&(field.len() as u64).to_le_bytes());
+        context.extend_from_slice(field);
+    }
+    context
 }
 
 pub fn delta_list_commitment(deltas: &[Delta]) -> String {

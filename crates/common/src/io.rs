@@ -269,7 +269,7 @@ pub fn read_proof(path: &Path) -> Result<StoredProof, String> {
     decode_proof_binary(&bytes)
 }
 
-const UPDATE_PROOF_MAGIC: &[u8; 8] = b"DPOAUPD5";
+const UPDATE_PROOF_MAGIC: &[u8; 8] = b"DPOAUPD6";
 
 pub fn encode_proof_binary(proof: &StoredProof) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
@@ -278,20 +278,13 @@ pub fn encode_proof_binary(proof: &StoredProof) -> Result<Vec<u8>, String> {
     put_bytes(&mut out, proof.new_state_root.as_bytes())?;
     put_hex(&mut out, &proof.delta_list_commitment_hex)?;
     put_hex(&mut out, &proof.c_u_hex)?;
-    put_hex(&mut out, &proof.c_y_hex)?;
+    put_hex(&mut out, &proof.d_y_hex)?;
     put_hex(&mut out, &proof.c_d_hex)?;
-    put_hex(&mut out, &proof.eval_proof_hex)?;
-    put_hex(&mut out, &proof.c_v_hex)?;
-    put_hex(&mut out, &scalar_to_hex(&proof.theta)?)?;
-    put_tagged_hex(&mut out, &proof.theta_opening_proof_hex, "zkopen", "v1", 5)?;
+    put_hex(&mut out, &proof.multi_zkopen_proof_hex)?;
     put_u64(&mut out, proof.gate_count as u64);
     put_hex(&mut out, &proof.transcript_hex)?;
     put_hex(&mut out, &proof.bp_proof_hex)?;
-    put_hex(&mut out, &proof.witness_vector_commitment_hex)?;
-    put_hex(&mut out, &proof.rho_bp_commitment_hex)?;
-    put_hex(&mut out, &proof.v_bp_commitment_hex)?;
-    put_bytes(&mut out, &proof.witness_link_ipa_proof)?;
-    put_bytes(&mut out, &proof.v_link_proof)?;
+    put_bytes(&mut out, &proof.committed_input_link_ipa_proof)?;
     put_bytes(&mut out, &proof.projection_ipa_proof)?;
     put_bytes(&mut out, proof.balance_range_proof_hex.as_bytes())?;
     Ok(out)
@@ -300,7 +293,7 @@ pub fn encode_proof_binary(proof: &StoredProof) -> Result<Vec<u8>, String> {
 fn decode_proof_binary(bytes: &[u8]) -> Result<StoredProof, String> {
     if !bytes.starts_with(UPDATE_PROOF_MAGIC) {
         return Err(
-            "unsupported update proof format; regenerate the proof with protocol v4".to_string(),
+            "unsupported update proof format; regenerate the proof with the MultiZKOpen update protocol".to_string(),
         );
     }
     let mut input = BinaryReader::new(&bytes[UPDATE_PROOF_MAGIC.len()..]);
@@ -308,21 +301,14 @@ fn decode_proof_binary(bytes: &[u8]) -> Result<StoredProof, String> {
     let new_state_root = input.string()?;
     let delta_list_commitment_hex = input.hex()?;
     let c_u_hex = input.hex()?;
-    let c_y_hex = input.hex()?;
+    let d_y_hex = input.hex()?;
     let c_d_hex = input.hex()?;
-    let eval_proof_hex = input.hex()?;
-    let c_v_hex = input.hex()?;
-    let theta = scalar_from_hex(&input.hex()?)?;
-    let theta_opening_proof_hex = input.tagged_hex("zkopen", "v1", 5)?;
+    let multi_zkopen_proof_hex = input.hex()?;
     let gate_count = usize::try_from(input.u64()?)
         .map_err(|_| "update proof gate count does not fit usize".to_string())?;
     let transcript_hex = input.hex()?;
     let bp_proof_hex = input.hex()?;
-    let witness_vector_commitment_hex = input.hex()?;
-    let rho_bp_commitment_hex = input.hex()?;
-    let v_bp_commitment_hex = input.hex()?;
-    let witness_link_ipa_proof = input.bytes()?.to_vec();
-    let v_link_proof = input.bytes()?.to_vec();
+    let committed_input_link_ipa_proof = input.bytes()?.to_vec();
     let projection_ipa_proof = input.bytes()?.to_vec();
     let balance_range_proof_hex = input.string()?;
     input.finish()?;
@@ -331,20 +317,13 @@ fn decode_proof_binary(bytes: &[u8]) -> Result<StoredProof, String> {
         new_state_root,
         delta_list_commitment_hex,
         c_u_hex,
-        c_y_hex,
+        d_y_hex,
         c_d_hex,
-        eval_proof_hex,
-        c_v_hex,
-        theta,
-        theta_opening_proof_hex,
+        multi_zkopen_proof_hex,
         gate_count,
         transcript_hex,
         bp_proof_hex,
-        witness_vector_commitment_hex,
-        rho_bp_commitment_hex,
-        v_bp_commitment_hex,
-        witness_link_ipa_proof,
-        v_link_proof,
+        committed_input_link_ipa_proof,
         projection_ipa_proof,
         balance_range_proof_hex,
     })
@@ -368,23 +347,6 @@ fn put_bytes(out: &mut Vec<u8>, value: &[u8]) -> Result<(), String> {
 
 fn put_hex(out: &mut Vec<u8>, value: &str) -> Result<(), String> {
     put_bytes(out, &hex_decode(value)?)
-}
-
-fn put_tagged_hex(
-    out: &mut Vec<u8>,
-    value: &str,
-    tag: &str,
-    version: &str,
-    field_count: usize,
-) -> Result<(), String> {
-    let parts = value.split(':').collect::<Vec<_>>();
-    if parts.len() != field_count + 2 || parts[0] != tag || parts[1] != version {
-        return Err(format!("invalid {tag} {version} proof encoding"));
-    }
-    for part in &parts[2..] {
-        put_hex(out, part)?;
-    }
-    Ok(())
 }
 
 struct BinaryReader<'a> {
@@ -438,21 +400,6 @@ impl<'a> BinaryReader<'a> {
 
     fn hex(&mut self) -> Result<String, String> {
         Ok(hex_encode(self.bytes()?))
-    }
-
-    fn tagged_hex(
-        &mut self,
-        tag: &str,
-        version: &str,
-        field_count: usize,
-    ) -> Result<String, String> {
-        let mut values = Vec::with_capacity(field_count + 2);
-        values.push(tag.to_string());
-        values.push(version.to_string());
-        for _ in 0..field_count {
-            values.push(self.hex()?);
-        }
-        Ok(values.join(":"))
     }
 
     fn finish(&self) -> Result<(), String> {
@@ -1331,31 +1278,24 @@ mod init_privacy_tests {
     }
 
     #[test]
-    fn update_v4_binary_round_trip_includes_balance_range_proof() {
+    fn update_multizkopen_binary_round_trip_includes_balance_range_proof() {
         let proof = StoredProof {
             old_state_root: "old".to_string(),
             new_state_root: "new".to_string(),
             delta_list_commitment_hex: "00".to_string(),
             c_u_hex: "01".to_string(),
-            c_y_hex: "02".to_string(),
+            d_y_hex: "02".to_string(),
             c_d_hex: "03".to_string(),
-            eval_proof_hex: "04".to_string(),
-            c_v_hex: "05".to_string(),
-            theta: Fr::from(7u64),
-            theta_opening_proof_hex: "zkopen:v1:06:07:08:09:0a".to_string(),
+            multi_zkopen_proof_hex: "04".to_string(),
             gate_count: 2,
             transcript_hex: "09".to_string(),
             bp_proof_hex: "0a".to_string(),
-            witness_vector_commitment_hex: "0b".to_string(),
-            rho_bp_commitment_hex: "0c".to_string(),
-            v_bp_commitment_hex: "0d".to_string(),
-            witness_link_ipa_proof: vec![14],
-            v_link_proof: vec![15],
+            committed_input_link_ipa_proof: vec![14],
             projection_ipa_proof: vec![16],
             balance_range_proof_hex: "crange:v1:128:aa,bb:cc".to_string(),
         };
         let encoded = encode_proof_binary(&proof).unwrap();
-        assert!(encoded.starts_with(b"DPOAUPD5"));
+        assert!(encoded.starts_with(b"DPOAUPD6"));
         assert_eq!(decode_proof_binary(&encoded).unwrap(), proof);
     }
 }

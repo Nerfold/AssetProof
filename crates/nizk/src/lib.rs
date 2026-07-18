@@ -6,6 +6,7 @@ pub mod init;
 pub mod init_proof;
 pub mod insert;
 pub mod kzg;
+pub mod multizkopen;
 pub mod parallel;
 pub mod polynomial;
 pub mod range;

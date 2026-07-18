@@ -1,8 +1,7 @@
 use crate::commitment::derive_generator;
 use crate::kzg::{commit_g1, Srs};
-use crate::polynomial::{Polynomial, QueryContext};
+use crate::polynomial::QueryContext;
 use crate::witness::UpdateWitness;
-use crate::zkopen::{eval_commit, prove_committed_opening, verify_committed_opening};
 use ark_bls12_381::{Fr, G1Affine as ArkG1Affine, G1Projective as ArkG1};
 use ark_ec::{CurveGroup, PrimeGroup};
 use ark_ff::{BigInteger, PrimeField, UniformRand, Zero};
@@ -32,16 +31,9 @@ pub struct LogicProof {
 }
 
 #[derive(Clone, Debug)]
-pub struct OptimizedZeroTestProof {
+pub struct DirectZeroTestProof {
     pub bp_proof_hex: String,
-    pub witness_vector_commitment_hex: String,
-    pub rho_bp_commitment_hex: String,
-    pub v_bp_commitment_hex: String,
-    pub witness_link_ipa_proof: Vec<u8>,
-    pub v_link_proof: Vec<u8>,
-    pub c_v_hex: String,
-    pub theta: Fr,
-    pub theta_opening_proof_hex: String,
+    pub committed_input_link_ipa_proof: Vec<u8>,
 }
 
 #[derive(Clone, Debug)]
@@ -467,8 +459,7 @@ pub fn verify_zero_test_logic(
     result
 }
 
-pub fn prove_optimized_zero_test_logic(
-    srs: &Srs,
+pub fn prove_direct_zero_test_logic(
     witness: &UpdateWitness,
     deltas: &[Delta],
     old_state_root: &str,
@@ -477,13 +468,11 @@ pub fn prove_optimized_zero_test_logic(
     old_balance_commitment_hex: &str,
     new_balance_commitment_hex: &str,
     c_u_hex: &str,
-    c_y_hex: &str,
+    d_y_hex: &str,
     c_d_hex: &str,
     r_u: Fr,
-    rho_y: Fr,
-    query_ctx: &QueryContext,
-    j_y: &Polynomial,
-) -> Result<OptimizedZeroTestProof, String> {
+    r_y: Fr,
+) -> Result<DirectZeroTestProof, String> {
     if witness.u_values.len() != deltas.len()
         || witness.y_values.len() != deltas.len()
         || witness.z_values.len() != deltas.len()
@@ -491,58 +480,10 @@ pub fn prove_optimized_zero_test_logic(
         return Err("optimized zero-test witness length mismatch".to_string());
     }
     let wire_capacity = update_relation_capacity(deltas.len());
-    let wire_values = zero_test_wire_values(witness, wire_capacity)?;
     let pc_gens = pedersen_gens();
-    let mut rng = rand::rngs::OsRng;
-    let r_w = Fr::rand(&mut rng);
-    let c_w = commit_witness_vector(&wire_values, wire_capacity, fr_to_bp_scalar(&r_w)?)?;
-    let witness_vector_commitment_hex = encode_bp_point(&c_w);
-    let rho_bp_blind = BpScalar::random(&mut rng);
-    let c_rho_bp = pc_gens.commit(fr_to_bp_scalar(&rho_y)?, rho_bp_blind);
-    let rho_bp_commitment_hex = encode_bp_point(&c_rho_bp);
-    let theta = derive_update_theta(
-        old_state_root,
-        new_state_root,
-        accumulator_hex,
-        old_balance_commitment_hex,
-        new_balance_commitment_hex,
-        deltas,
-        c_u_hex,
-        c_d_hex,
-        c_y_hex,
-        &witness_vector_commitment_hex,
-        &rho_bp_commitment_hex,
-        query_ctx.points(),
-    )?;
-    let link_coefficients = random_link_coefficients(query_ctx, theta)?;
-    let v = random_link_value(
-        &witness.y_values,
-        rho_y,
-        &link_coefficients.lagrange_at_theta,
-        link_coefficients.z_theta,
-    );
-    let r_v = derive_eval_blind("update-r-v", v, theta);
-    let c_v = eval_commit(v, r_v);
-    let c_v_hex = point_g1_to_hex(&c_v)?;
-    let theta_divisor = Polynomial::from_coeffs(vec![-theta, Fr::from(1u64)]);
-    let theta_quotient = j_y
-        .sub(&Polynomial::constant(v))
-        .div_exact(&theta_divisor)?;
-    let theta_opening = commit_g1(srs, &theta_quotient)?;
-    let theta_opening_proof_hex = prove_committed_opening(
-        srs,
-        c_y_hex,
-        theta,
-        &c_v_hex,
-        v,
-        r_v,
-        &theta_opening,
-        "dynamic-poa-update-theta-zkopen",
-    )?;
-    let v_bp_blind = BpScalar::random(&mut rng);
     let bp_gens = bulletproof_gens(wire_capacity);
-    let mut transcript = Transcript::new(b"dynamic-poa-vector-committed-zero-test-v3");
-    append_optimized_zero_test_public_to_transcript(
+    let mut transcript = Transcript::new(b"dynamic-poa-direct-multizkopen-zero-test-v1");
+    append_direct_zero_test_public_to_transcript(
         &mut transcript,
         old_state_root,
         new_state_root,
@@ -550,131 +491,56 @@ pub fn prove_optimized_zero_test_logic(
         old_balance_commitment_hex,
         new_balance_commitment_hex,
         c_u_hex,
-        c_y_hex,
+        d_y_hex,
         c_d_hex,
-        &c_v_hex,
-        &witness_vector_commitment_hex,
-        &rho_bp_commitment_hex,
-        theta,
         deltas,
-    )?;
+    );
     let mut prover = Prover::new(pc_gens, &mut transcript);
-    let (actual_rho_commitment, rho_var) = prover.commit(fr_to_bp_scalar(&rho_y)?, rho_bp_blind);
-    if actual_rho_commitment != c_rho_bp {
-        return Err("rho Bulletproof commitment mismatch".to_string());
-    }
-    let (c_v_bp, v_var) = prover.commit(fr_to_bp_scalar(&v)?, v_bp_blind);
-    let v_bp_commitment_hex = encode_bp_point(&c_v_bp);
-    optimized_vector_zero_test_relation(
-        &mut prover,
-        Some(witness),
-        rho_var,
-        v_var,
-        &link_coefficients.lagrange_at_theta,
-        link_coefficients.z_theta,
-    )?;
+    direct_vector_zero_test_relation(&mut prover, Some(witness), deltas.len())?;
     let (bp_proof, phase_one_opening) = prover
         .prove_with_phase_one_opening(bp_gens.as_ref())
-        .map_err(|err| format!("optimized zero-test bulletproof prove: {err}"))?;
+        .map_err(|err| format!("direct zero-test Bulletproof prove: {err}"))?;
     let bp_proof_bytes = bp_proof.to_bytes();
-    let witness_link_ipa_proof = prove_witness_link_ipa(
+    let committed_input_link_ipa_proof = prove_committed_input_link_ipa(
         &bp_proof,
         &phase_one_opening,
-        &wire_values,
+        witness,
         wire_capacity,
         deltas,
         c_u_hex,
-        &witness_vector_commitment_hex,
-        &c_v_hex,
+        d_y_hex,
         r_u,
-        r_w,
+        r_y,
         &bp_proof_bytes,
     )?;
-    let v_link_proof = prove_scalar_commitment_link(v, v_bp_blind, r_v, &c_v_bp, &c_v, theta)?;
 
-    Ok(OptimizedZeroTestProof {
+    Ok(DirectZeroTestProof {
         bp_proof_hex: hex_encode(&bp_proof_bytes),
-        witness_vector_commitment_hex,
-        rho_bp_commitment_hex,
-        v_bp_commitment_hex,
-        witness_link_ipa_proof,
-        v_link_proof,
-        c_v_hex,
-        theta,
-        theta_opening_proof_hex,
+        committed_input_link_ipa_proof,
     })
 }
 
-pub fn verify_optimized_zero_test_logic(
-    srs: &Srs,
+pub fn verify_direct_zero_test_logic(
     deltas: &[Delta],
-    x_values: &[Fr],
     old_state_root: &str,
     new_state_root: &str,
     accumulator_hex: &str,
     old_balance_commitment_hex: &str,
     new_balance_commitment_hex: &str,
     c_u_hex: &str,
-    c_y_hex: &str,
-    c_v_hex: &str,
+    d_y_hex: &str,
     c_d_hex: &str,
-    theta: Fr,
-    theta_opening_proof_hex: &str,
     bp_proof_hex: &str,
-    witness_vector_commitment_hex: &str,
-    rho_bp_commitment_hex: &str,
-    v_bp_commitment_hex: &str,
-    witness_link_ipa_proof: &[u8],
-    v_link_proof: &[u8],
+    committed_input_link_ipa_proof: &[u8],
 ) -> Result<(), String> {
     let emit_timing = verify_timing_enabled();
     let total_start = Instant::now();
-    let parse_start = Instant::now();
     let wire_capacity = update_relation_capacity(deltas.len());
-    let c_w = decode_bp_point(witness_vector_commitment_hex)?;
-    let c_rho_bp = decode_bp_point(rho_bp_commitment_hex)?;
-    let c_v_bp = decode_bp_point(v_bp_commitment_hex)?;
-    emit_bp_timing(emit_timing, "verify_vector_commitments_parse", parse_start);
-    let theta_start = Instant::now();
-    let expected_theta = derive_update_theta(
-        old_state_root,
-        new_state_root,
-        accumulator_hex,
-        old_balance_commitment_hex,
-        new_balance_commitment_hex,
-        deltas,
-        c_u_hex,
-        c_d_hex,
-        c_y_hex,
-        witness_vector_commitment_hex,
-        rho_bp_commitment_hex,
-        x_values,
-    )?;
-    if theta != expected_theta {
-        return Err("optimized update theta mismatch".to_string());
-    }
-    if x_values.iter().any(|point| *point == theta) {
-        return Err("optimized update theta collides with query point".to_string());
-    }
-    let query_ctx = QueryContext::new(x_values)?;
-    let link_coefficients = random_link_coefficients(&query_ctx, theta)?;
-    emit_bp_timing(emit_timing, "verify_vector_link_theta", theta_start);
-    let zkopen_start = Instant::now();
-    verify_committed_opening(
-        srs,
-        c_y_hex,
-        theta,
-        c_v_hex,
-        theta_opening_proof_hex,
-        "dynamic-poa-update-theta-zkopen",
-    )?;
-    emit_bp_timing(emit_timing, "verify_vector_link_zkopen", zkopen_start);
-
     let r1cs_start = Instant::now();
     let pc_gens = pedersen_gens();
     let bp_gens = bulletproof_gens(wire_capacity);
-    let mut transcript = Transcript::new(b"dynamic-poa-vector-committed-zero-test-v3");
-    append_optimized_zero_test_public_to_transcript(
+    let mut transcript = Transcript::new(b"dynamic-poa-direct-multizkopen-zero-test-v1");
+    append_direct_zero_test_public_to_transcript(
         &mut transcript,
         old_state_root,
         new_state_root,
@@ -682,51 +548,36 @@ pub fn verify_optimized_zero_test_logic(
         old_balance_commitment_hex,
         new_balance_commitment_hex,
         c_u_hex,
-        c_y_hex,
+        d_y_hex,
         c_d_hex,
-        c_v_hex,
-        witness_vector_commitment_hex,
-        rho_bp_commitment_hex,
-        theta,
         deltas,
-    )?;
+    );
     let mut verifier = Verifier::new(&mut transcript);
-    let rho_var = verifier.commit(c_rho_bp);
-    let v_var = verifier.commit(c_v_bp);
-    optimized_vector_zero_test_relation(
-        &mut verifier,
-        None,
-        rho_var,
-        v_var,
-        &link_coefficients.lagrange_at_theta,
-        link_coefficients.z_theta,
-    )?;
+    direct_vector_zero_test_relation(&mut verifier, None, deltas.len())?;
 
     let bp_bytes = hex_decode(bp_proof_hex)?;
     let bp_proof = R1CSProof::from_bytes(&bp_bytes)
-        .map_err(|err| format!("optimized zero-test bulletproof parse: {err}"))?;
+        .map_err(|err| format!("direct zero-test Bulletproof parse: {err}"))?;
     verifier
         .verify(&bp_proof, pc_gens, bp_gens.as_ref())
-        .map_err(|err| format!("optimized zero-test bulletproof verify: {err}"))?;
+        .map_err(|err| format!("direct zero-test Bulletproof verify: {err}"))?;
     emit_bp_timing(emit_timing, "verify_vector_r1cs", r1cs_start);
-    let witness_link_start = Instant::now();
-    verify_witness_link_ipa(
+    let committed_input_link_start = Instant::now();
+    verify_committed_input_link_ipa(
         &bp_proof,
-        &c_w,
         wire_capacity,
         deltas,
         c_u_hex,
-        c_v_hex,
-        witness_vector_commitment_hex,
-        witness_link_ipa_proof,
+        d_y_hex,
+        committed_input_link_ipa_proof,
         &bp_bytes,
     )?;
-    emit_bp_timing(emit_timing, "verify_witness_link_ipa", witness_link_start);
-    let scalar_link_start = Instant::now();
-    let c_v = point_g1_from_hex(c_v_hex)?;
-    verify_scalar_commitment_link(&c_v_bp, &c_v, theta, v_link_proof)?;
-    emit_bp_timing(emit_timing, "verify_v_scalar_link", scalar_link_start);
-    emit_bp_timing(emit_timing, "verify_optimized_zero_test_total", total_start);
+    emit_bp_timing(
+        emit_timing,
+        "verify_committed_input_link_ipa",
+        committed_input_link_start,
+    );
+    emit_bp_timing(emit_timing, "verify_direct_zero_test_total", total_start);
     Ok(())
 }
 
@@ -1055,15 +906,11 @@ fn zero_test_relation<CS: ConstraintSystem>(
     Ok(())
 }
 
-fn optimized_vector_zero_test_relation<CS: ConstraintSystem>(
+fn direct_vector_zero_test_relation<CS: ConstraintSystem>(
     cs: &mut CS,
     witness: Option<&UpdateWitness>,
-    rho_var: bulletproofs_bls::r1cs::Variable,
-    v_var: bulletproofs_bls::r1cs::Variable,
-    lagrange_at_theta: &[Fr],
-    z_theta: Fr,
+    m: usize,
 ) -> Result<(), String> {
-    let m = lagrange_at_theta.len();
     if let Some(witness) = witness {
         if witness.u_values.len() != m || witness.y_values.len() != m || witness.z_values.len() != m
         {
@@ -1071,7 +918,6 @@ fn optimized_vector_zero_test_relation<CS: ConstraintSystem>(
         }
     }
 
-    let mut y_vars = Vec::with_capacity(m);
     for j in 0..m {
         let gate_uy = match witness {
             Some(w) => Some((
@@ -1096,15 +942,7 @@ fn optimized_vector_zero_test_relation<CS: ConstraintSystem>(
         cs.constrain(uy.into());
         cs.constrain(y_left - y_right);
         cs.constrain(yz - bp_one() + u);
-        y_vars.push(y_left);
     }
-
-    let mut link_lc: LinearCombination = v_var.into();
-    for (y, coeff) in y_vars.into_iter().zip(lagrange_at_theta.iter()) {
-        link_lc = link_lc - fr_to_bp_scalar(coeff)? * y;
-    }
-    link_lc = link_lc - fr_to_bp_scalar(&z_theta)? * rho_var;
-    cs.constrain(link_lc);
     Ok(())
 }
 
@@ -1428,125 +1266,86 @@ fn flatten_zero_test_values(witness: &UpdateWitness) -> Vec<Fr> {
     values
 }
 
-fn zero_test_wire_values(
-    witness: &UpdateWitness,
-    wire_capacity: usize,
-) -> Result<Vec<BpScalar>, String> {
-    let m = witness.u_values.len();
-    if witness.y_values.len() != m
-        || witness.z_values.len() != m
-        || wire_capacity < 2 * m
-        || !wire_capacity.is_power_of_two()
-    {
-        return Err("invalid zero-test wire vector shape".to_string());
+fn direct_committed_input_generators(wire_capacity: usize, m: usize) -> Result<Vec<BpG1>, String> {
+    if 2 * m > wire_capacity {
+        return Err("direct committed-input link capacity is too small".to_string());
     }
-    let mut left = vec![BpScalar::ZERO; wire_capacity];
-    let mut right = vec![BpScalar::ZERO; wire_capacity];
-    for j in 0..m {
-        left[2 * j] = fr_to_bp_scalar(&witness.u_values[j])?;
-        right[2 * j] = fr_to_bp_scalar(&witness.y_values[j])?;
-        left[2 * j + 1] = fr_to_bp_scalar(&witness.y_values[j])?;
-        right[2 * j + 1] = fr_to_bp_scalar(&witness.z_values[j])?;
-    }
-    left.extend(right);
-    Ok(left)
-}
-
-fn witness_vector_generators(wire_capacity: usize) -> Vec<BpG1> {
     let bp_gens = bulletproof_gens(wire_capacity);
-    bp_gens
-        .share(1)
+    let mut generators = bp_gens
+        .share(0)
         .G(wire_capacity)
         .copied()
-        .chain(bp_gens.share(1).H(wire_capacity).copied())
-        .collect()
-}
-
-fn commit_witness_vector(
-    wire_values: &[BpScalar],
-    wire_capacity: usize,
-    blind: BpScalar,
-) -> Result<BpG1, String> {
-    if wire_values.len() != 2 * wire_capacity {
-        return Err("witness vector commitment length mismatch".to_string());
-    }
-    let mut points = witness_vector_generators(wire_capacity);
-    points.push(pedersen_gens().B_blinding);
-    let mut scalars = wire_values.to_vec();
-    scalars.push(blind);
-    Ok(BpG1::sum_of_products(&points, &scalars))
-}
-
-fn witness_link_generators(wire_capacity: usize, m: usize) -> Result<Vec<BpG1>, String> {
-    if 2 * m > wire_capacity {
-        return Err("witness link capacity is too small".to_string());
-    }
-    let bp_gens = bulletproof_gens(wire_capacity);
-    let a_g = bp_gens.share(0).G(wire_capacity).copied();
-    let a_h = bp_gens.share(0).H(wire_capacity).copied();
-    let w_g = bp_gens.share(1).G(wire_capacity).copied();
-    let w_h = bp_gens.share(1).H(wire_capacity).copied();
-    let u = bp_gens.share(2).G(m).copied().collect::<Vec<_>>();
-    let mut generators = a_g
-        .zip(w_g)
-        .enumerate()
-        .map(|(index, (a, w))| {
-            let mut combined = a + w;
-            if index < 2 * m && index % 2 == 0 {
-                combined += u[index / 2];
-            }
-            combined
-        })
+        .chain(bp_gens.share(0).H(wire_capacity).copied())
         .collect::<Vec<_>>();
-    generators.extend(a_h.zip(w_h).map(|(a, w)| a + w));
+    let u_generators = bp_gens.share(2).G(m).copied().collect::<Vec<_>>();
+    let y_generators = crate::multizkopen::evaluation_generators(m)
+        .iter()
+        .map(ark_g1_to_bp)
+        .collect::<Result<Vec<_>, _>>()?;
+    for j in 0..m {
+        // a_L[2j] is u_j and a_R[2j] is the first copy of y_j.
+        generators[2 * j] += u_generators[j];
+        generators[wire_capacity + 2 * j] += y_generators[j];
+    }
+    // D_Y uses an independent blinding base. Treat r_Y as an additional
+    // committed coordinate in the link IPA instead of folding it into the
+    // Bulletproof blinding scalar.
+    generators.push(ark_g1_to_bp(
+        &crate::multizkopen::evaluation_blinding_generator(),
+    )?);
+    let padded_len = generators.len().next_power_of_two();
+    while generators.len() < padded_len {
+        generators.push(ark_g1_to_bp(&derive_generator(
+            "update-committed-input-link-padding",
+            generators.len(),
+        ))?);
+    }
     Ok(generators)
 }
 
 #[allow(clippy::too_many_arguments)]
-fn prove_witness_link_ipa(
+fn prove_committed_input_link_ipa(
     bp_proof: &R1CSProof,
     opening: &PhaseOneWitnessCommitmentOpening,
-    wire_values: &[BpScalar],
+    witness: &UpdateWitness,
     wire_capacity: usize,
     deltas: &[Delta],
     c_u_hex: &str,
-    c_w_hex: &str,
-    c_v_hex: &str,
+    d_y_hex: &str,
     r_u: Fr,
-    r_w: Fr,
+    r_y: Fr,
     bp_proof_bytes: &[u8],
 ) -> Result<Vec<u8>, String> {
     let n = deltas
         .len()
         .checked_mul(2)
-        .ok_or_else(|| "link vector length overflow".to_string())?;
+        .ok_or_else(|| "direct link vector length overflow".to_string())?;
     if opening.a_l().len() != n || opening.a_r().len() != n {
         return Err("R1CS phase-one opening length mismatch".to_string());
     }
+    for j in 0..deltas.len() {
+        if opening.a_l()[2 * j] != fr_to_bp_scalar(&witness.u_values[j])?
+            || opening.a_r()[2 * j] != fr_to_bp_scalar(&witness.y_values[j])?
+        {
+            return Err("Bulletproof wires differ from D_Y/C_U committed inputs".to_string());
+        }
+    }
+    let generators = direct_committed_input_generators(wire_capacity, deltas.len())?;
     let mut opening_values = opening.a_l().to_vec();
     opening_values.resize(wire_capacity, BpScalar::ZERO);
     let mut right = opening.a_r().to_vec();
     right.resize(wire_capacity, BpScalar::ZERO);
     opening_values.extend(right);
-    if opening_values != wire_values {
-        return Err("R1CS wire opening differs from committed witness vector".to_string());
-    }
+    opening_values.push(fr_to_bp_scalar(&r_y)?);
+    opening_values.resize(generators.len(), BpScalar::ZERO);
 
-    let c_w = decode_bp_point(c_w_hex)?;
     let c_u = ark_g1_to_bp(&point_g1_from_hex(c_u_hex)?)?;
-    let commitment = bp_proof.phase_one_input_commitment() + c_w + c_u;
-    let generators = witness_link_generators(wire_capacity, deltas.len())?;
-    let blind = opening.blinding() + fr_to_bp_scalar(&(r_w + r_u))?;
+    let d_y = ark_g1_to_bp(&point_g1_from_hex(d_y_hex)?)?;
+    let commitment = bp_proof.phase_one_input_commitment() + c_u + d_y;
+    let blind = opening.blinding() + fr_to_bp_scalar(&r_u)?;
     let public_vector = vec![BpScalar::ZERO; generators.len()];
-    let mut transcript = Transcript::new(b"dynamic-poa-witness-vector-link-v1");
-    append_witness_link_public(
-        &mut transcript,
-        deltas,
-        c_u_hex,
-        c_w_hex,
-        c_v_hex,
-        bp_proof_bytes,
-    );
+    let mut transcript = Transcript::new(b"dynamic-poa-direct-committed-input-link-v1");
+    append_committed_input_link_public(&mut transcript, deltas, c_u_hex, d_y_hex, bp_proof_bytes);
     let proof = LinearProof::create(
         &mut transcript,
         rand::rngs::OsRng,
@@ -1558,46 +1357,35 @@ fn prove_witness_link_ipa(
         &pedersen_gens().B,
         &pedersen_gens().B_blinding,
     )
-    .map_err(|err| format!("witness-link IPA prove: {err}"))?;
+    .map_err(|err| format!("committed-input link IPA prove: {err}"))?;
     Ok(proof.to_bytes())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn verify_witness_link_ipa(
+fn verify_committed_input_link_ipa(
     bp_proof: &R1CSProof,
-    c_w: &BpG1,
     wire_capacity: usize,
     deltas: &[Delta],
     c_u_hex: &str,
-    c_v_hex: &str,
-    c_w_hex: &str,
+    d_y_hex: &str,
     proof_bytes: &[u8],
     bp_proof_bytes: &[u8],
 ) -> Result<(), String> {
-    let vector_len = 2 * wire_capacity;
-    let expected_size = 112 + 96 * vector_len.trailing_zeros() as usize;
+    let generators = direct_committed_input_generators(wire_capacity, deltas.len())?;
+    let expected_size = 112 + 96 * generators.len().trailing_zeros() as usize;
     if proof_bytes.len() != expected_size {
         return Err(format!(
-            "witness-link IPA length mismatch: got {}, expected {}",
-            proof_bytes.len(),
-            expected_size
+            "committed-input link IPA length mismatch: got {}, expected {expected_size}",
+            proof_bytes.len()
         ));
     }
     let proof = LinearProof::from_bytes(proof_bytes)
-        .map_err(|err| format!("witness-link IPA parse: {err}"))?;
+        .map_err(|err| format!("committed-input link IPA parse: {err}"))?;
     let c_u = ark_g1_to_bp(&point_g1_from_hex(c_u_hex)?)?;
-    let commitment = bp_proof.phase_one_input_commitment() + *c_w + c_u;
-    let generators = witness_link_generators(wire_capacity, deltas.len())?;
-    let public_vector = vec![BpScalar::ZERO; vector_len];
-    let mut transcript = Transcript::new(b"dynamic-poa-witness-vector-link-v1");
-    append_witness_link_public(
-        &mut transcript,
-        deltas,
-        c_u_hex,
-        c_w_hex,
-        c_v_hex,
-        bp_proof_bytes,
-    );
+    let d_y = ark_g1_to_bp(&point_g1_from_hex(d_y_hex)?)?;
+    let commitment = bp_proof.phase_one_input_commitment() + c_u + d_y;
+    let public_vector = vec![BpScalar::ZERO; generators.len()];
+    let mut transcript = Transcript::new(b"dynamic-poa-direct-committed-input-link-v1");
+    append_committed_input_link_public(&mut transcript, deltas, c_u_hex, d_y_hex, bp_proof_bytes);
     proof
         .verify(
             &mut transcript,
@@ -1607,20 +1395,18 @@ fn verify_witness_link_ipa(
             &pedersen_gens().B_blinding,
             public_vector,
         )
-        .map_err(|err| format!("witness-link IPA verify: {err}"))
+        .map_err(|err| format!("committed-input link IPA verify: {err}"))
 }
 
-fn append_witness_link_public(
+fn append_committed_input_link_public(
     transcript: &mut Transcript,
     deltas: &[Delta],
     c_u_hex: &str,
-    c_w_hex: &str,
-    c_v_hex: &str,
+    d_y_hex: &str,
     bp_proof_bytes: &[u8],
 ) {
     transcript.append_message(b"C_U", c_u_hex.as_bytes());
-    transcript.append_message(b"C_W", c_w_hex.as_bytes());
-    transcript.append_message(b"C_v", c_v_hex.as_bytes());
+    transcript.append_message(b"D_Y", d_y_hex.as_bytes());
     transcript.append_message(b"r1cs-proof", bp_proof_bytes);
     for delta in deltas {
         transcript.append_message(b"addr", delta.address.as_bytes());
@@ -1712,7 +1498,7 @@ fn append_zero_test_public_to_transcript(
     append_public_to_transcript(transcript, c_u, c_y, "", deltas);
 }
 
-fn append_optimized_zero_test_public_to_transcript(
+fn append_direct_zero_test_public_to_transcript(
     transcript: &mut Transcript,
     old_state_root: &str,
     new_state_root: &str,
@@ -1720,15 +1506,11 @@ fn append_optimized_zero_test_public_to_transcript(
     old_balance_commitment_hex: &str,
     new_balance_commitment_hex: &str,
     c_u: &str,
-    c_y: &str,
+    d_y: &str,
     c_d: &str,
-    c_v: &str,
-    c_w: &str,
-    c_rho: &str,
-    theta: Fr,
     deltas: &[Delta],
-) -> Result<(), String> {
-    transcript.append_message(b"dom-sep", b"dynamic-poa-vector-committed-zero-test-v3");
+) {
+    transcript.append_message(b"dom-sep", b"dynamic-poa-direct-multizkopen-zero-test-v1");
     transcript.append_u64(b"m", deltas.len() as u64);
     transcript.append_message(b"old-root", old_state_root.as_bytes());
     transcript.append_message(b"new-root", new_state_root.as_bytes());
@@ -1736,17 +1518,12 @@ fn append_optimized_zero_test_public_to_transcript(
     transcript.append_message(b"old-C", old_balance_commitment_hex.as_bytes());
     transcript.append_message(b"new-C", new_balance_commitment_hex.as_bytes());
     transcript.append_message(b"C_U", c_u.as_bytes());
-    transcript.append_message(b"C_Y", c_y.as_bytes());
+    transcript.append_message(b"D_Y", d_y.as_bytes());
     transcript.append_message(b"C_D", c_d.as_bytes());
-    transcript.append_message(b"C_v", c_v.as_bytes());
-    transcript.append_message(b"C_W", c_w.as_bytes());
-    transcript.append_message(b"C_rho", c_rho.as_bytes());
-    transcript.append_message(b"theta", scalar_to_hex(&theta)?.as_bytes());
     for delta in deltas {
         transcript.append_message(b"addr", delta.address.as_bytes());
         transcript.append_message(b"delta", &delta.delta.to_le_bytes());
     }
-    Ok(())
 }
 
 fn append_projection_ipa_public(
@@ -2094,78 +1871,6 @@ fn insert_link_challenge(
     Ok(Fr::from_le_bytes_mod_order(hasher.finalize().as_bytes()))
 }
 
-#[derive(Clone, Debug)]
-struct RandomLinkCoefficients {
-    lagrange_at_theta: Vec<Fr>,
-    z_theta: Fr,
-}
-
-fn derive_update_theta(
-    old_state_root: &str,
-    new_state_root: &str,
-    accumulator_hex: &str,
-    old_balance_commitment_hex: &str,
-    new_balance_commitment_hex: &str,
-    deltas: &[Delta],
-    c_u_hex: &str,
-    c_d_hex: &str,
-    c_y_hex: &str,
-    witness_vector_commitment_hex: &str,
-    rho_bp_commitment_hex: &str,
-    x_values: &[Fr],
-) -> Result<Fr, String> {
-    for attempt in 0u64..128 {
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(b"dynamic-poa-updlink-theta-v3");
-        hasher.update(&attempt.to_le_bytes());
-        hasher.update(old_state_root.as_bytes());
-        hasher.update(new_state_root.as_bytes());
-        hasher.update(accumulator_hex.as_bytes());
-        hasher.update(old_balance_commitment_hex.as_bytes());
-        hasher.update(new_balance_commitment_hex.as_bytes());
-        hasher.update(c_u_hex.as_bytes());
-        hasher.update(c_d_hex.as_bytes());
-        hasher.update(c_y_hex.as_bytes());
-        hasher.update(witness_vector_commitment_hex.as_bytes());
-        hasher.update(rho_bp_commitment_hex.as_bytes());
-        for delta in deltas {
-            hasher.update(delta.address.as_bytes());
-            hasher.update(&delta.delta.to_le_bytes());
-        }
-        let theta = Fr::from_le_bytes_mod_order(hasher.finalize().as_bytes());
-        if !theta.is_zero() && !x_values.iter().any(|point| *point == theta) {
-            return Ok(theta);
-        }
-    }
-    Err("failed to derive non-colliding update theta".to_string())
-}
-
-fn random_link_coefficients(
-    query_ctx: &QueryContext,
-    theta: Fr,
-) -> Result<RandomLinkCoefficients, String> {
-    let lagrange_at_theta = query_ctx.lagrange_at(theta)?;
-    let z_theta = query_ctx.z_poly().evaluate(theta);
-    if z_theta.is_zero() {
-        return Err("random link theta collides with query set".to_string());
-    }
-    Ok(RandomLinkCoefficients {
-        lagrange_at_theta,
-        z_theta,
-    })
-}
-
-fn random_link_value(y_values: &[Fr], rho_y: Fr, lagrange_at_theta: &[Fr], z_theta: Fr) -> Fr {
-    y_values
-        .iter()
-        .zip(lagrange_at_theta.iter())
-        .fold(rho_y * z_theta, |acc, (y, coeff)| acc + *y * *coeff)
-}
-
-fn derive_eval_blind(_label: &str, _value: Fr, _theta: Fr) -> Fr {
-    Fr::rand(&mut rand::rngs::OsRng)
-}
-
 fn append_ark_g1_bytes(hasher: &mut blake3::Hasher, point: &ArkG1) -> Result<(), String> {
     let mut bytes = Vec::new();
     point
@@ -2348,107 +2053,6 @@ fn encode_bp_points(points: &[BpG1]) -> String {
         .map(|point| hex_encode(&point.to_affine().to_compressed()))
         .collect::<Vec<_>>()
         .join(",")
-}
-
-fn encode_bp_point(point: &BpG1) -> String {
-    hex_encode(&point.to_affine().to_compressed())
-}
-
-fn decode_bp_point(raw: &str) -> Result<BpG1, String> {
-    let points = decode_bp_points(raw)?;
-    if points.len() != 1 {
-        return Err("expected one Bulletproof G1 point".to_string());
-    }
-    Ok(points[0])
-}
-
-fn prove_scalar_commitment_link(
-    value: Fr,
-    bp_blind: BpScalar,
-    external_blind: Fr,
-    c_bp: &BpG1,
-    c_external: &ArkG1,
-    theta: Fr,
-) -> Result<Vec<u8>, String> {
-    let mut rng = rand::rngs::OsRng;
-    let t_value = Fr::rand(&mut rng);
-    let t_bp_blind = BpScalar::random(&mut rng);
-    let t_external_blind = Fr::rand(&mut rng);
-    let r_bp = pedersen_gens().commit(fr_to_bp_scalar(&t_value)?, t_bp_blind);
-    let r_external = eval_commit(t_value, t_external_blind);
-    let challenge = scalar_link_challenge(c_bp, c_external, &r_bp, &r_external, theta)?;
-    let challenge_bp = fr_to_bp_scalar(&challenge)?;
-    let s_value = t_value + challenge * value;
-    let s_bp_blind = t_bp_blind + challenge_bp * bp_blind;
-    let s_external_blind = t_external_blind + challenge * external_blind;
-
-    let mut bytes = Vec::with_capacity(192);
-    bytes.extend_from_slice(&r_bp.to_affine().to_compressed());
-    let mut ark_bytes = Vec::new();
-    r_external
-        .into_affine()
-        .serialize_compressed(&mut ark_bytes)
-        .map_err(|err| format!("serialize scalar-link point: {err}"))?;
-    bytes.extend_from_slice(&ark_bytes);
-    s_value
-        .serialize_compressed(&mut bytes)
-        .map_err(|err| format!("serialize scalar-link value: {err}"))?;
-    bytes.extend_from_slice(&s_bp_blind.to_le_bytes());
-    s_external_blind
-        .serialize_compressed(&mut bytes)
-        .map_err(|err| format!("serialize scalar-link blind: {err}"))?;
-    Ok(bytes)
-}
-
-fn verify_scalar_commitment_link(
-    c_bp: &BpG1,
-    c_external: &ArkG1,
-    theta: Fr,
-    proof: &[u8],
-) -> Result<(), String> {
-    if proof.len() != 192 {
-        return Err(format!(
-            "scalar-link proof length mismatch: got {}, expected 192",
-            proof.len()
-        ));
-    }
-    let r_bp = decode_bp_point(&hex_encode(&proof[..48]))?;
-    let r_external = point_g1_from_hex(&hex_encode(&proof[48..96]))?;
-    let s_value = common::crypto::scalar_from_hex(&hex_encode(&proof[96..128]))?;
-    let mut bp_blind_bytes = [0u8; 32];
-    bp_blind_bytes.copy_from_slice(&proof[128..160]);
-    let s_bp_blind = bp_scalar_from_32(&bp_blind_bytes)?;
-    let s_external_blind = common::crypto::scalar_from_hex(&hex_encode(&proof[160..192]))?;
-    let challenge = scalar_link_challenge(c_bp, c_external, &r_bp, &r_external, theta)?;
-    let challenge_bp = fr_to_bp_scalar(&challenge)?;
-    let lhs_bp = pedersen_gens().commit(fr_to_bp_scalar(&s_value)?, s_bp_blind);
-    let rhs_bp = r_bp + *c_bp * challenge_bp;
-    if lhs_bp != rhs_bp {
-        return Err("scalar-link Bulletproof commitment equation failed".to_string());
-    }
-    let lhs_external = eval_commit(s_value, s_external_blind);
-    let rhs_external = r_external + c_external.mul_bigint(challenge.into_bigint());
-    if lhs_external != rhs_external {
-        return Err("scalar-link external commitment equation failed".to_string());
-    }
-    Ok(())
-}
-
-fn scalar_link_challenge(
-    c_bp: &BpG1,
-    c_external: &ArkG1,
-    r_bp: &BpG1,
-    r_external: &ArkG1,
-    theta: Fr,
-) -> Result<Fr, String> {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"dynamic-poa-scalar-link-v1");
-    hasher.update(&c_bp.to_affine().to_compressed());
-    append_ark_g1_bytes(&mut hasher, c_external)?;
-    hasher.update(&r_bp.to_affine().to_compressed());
-    append_ark_g1_bytes(&mut hasher, r_external)?;
-    hasher.update(&theta.into_bigint().to_bytes_le());
-    Ok(Fr::from_le_bytes_mod_order(hasher.finalize().as_bytes()))
 }
 
 fn decode_bp_points(raw: &str) -> Result<Vec<BpG1>, String> {

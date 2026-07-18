@@ -24,7 +24,7 @@ use nizk_fixed_set::verifier::{
 
 mod ethereum_fixture;
 
-const FIXTURE_VERSION: &str = "ethereum-eip6800-verkle-v3-master";
+const FIXTURE_VERSION: &str = "ethereum-eip6800-verkle-v4-ecdsa";
 
 fn main() {
     if let Err(err) = run() {
@@ -582,7 +582,7 @@ fn benchmark_insert(
         ethereum_fixture::CHAIN_ID.to_string(),
         insert.address.clone(),
         insert.balance,
-        common::crypto::hex_encode(&insert.private_key),
+        common::crypto::hex_encode(&insert.ownership_signature),
         insert.tree_key,
         insert.basic_data,
         insert.proof.clone(),
@@ -738,7 +738,7 @@ fn benchmark_update(
             prover,
             verifier,
             proof_bytes,
-            proof_encoding: "DPOAUPD5-binary",
+            proof_encoding: "DPOAUPD6-multizkopen-binary",
         });
         prover_samples.push(prover);
         verifier_samples.push(verifier);
@@ -754,7 +754,7 @@ fn benchmark_update(
         &prover_samples,
         &verifier_samples,
         &proof_sizes,
-        "DPOAUPD5-binary",
+        "DPOAUPD6-multizkopen-binary",
     ))
 }
 
@@ -1086,6 +1086,18 @@ fn write_environment(config: &Config) -> Result<(), String> {
         "sp1_proof_mode",
         std::env::var("POA_SP1_PROOF_MODE").unwrap_or_else(|_| "groth16".to_string()),
     );
+    for key in [
+        "SHARD_SIZE",
+        "MINIMAL_TRACE_CHUNK_THRESHOLD",
+        "TRACE_CHUNK_SLOTS",
+        "GAS_TRACE_CHUNK_THRESHOLD",
+        "GAS_TRACE_CHUNK_SLOTS",
+    ] {
+        values.insert(
+            key,
+            std::env::var(key).unwrap_or_else(|_| "SP1 default".to_string()),
+        );
+    }
     values.insert("rustc", command_output("rustc", &["--version"]));
     values.insert("git_commit", command_output("git", &["rev-parse", "HEAD"]));
     values.insert("uname", command_output("uname", &["-a"]));

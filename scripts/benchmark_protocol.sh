@@ -10,12 +10,22 @@ MASTER_N="${MASTER_N:-1000000}"
 SAMPLES="${SAMPLES:-3}"
 WARMUP="${WARMUP:-1}"
 POA_SP1_PROOF_MODE="${POA_SP1_PROOF_MODE:-groth16}"
+# SP1's defaults target large proving machines (2^24-cycle shards and very
+# large trace buffers). Keep protocol benchmarks bounded on workstation-class
+# machines while allowing every value to be overridden explicitly.
+SHARD_SIZE="${SHARD_SIZE:-1048576}"
+MINIMAL_TRACE_CHUNK_THRESHOLD="${MINIMAL_TRACE_CHUNK_THRESHOLD:-1048576}"
+TRACE_CHUNK_SLOTS="${TRACE_CHUNK_SLOTS:-2}"
+GAS_TRACE_CHUNK_THRESHOLD="${GAS_TRACE_CHUNK_THRESHOLD:-8388608}"
+GAS_TRACE_CHUNK_SLOTS="${GAS_TRACE_CHUNK_SLOTS:-2}"
 RUN_ID="${RUN_ID:-$(date +%Y%m%d-%H%M%S)}"
 OUTPUT_DIR="${OUTPUT_DIR:-artifacts/benchmarks/protocol-$RUN_ID}"
 SRS_DIR="${SRS_DIR:-params/srs/bench}"
 FIXTURE_DIR="${FIXTURE_DIR:-data/mock/bench/generated}"
 
 export POA_SP1_PROOF_MODE
+export SHARD_SIZE MINIMAL_TRACE_CHUNK_THRESHOLD TRACE_CHUNK_SLOTS
+export GAS_TRACE_CHUNK_THRESHOLD GAS_TRACE_CHUNK_SLOTS
 
 echo "Dynamic PoA benchmark"
 echo "  n:          $N_SIZES"
@@ -24,6 +34,9 @@ echo "  master n:   $MASTER_N"
 echo "  samples:    $SAMPLES"
 echo "  warmup:     $WARMUP"
 echo "  SP1 mode:   $POA_SP1_PROOF_MODE"
+echo "  SP1 shard:  $SHARD_SIZE cycles"
+echo "  trace:      chunk=$MINIMAL_TRACE_CHUNK_THRESHOLD slots=$TRACE_CHUNK_SLOTS"
+echo "  gas trace:  chunk=$GAS_TRACE_CHUNK_THRESHOLD slots=$GAS_TRACE_CHUNK_SLOTS"
 echo "  output:     $OUTPUT_DIR"
 
 if [[ ! -f "$FIXTURE_DIR/preparation-manifest.txt" ]]; then
@@ -32,16 +45,16 @@ if [[ ! -f "$FIXTURE_DIR/preparation-manifest.txt" ]]; then
   echo "Run scripts/initialize_benchmark_data.sh first." >&2
   exit 1
 fi
-if ! grep -Fxq "fixture_version=ethereum-eip6800-verkle-v3-master" "$FIXTURE_DIR/preparation-manifest.txt" \
+if ! grep -Fxq "fixture_version=ethereum-eip6800-verkle-v4-ecdsa" "$FIXTURE_DIR/preparation-manifest.txt" \
   || ! grep -Fxq "master.max_n=$MASTER_N" "$FIXTURE_DIR/preparation-manifest.txt"; then
   echo >&2
-  echo "Prepared fixtures do not match fixture v3 / MASTER_N=$MASTER_N." >&2
+  echo "Prepared fixtures do not match fixture v4 ECDSA / MASTER_N=$MASTER_N." >&2
   echo "Run scripts/initialize_benchmark_data.sh again." >&2
   exit 1
 fi
 
 echo
-echo "Preparing SP1 verification-key setup outside benchmark timers..."
+echo "Preparing protocol SP1 setup (initialization + KZG insert) outside benchmark timers..."
 ./poa sp1-setup
 
 echo

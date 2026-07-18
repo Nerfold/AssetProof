@@ -3,9 +3,8 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
-use k256::elliptic_curve::sec1::ToEncodedPoint;
+use banderwagon::trait_defs::CanonicalSerialize;
 use num::BigUint;
-use sha3::{Digest, Keccak256};
 use sp1_curves::params::FieldParameters;
 use sp1_curves::weierstrass::bls12_381::{Bls12381, Bls12381BaseField};
 use sp1_curves::AffinePoint;
@@ -17,7 +16,6 @@ use sp1_programs_common::io::{
     Sp1KzgInsertStdin, Sp1OwnershipWitness,
 };
 use sp1_zkvm::entrypoint;
-use verkle_spec::Hasher as VerkleKeyHasher;
 use verkle_trie::{proof::VerkleProof, Element};
 
 entrypoint!(main);
@@ -38,7 +36,23 @@ fn verify_insert(input: Sp1KzgInsertStdin) -> Sp1KzgInsertPublicValues {
         input.reserve_count_after, expected_reserve_count_after,
         "insert reserve count mismatch"
     );
-    verify_ownership(&input.chain_id, &input.address, &input.ownership);
+    let ownership_context = matches!(
+        &input.ownership,
+        Sp1OwnershipWitness::EthereumEoaSignature { .. }
+    )
+    .then(|| {
+        sp1_programs_common::ethereum_eoa::ownership_context_hash(
+            sp1_programs_common::ethereum_eoa::OwnershipOperation::Insert,
+            &input.chain_id,
+            &input.state_root,
+        )
+    });
+    verify_ownership(
+        &input.chain_id,
+        ownership_context.as_ref(),
+        &input.address,
+        &input.ownership,
+    );
     verify_chain_balance(
         &input.chain_id,
         &input.state_root,
@@ -279,7 +293,12 @@ fn encode_address(address: &str) -> BigUint {
     BigUint::from_bytes_be(&bytes)
 }
 
-fn verify_ownership(chain_id: &str, address: &str, proof: &Sp1OwnershipWitness) {
+fn verify_ownership(
+    chain_id: &str,
+    ownership_context: Option<&[u8; 32]>,
+    address: &str,
+    proof: &Sp1OwnershipWitness,
+) {
     match proof {
         Sp1OwnershipWitness::MockPrivateKey { private_key } => {
             assert_eq!(
@@ -288,24 +307,19 @@ fn verify_ownership(chain_id: &str, address: &str, proof: &Sp1OwnershipWitness) 
             );
             assert_eq!(private_key, &alloc::format!("mock-private-key:{address}"));
         }
-        Sp1OwnershipWitness::EthereumEoaPrivateKey { private_key } => {
-            assert_ethereum_eoa(address, private_key);
+        Sp1OwnershipWitness::EthereumEoaSignature { r, s, recovery_id } => {
+            sp1_programs_common::ethereum_eoa::verify_ownership_signature_with_context(
+                ownership_context.expect("missing Ethereum ownership context"),
+                address,
+                r,
+                s,
+                *recovery_id,
+            );
         }
         Sp1OwnershipWitness::UnsupportedExternal { .. } => {
             panic!("unsupported external ownership verifier")
         }
     }
-}
-
-fn assert_ethereum_eoa(address: &str, private_key: &[u8; 32]) {
-    let secret = k256::SecretKey::from_slice(private_key).expect("invalid secp256k1 private key");
-    let public = secret.public_key();
-    let encoded = public.to_encoded_point(false);
-    let encoded = encoded.as_bytes();
-    assert_eq!(encoded[0], 4, "expected uncompressed secp256k1 key");
-    let digest = Keccak256::digest(&encoded[1..]);
-    let expected = decode_address_bytes(address);
-    assert_eq!(&digest[12..], &expected, "private key does not own address");
 }
 
 fn decode_address_bytes(address: &str) -> [u8; 20] {
@@ -377,10 +391,6 @@ fn verify_chain_balance(
     }
 }
 
-struct Eip6800PedersenHasher;
-
-impl VerkleKeyHasher for Eip6800PedersenHasher {}
-
 fn verify_ethereum_verkle_opening(
     state_root: &str,
     address: &str,
@@ -418,8 +428,15 @@ fn verify_ethereum_verkle_opening(
 fn eip6800_basic_data_key(address: &[u8; 20]) -> Hash {
     let mut input = [0u8; 64];
     input[12..32].copy_from_slice(address);
-    let hash = <Eip6800PedersenHasher as VerkleKeyHasher>::hash64(input);
-    let mut key = *hash.as_fixed_bytes();
+    let scalars = verkle_spec::chunk64(input).map(verkle_trie::Fr::from);
+    let mut commitment = Element::zero();
+    for (base, scalar) in verkle_trie::constants::CRS.G.iter().take(5).zip(scalars) {
+        commitment = commitment + (*base * scalar);
+    }
+    let hash = commitment.map_to_scalar_field();
+    let mut key = [0u8; 32];
+    hash.serialize_compressed(&mut key[..])
+        .expect("serialize EIP-6800 Pedersen hash");
     key[31] = 0;
     key
 }

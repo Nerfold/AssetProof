@@ -31,17 +31,19 @@ pub fn default_setup_dir() -> PathBuf {
         .join("params/sp1")
 }
 
-pub fn ensure_all_setups(
+pub fn ensure_protocol_setups(
     setup_dir: &Path,
-    update_elf: Elf,
-    insert_elf: Elf,
     init_elf: Elf,
     kzg_insert_elf: Elf,
 ) -> Result<(), String> {
-    ensure_setup_file(setup_dir, UPDATE_ELF_NAME, update_elf)?;
-    ensure_setup_file(setup_dir, INSERT_ELF_NAME, insert_elf)?;
     ensure_setup_file(setup_dir, INIT_ELF_NAME, init_elf)?;
     ensure_setup_file(setup_dir, KZG_INSERT_ELF_NAME, kzg_insert_elf)?;
+    Ok(())
+}
+
+pub fn ensure_smt_setups(setup_dir: &Path, update_elf: Elf, insert_elf: Elf) -> Result<(), String> {
+    ensure_setup_file(setup_dir, UPDATE_ELF_NAME, update_elf)?;
+    ensure_setup_file(setup_dir, INSERT_ELF_NAME, insert_elf)?;
     Ok(())
 }
 
@@ -70,8 +72,12 @@ fn ensure_setup_file(setup_dir: &Path, elf_name: &str, elf: Elf) -> Result<(), S
     if path.exists() {
         let stored = read_setup_file(&path)?;
         if stored.elf_digest == digest {
+            println!("SP1 setup [{elf_name}]: reusing {}", path.display());
             return Ok(());
         }
+        println!("SP1 setup [{elf_name}]: ELF changed, regenerating...");
+    } else {
+        println!("SP1 setup [{elf_name}]: generating...");
     }
 
     let prover = ProverClient::builder().cpu().build();
@@ -83,7 +89,9 @@ fn ensure_setup_file(setup_dir: &Path, elf_name: &str, elf: Elf) -> Result<(), S
         elf_digest: digest,
         vk: pk.verifying_key().clone(),
     };
-    write_setup_file(&path, &stored)
+    write_setup_file(&path, &stored)?;
+    println!("SP1 setup [{elf_name}]: wrote {}", path.display());
+    Ok(())
 }
 
 fn load_setup_file(setup_dir: &Path, elf_name: &str, elf: Elf) -> Result<SP1VerifyingKey, String> {

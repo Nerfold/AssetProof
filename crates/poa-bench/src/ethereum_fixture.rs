@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use common::crypto::hex_encode;
@@ -9,20 +10,26 @@ use common::types::{
     ChainBalanceProofInput, Delta, EthereumVerkleBatchProofInput, InitReserveWitness,
     OwnershipWitnessInput,
 };
+use ipa_multipoint::committer::DefaultCommitter;
+use k256::ecdsa::{RecoveryId, Signature, SigningKey, VerifyingKey};
 use k256::elliptic_curve::sec1::ToEncodedPoint;
 use k256::SecretKey;
 use sha3::{Digest, Keccak256};
-use verkle_spec::Hasher as VerkleKeyHasher;
+use sp1_programs_common::ethereum_eoa::{
+    ownership_context_hash, ownership_digest_from_context, OwnershipOperation,
+};
 use verkle_trie::database::memory_db::MemoryDb;
-use verkle_trie::{proof::VerkleProof, DefaultConfig, Element, Trie, TrieTrait};
+use verkle_trie::{proof::VerkleProof, Config, Element, Trie, TrieTrait};
 
-pub const CHAIN_ID: &str = "benchmark-ethereum-eip6800-verkle-v3-master";
+pub const CHAIN_ID: &str = "benchmark-ethereum-eip6800-verkle-v4-ecdsa";
 
 const ACCOUNT_MAGIC: &[u8; 8] = b"DPOAVKMA";
 const PROOF_MAGIC: &[u8; 8] = b"DPOAVKMP";
-const VERSION: u32 = 3;
+const VERSION: u32 = 4;
 const PUBLIC_KEY_BYTES: usize = 65;
-const ACCOUNT_RECORD_BYTES: u64 = (32 + PUBLIC_KEY_BYTES + 20 + 16 + 32 + 32) as u64;
+const OWNERSHIP_SIGNATURE_BYTES: usize = 65;
+const ACCOUNT_RECORD_BYTES: u64 =
+    (32 + PUBLIC_KEY_BYTES + 20 + 16 + 32 + 32 + OWNERSHIP_SIGNATURE_BYTES) as u64;
 const ACCOUNT_HEADER_BYTES: u64 = 8 + 4 + 8 + 32;
 
 pub struct EthereumInitFixture {
@@ -43,7 +50,7 @@ pub enum FixtureValidation {
 pub struct EthereumInsertFixture {
     pub address: String,
     pub balance: i128,
-    pub private_key: [u8; 32],
+    pub ownership_signature: [u8; OWNERSHIP_SIGNATURE_BYTES],
     pub tree_key: [u8; 32],
     pub basic_data: [u8; 32],
     pub proof: Vec<u8>,
@@ -57,11 +64,8 @@ struct AccountRecord {
     balance: i128,
     tree_key: [u8; 32],
     basic_data: [u8; 32],
+    ownership_signature: [u8; OWNERSHIP_SIGNATURE_BYTES],
 }
-
-struct Eip6800PedersenHasher;
-
-impl VerkleKeyHasher for Eip6800PedersenHasher {}
 
 pub fn ensure_master_fixture(
     dir: &Path,
@@ -89,12 +93,25 @@ pub fn ensure_master_fixture(
         .collect::<Result<Vec<_>, _>>()?;
     accounts.sort_unstable_by(|left, right| left.address.cmp(&right.address));
 
-    let mut trie = build_verkle_trie(
-        accounts
-            .iter()
-            .map(|account| (account.tree_key, account.basic_data)),
-    )?;
+    let tree_items = accounts
+        .iter()
+        .map(|account| (account.tree_key, account.basic_data))
+        .collect::<Vec<_>>();
+    let mut trie = build_verkle_trie(tree_items.into_iter())?;
     let root_commitment = trie.root_commitment().to_bytes();
+    let state_root = hex_encode(&root_commitment);
+    let init_ownership_context =
+        ownership_context_hash(OwnershipOperation::Initialization, CHAIN_ID, &state_root);
+    let insert_ownership_context =
+        ownership_context_hash(OwnershipOperation::Insert, CHAIN_ID, &state_root);
+    for (index, account) in accounts.iter_mut().enumerate() {
+        let context = if index == max_n {
+            &insert_ownership_context
+        } else {
+            &init_ownership_context
+        };
+        account.ownership_signature = sign_ownership(account, context)?;
+    }
     write_master_accounts(dir, max_n, &root_commitment, &accounts)?;
 
     for &n in &canonical_sizes(n_sizes) {
@@ -173,7 +190,7 @@ pub fn load_init_fixture(
         insert: EthereumInsertFixture {
             address: format!("0x{}", hex_encode(&candidate.address)),
             balance: candidate.balance,
-            private_key: candidate.private_key,
+            ownership_signature: candidate.ownership_signature,
             tree_key: candidate.tree_key,
             basic_data: candidate.basic_data,
             proof: insert_proof,
@@ -218,7 +235,10 @@ fn build_verkle_trie(
     items: impl Iterator<Item = ([u8; 32], [u8; 32])>,
 ) -> Result<impl TrieTrait, String> {
     let db = MemoryDb::new();
-    let mut trie = Trie::new(DefaultConfig::new(db));
+    let mut trie = Trie::new(Config {
+        db,
+        committer: eip6800_committer().clone(),
+    });
     trie.insert(items);
     Ok(trie)
 }
@@ -257,7 +277,12 @@ fn canonical_sizes(values: &[usize]) -> Vec<usize> {
 }
 
 fn master_artifacts_exist(dir: &Path, n_sizes: &[usize], m_sizes: &[usize]) -> bool {
-    master_accounts_path(dir).is_file()
+    let current_manifest = fs::read_to_string(master_manifest_path(dir)).is_ok_and(|body| {
+        body.lines()
+            .any(|line| line == "version=ethereum-eip6800-verkle-v4-ecdsa")
+    });
+    current_manifest
+        && master_accounts_path(dir).is_file()
         && insert_proof_path(dir).is_file()
         && master_manifest_path(dir).is_file()
         && n_sizes.iter().all(|&n| init_proof_path(dir, n).is_file())
@@ -355,7 +380,7 @@ fn write_delta_artifact(
 ) -> Result<(), String> {
     let file = File::create(path).map_err(|err| format!("create {}: {err}", path.display()))?;
     let mut writer = BufWriter::new(file);
-    writeln!(writer, "# version=ethereum-eip6800-verkle-v3-master")
+    writeln!(writer, "# version=ethereum-eip6800-verkle-v4-ecdsa")
         .map_err(|err| format!("write {}: {err}", path.display()))?;
     writeln!(writer, "# master_n={max_n}")
         .map_err(|err| format!("write {}: {err}", path.display()))?;
@@ -383,7 +408,7 @@ fn write_master_manifest(
 ) -> Result<(), String> {
     let path = master_manifest_path(dir);
     let body = format!(
-        "version=ethereum-eip6800-verkle-v3-master\nmax_n={max_n}\nn_sizes={:?}\nm_sizes={:?}\nstate_root={}\naccounts_path={}\nstatus=complete\n",
+        "version=ethereum-eip6800-verkle-v4-ecdsa\nmax_n={max_n}\nn_sizes={:?}\nm_sizes={:?}\nstate_root={}\naccounts_path={}\nstatus=complete\n",
         canonical_sizes(n_sizes),
         canonical_sizes(m_sizes),
         hex_encode(root),
@@ -586,7 +611,10 @@ fn write_account(
         .map_err(io_error(path, "write Verkle tree key"))?;
     writer
         .write_all(&account.basic_data)
-        .map_err(io_error(path, "write EIP-6800 basic data"))
+        .map_err(io_error(path, "write EIP-6800 basic data"))?;
+    writer
+        .write_all(&account.ownership_signature)
+        .map_err(io_error(path, "write ECDSA ownership signature"))
 }
 
 fn read_master_account_prefix(
@@ -637,12 +665,17 @@ fn read_master_account_prefix(
     reader
         .read_exact(&mut root_commitment)
         .map_err(io_error(&path, "read root commitment"))?;
+    let state_root = hex_encode(&root_commitment);
+    let init_ownership_context =
+        ownership_context_hash(OwnershipOperation::Initialization, CHAIN_ID, &state_root);
+    let insert_ownership_context =
+        ownership_context_hash(OwnershipOperation::Insert, CHAIN_ID, &state_root);
     let mut witnesses = Vec::with_capacity(n);
     let mut previous_address = None;
     for index in 0..n {
         let account = read_account(&mut reader, &path)?;
         if validate_cryptography {
-            validate_account(&account)
+            validate_account(&account, &init_ownership_context)
                 .map_err(|err| format!("master account {index} is invalid: {err}"))?;
         }
         if previous_address.is_some_and(|previous| previous >= account.address) {
@@ -663,7 +696,7 @@ fn read_master_account_prefix(
         .map_err(io_error(&path, "seek insertion account"))?;
     let candidate = read_account(&mut reader, &path)?;
     if validate_cryptography {
-        validate_account(&candidate)
+        validate_account(&candidate, &insert_ownership_context)
             .map_err(|err| format!("insertion account is invalid: {err}"))?;
     }
     if previous_address.is_some_and(|address| address >= candidate.address) {
@@ -741,6 +774,7 @@ fn read_account(reader: &mut impl Read, path: &Path) -> Result<AccountRecord, St
     let mut balance = [0u8; 16];
     let mut tree_key = [0u8; 32];
     let mut basic_data = [0u8; 32];
+    let mut ownership_signature = [0u8; OWNERSHIP_SIGNATURE_BYTES];
     reader
         .read_exact(&mut private_key)
         .map_err(io_error(path, "read private key"))?;
@@ -759,6 +793,9 @@ fn read_account(reader: &mut impl Read, path: &Path) -> Result<AccountRecord, St
     reader
         .read_exact(&mut basic_data)
         .map_err(io_error(path, "read EIP-6800 basic data"))?;
+    reader
+        .read_exact(&mut ownership_signature)
+        .map_err(io_error(path, "read ECDSA ownership signature"))?;
     Ok(AccountRecord {
         private_key,
         public_key,
@@ -766,6 +803,7 @@ fn read_account(reader: &mut impl Read, path: &Path) -> Result<AccountRecord, St
         balance: i128::from_le_bytes(balance),
         tree_key,
         basic_data,
+        ownership_signature,
     })
 }
 
@@ -774,8 +812,8 @@ fn init_witness(account: &AccountRecord) -> InitReserveWitness {
     InitReserveWitness {
         address,
         balance: account.balance,
-        ownership: OwnershipWitnessInput::EthereumEoaPrivateKeyHex {
-            private_key_hex: hex_encode(&account.private_key),
+        ownership: OwnershipWitnessInput::EthereumEoaSignatureHex {
+            signature_hex: hex_encode(&account.ownership_signature),
         },
         chain_balance_proof: ChainBalanceProofInput::EthereumVerkleBatchMember {
             chain_id: CHAIN_ID.to_string(),
@@ -785,7 +823,7 @@ fn init_witness(account: &AccountRecord) -> InitReserveWitness {
     }
 }
 
-fn validate_account(account: &AccountRecord) -> Result<(), String> {
+fn validate_account(account: &AccountRecord, ownership_context: &[u8; 32]) -> Result<(), String> {
     let (public_key, address) = public_key_and_address(&account.private_key)?;
     if public_key != account.public_key || address != account.address {
         return Err("secp256k1 public key/address mismatch".to_string());
@@ -798,6 +836,20 @@ fn validate_account(account: &AccountRecord) -> Result<(), String> {
     }
     if account.basic_data != eip6800_basic_data(account.balance) {
         return Err("EIP-6800 basic-data value mismatch".to_string());
+    }
+    let signature = Signature::from_slice(&account.ownership_signature[..64])
+        .map_err(|err| format!("invalid ECDSA ownership signature: {err}"))?;
+    if signature.normalize_s().is_some() {
+        return Err("non-canonical high-s ECDSA ownership signature".to_string());
+    }
+    let recovery_id = RecoveryId::from_byte(account.ownership_signature[64])
+        .ok_or_else(|| "invalid ECDSA recovery id".to_string())?;
+    let address_hex = format!("0x{}", hex_encode(&account.address));
+    let digest = ownership_digest_from_context(ownership_context, &address_hex);
+    let recovered = VerifyingKey::recover_from_prehash(&digest, &signature, recovery_id)
+        .map_err(|err| format!("ECDSA ownership recovery failed: {err}"))?;
+    if recovered.to_encoded_point(false).as_bytes() != account.public_key {
+        return Err("ECDSA ownership signature recovered the wrong public key".to_string());
     }
     Ok(())
 }
@@ -834,7 +886,29 @@ fn derive_account(seed: &[u8; 32], index: usize) -> Result<AccountRecord, String
         balance,
         tree_key: eip6800_basic_data_key(&address),
         basic_data: eip6800_basic_data(balance),
+        ownership_signature: [0u8; OWNERSHIP_SIGNATURE_BYTES],
     })
+}
+
+fn sign_ownership(
+    account: &AccountRecord,
+    ownership_context: &[u8; 32],
+) -> Result<[u8; OWNERSHIP_SIGNATURE_BYTES], String> {
+    let address = format!("0x{}", hex_encode(&account.address));
+    let digest = ownership_digest_from_context(ownership_context, &address);
+    let signing_key = SigningKey::from_slice(&account.private_key)
+        .map_err(|err| format!("invalid ECDSA signing key: {err}"))?;
+    let (signature, recovery_id) = signing_key
+        .sign_prehash_recoverable(&digest)
+        .map_err(|err| format!("sign ECDSA ownership statement: {err}"))?;
+    let recovery_id = recovery_id.to_byte();
+    if recovery_id > 1 {
+        return Err("Ethereum ownership signature requires recovery id 0 or 1".to_string());
+    }
+    let mut encoded = [0u8; OWNERSHIP_SIGNATURE_BYTES];
+    encoded[..64].copy_from_slice(signature.to_bytes().as_slice());
+    encoded[64] = recovery_id;
+    Ok(encoded)
 }
 
 fn public_key_and_address(
@@ -856,10 +930,15 @@ fn public_key_and_address(
 fn eip6800_basic_data_key(address: &[u8; 20]) -> [u8; 32] {
     let mut input = [0u8; 64];
     input[12..32].copy_from_slice(address);
-    let hash = <Eip6800PedersenHasher as VerkleKeyHasher>::hash64(input);
+    let hash = verkle_spec::hash64(eip6800_committer(), input);
     let mut key = *hash.as_fixed_bytes();
     key[31] = 0;
     key
+}
+
+fn eip6800_committer() -> &'static DefaultCommitter {
+    static COMMITTER: OnceLock<DefaultCommitter> = OnceLock::new();
+    COMMITTER.get_or_init(|| DefaultCommitter::new(&verkle_trie::constants::CRS.G))
 }
 
 fn eip6800_basic_data(balance: i128) -> [u8; 32] {

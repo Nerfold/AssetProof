@@ -1309,7 +1309,20 @@ dependencies = [
  "der",
  "digest 0.10.7",
  "elliptic-curve",
- "rfc6979",
+ "rfc6979 0.4.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "signature",
+ "spki",
+]
+
+[[package]]
+name = "ecdsa"
+version = "0.16.9"
+source = "git+https://github.com/sp1-patches/signatures?tag=sp1-skip-verify-on-recovery#1880299a48fe7ef249edaa616fd411239fb5daf1"
+dependencies = [
+ "der",
+ "digest 0.10.7",
+ "elliptic-curve",
+ "rfc6979 0.4.0 (git+https://github.com/sp1-patches/signatures?tag=sp1-skip-verify-on-recovery)",
  "serdect",
  "signature",
  "spki",
@@ -1354,6 +1367,7 @@ dependencies = [
  "ff",
  "generic-array 0.14.7",
  "group",
+ "hkdf",
  "pem-rfc7468",
  "pkcs8",
  "rand_core 0.6.4",
@@ -1860,6 +1874,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
+name = "hkdf"
+version = "0.12.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7b5f8eb2ad728638ea2c7d47a21db23b7b58a72ed6a38256b8a1849f15fbbdf7"
+dependencies = [
+ "hmac",
+]
+
+[[package]]
 name = "hmac"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2271,16 +2294,17 @@ dependencies = [
 [[package]]
 name = "k256"
 version = "0.13.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f6e3919bbaa2945715f0bb6d3934a173d1e9a59ac23767fbaaef277265a7411b"
+source = "git+https://github.com/sp1-patches/elliptic-curves?tag=patch-k256-13.4-sp1-6.2.0#41374de1febd88e67faa695a5641ae46460a8cb6"
 dependencies = [
  "cfg-if",
- "ecdsa",
+ "ecdsa 0.16.9 (git+https://github.com/sp1-patches/signatures?tag=sp1-skip-verify-on-recovery)",
  "elliptic-curve",
+ "hex",
  "once_cell",
  "serdect",
  "sha2 0.10.9",
  "signature",
+ "sp1-lib",
 ]
 
 [[package]]
@@ -2766,7 +2790,7 @@ version = "0.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c9863ad85fa8f4460f9c48cb909d38a0d689dba1f6f6988a5e3e0d31071bcd4b"
 dependencies = [
- "ecdsa",
+ "ecdsa 0.16.9 (registry+https://github.com/rust-lang/crates.io-index)",
  "elliptic-curve",
  "primeorder",
  "sha2 0.10.9",
@@ -3179,9 +3203,11 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "common",
+ "ipa-multipoint",
  "k256",
  "nizk-fixed-set",
  "sha3",
+ "sp1-programs-common",
  "verkle-spec",
  "verkle-trie",
 ]
@@ -3673,6 +3699,15 @@ name = "rfc6979"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8dd2a808d456c4a54e300a23e9f5a67e122c3024119acbfd73e3bf664491cb2"
+dependencies = [
+ "hmac",
+ "subtle",
+]
+
+[[package]]
+name = "rfc6979"
+version = "0.4.0"
+source = "git+https://github.com/sp1-patches/signatures?tag=sp1-skip-verify-on-recovery#1880299a48fe7ef249edaa616fd411239fb5daf1"
 dependencies = [
  "hmac",
  "subtle",
@@ -4853,10 +4888,9 @@ dependencies = [
 name = "sp1-init-merkle"
 version = "0.1.0"
 dependencies = [
+ "banderwagon",
  "blake3",
- "k256",
  "num",
- "sha3",
  "smt",
  "sp1-curves",
  "sp1-programs-common",
@@ -4886,10 +4920,9 @@ dependencies = [
 name = "sp1-kzg-insert"
 version = "0.1.0"
 dependencies = [
+ "banderwagon",
  "blake3",
- "k256",
  "num",
- "sha3",
  "sp1-curves",
  "sp1-programs-common",
  "sp1-zkvm",
@@ -4904,6 +4937,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9281c105496b6b8d20b25f0be936242e5b747cc7711a68706ffbb3719d16145d"
 dependencies = [
  "bincode",
+ "elliptic-curve",
  "serde",
  "sp1-primitives",
 ]
@@ -4937,9 +4971,11 @@ name = "sp1-programs-common"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "k256",
  "serde",
  "sha3",
  "slop-algebra",
+ "sp1-lib",
  "sp1-primitives",
 ]
 

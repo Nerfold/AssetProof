@@ -21,7 +21,7 @@ fn run() -> Result<(), String> {
     }
     ensure_sp1_setup(&setup_dir)?;
     println!(
-        "protocol SP1 setup complete (initialization + KZG insert): {}",
+        "protocol SP1 setup complete (init Merkle + init ownership + KZG insert): {}",
         setup_dir.display()
     );
     Ok(())

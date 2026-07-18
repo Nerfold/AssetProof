@@ -2,8 +2,6 @@
 
 extern crate alloc;
 
-use alloc::vec::Vec;
-use banderwagon::trait_defs::CanonicalSerialize;
 use num::BigUint;
 use sp1_curves::params::FieldParameters;
 use sp1_curves::weierstrass::bls12_381::{Bls12381, Bls12381BaseField};
@@ -13,11 +11,10 @@ use sp1_programs_common::bls12_381_scalar::{
     Scalar,
 };
 use sp1_programs_common::io::{
-    init_shape_commitment, Hash, Sp1ChainBalanceProof, Sp1G1Affine, Sp1InitPublicValues,
-    Sp1InitReserveEntry, Sp1InitStdin, Sp1OwnershipWitness,
+    init_reserve_commitment, init_shape_commitment, Hash, Sp1ChainBalanceProof, Sp1G1Affine,
+    Sp1InitPublicValues, Sp1InitReserveEntry, Sp1InitStdin,
 };
 use sp1_zkvm::entrypoint;
-use verkle_trie::{proof::VerkleProof, Element};
 
 entrypoint!(main);
 
@@ -34,8 +31,6 @@ fn verify_init(input: Sp1InitStdin) -> Sp1InitPublicValues {
         "reserve count mismatch"
     );
     assert!(!input.reserves.is_empty(), "empty reserve set");
-    verify_ethereum_verkle_batch(&input);
-
     let mut balance_total = 0i128;
     let mut product = scalar_from_le_bytes(input.alpha_le);
     assert!(
@@ -44,26 +39,9 @@ fn verify_init(input: Sp1InitStdin) -> Sp1InitPublicValues {
     );
     let zeta = scalar_from_le_bytes(input.zeta_le);
     let claimed_product = scalar_from_le_bytes(input.product_zeta_le);
-    let ownership_context = input
-        .reserves
-        .iter()
-        .any(|reserve| {
-            matches!(
-                &reserve.ownership,
-                Sp1OwnershipWitness::EthereumEoaSignature { .. }
-            )
-        })
-        .then(|| {
-            sp1_programs_common::ethereum_eoa::ownership_context_hash(
-                sp1_programs_common::ethereum_eoa::OwnershipOperation::Initialization,
-                &input.chain_id,
-                &input.state_root,
-            )
-        });
     let mut previous_x = None;
     for reserve in &input.reserves {
         assert!(reserve.balance >= 0, "negative reserve balance");
-        verify_ownership(&input.chain_id, ownership_context.as_ref(), reserve);
         verify_chain_balance(&input.chain_id, &input.state_root, reserve);
         let x = scalar_from_le_bytes(reserve.encoded_address_le);
         assert_eq!(
@@ -97,9 +75,6 @@ fn verify_init(input: Sp1InitStdin) -> Sp1InitPublicValues {
 
     let uses_mock_inputs = input.reserves.iter().any(|reserve| {
         matches!(
-            &reserve.ownership,
-            Sp1OwnershipWitness::MockPrivateKey { .. }
-        ) || matches!(
             &reserve.chain_balance_proof,
             Sp1ChainBalanceProof::MockBinding { .. }
         )
@@ -110,6 +85,13 @@ fn verify_init(input: Sp1InitStdin) -> Sp1InitPublicValues {
         state_root: input.state_root,
         session_id: input.session_id,
         reserve_count: input.reserve_count,
+        reserve_commitment: init_reserve_commitment(
+            input.reserves.len(),
+            input
+                .reserves
+                .iter()
+                .map(|reserve| (reserve.address.as_str(), reserve.balance)),
+        ),
         zeta_le: input.zeta_le,
         balance_commitment: input.balance_commitment,
         shape_commitment: input.shape_commitment,
@@ -298,38 +280,6 @@ fn encode_address(address: &str) -> [u8; 32] {
     out
 }
 
-fn verify_ownership(
-    chain_id: &str,
-    ownership_context: Option<&[u8; 32]>,
-    reserve: &Sp1InitReserveEntry,
-) {
-    match &reserve.ownership {
-        Sp1OwnershipWitness::MockPrivateKey { private_key } => {
-            assert_eq!(
-                chain_id, "mock-chain",
-                "mock ownership used outside mock chain"
-            );
-            assert_eq!(
-                private_key,
-                &alloc::format!("mock-private-key:{}", reserve.address),
-                "mock private key does not bind the reserve address"
-            );
-        }
-        Sp1OwnershipWitness::EthereumEoaSignature { r, s, recovery_id } => {
-            sp1_programs_common::ethereum_eoa::verify_ownership_signature_with_context(
-                ownership_context.expect("missing Ethereum ownership context"),
-                &reserve.address,
-                r,
-                s,
-                *recovery_id,
-            );
-        }
-        Sp1OwnershipWitness::UnsupportedExternal { .. } => {
-            panic!("unsupported external ownership verifier")
-        }
-    }
-}
-
 fn decode_address(address: &str) -> [u8; 20] {
     let raw = address.strip_prefix("0x").unwrap_or(address);
     assert_eq!(raw.len(), 40, "address must contain 20 bytes");
@@ -384,125 +334,15 @@ fn verify_chain_balance(chain_id: &str, state_root: &str, reserve: &Sp1InitReser
             .expect("invalid Ethereum account proof");
         }
         Sp1ChainBalanceProof::EthereumVerkleBatchMember { .. } => {
-            // All batch members are checked together before the reserve loop so
-            // the IPA multiproof is verified exactly once.
+            panic!("Verkle proofs are disabled in the Merkle initialization guest")
         }
-        Sp1ChainBalanceProof::EthereumVerkleProof {
-            tree_key,
-            basic_data,
-            proof,
-        } => verify_ethereum_verkle_opening(
-            state_root,
-            &reserve.address,
-            reserve.balance,
-            tree_key,
-            basic_data,
-            proof,
-        ),
+        Sp1ChainBalanceProof::EthereumVerkleProof { .. } => {
+            panic!("Verkle proofs are disabled in the Merkle initialization guest")
+        }
         Sp1ChainBalanceProof::UnsupportedGeneric { .. } => {
             panic!("unsupported generic chain proof verifier")
         }
     }
-}
-
-fn verify_ethereum_verkle_batch(input: &Sp1InitStdin) {
-    let mut keys = Vec::new();
-    let mut values = Vec::new();
-    for reserve in &input.reserves {
-        if let Sp1ChainBalanceProof::EthereumVerkleBatchMember {
-            tree_key,
-            basic_data,
-        } = &reserve.chain_balance_proof
-        {
-            assert_eip6800_account_opening(&reserve.address, reserve.balance, tree_key, basic_data);
-            keys.push(*tree_key);
-            values.push(Some(*basic_data));
-        }
-    }
-
-    match (&input.ethereum_verkle_batch_proof, keys.is_empty()) {
-        (None, true) => return,
-        (Some(_), true) => panic!("Verkle batch proof has no members"),
-        (None, false) => panic!("Verkle batch members require a shared proof"),
-        (Some(_), false) => {}
-    }
-    assert_eq!(
-        keys.len(),
-        input.reserves.len(),
-        "initialization cannot mix Verkle batch members with other chain proofs"
-    );
-
-    let batch = input
-        .ethereum_verkle_batch_proof
-        .as_ref()
-        .expect("checked above");
-    let root_bytes = decode_hash(&input.state_root);
-    let root = Element::from_bytes(&root_bytes).expect("invalid Banderwagon root commitment");
-    let proof = VerkleProof::read(batch.proof.as_slice()).expect("invalid Verkle proof encoding");
-    let (valid, _) = proof.check(keys, values, root);
-    assert!(valid, "Ethereum Verkle batch proof mismatch");
-}
-
-fn verify_ethereum_verkle_opening(
-    state_root: &str,
-    address: &str,
-    balance: i128,
-    tree_key: &Hash,
-    basic_data: &Hash,
-    proof_bytes: &[u8],
-) {
-    assert_eip6800_account_opening(address, balance, tree_key, basic_data);
-    let root_bytes = decode_hash(state_root);
-    let root = Element::from_bytes(&root_bytes).expect("invalid Banderwagon root commitment");
-    let proof = VerkleProof::read(proof_bytes).expect("invalid Verkle proof encoding");
-    let (valid, _) = proof.check(vec![*tree_key], vec![Some(*basic_data)], root);
-    assert!(valid, "Ethereum Verkle account proof mismatch");
-}
-
-fn assert_eip6800_account_opening(
-    address: &str,
-    balance: i128,
-    tree_key: &Hash,
-    basic_data: &Hash,
-) {
-    assert!(balance >= 0, "negative EIP-6800 balance");
-    assert_eq!(
-        *tree_key,
-        eip6800_basic_data_key(&decode_address(address)),
-        "EIP-6800 account tree key mismatch"
-    );
-    assert_eq!(basic_data[0], 0, "unsupported EIP-6800 account version");
-    assert_eq!(
-        &basic_data[1..5],
-        &[0u8; 4],
-        "non-zero EIP-6800 reserved account bytes"
-    );
-    assert_eq!(
-        &basic_data[5..16],
-        &[0u8; 11],
-        "benchmark EOA must have zero code-size and nonce"
-    );
-    assert_eq!(
-        &basic_data[16..32],
-        &(balance as u128).to_be_bytes(),
-        "EIP-6800 account balance mismatch"
-    );
-}
-
-fn eip6800_basic_data_key(address: &[u8; 20]) -> Hash {
-    let mut input = [0u8; 64];
-    input[12..32].copy_from_slice(address);
-    let scalars = verkle_spec::chunk64(input).map(verkle_trie::Fr::from);
-    let mut commitment = Element::zero();
-    for (base, scalar) in verkle_trie::constants::CRS.G.iter().take(5).zip(scalars) {
-        commitment = commitment + (*base * scalar);
-    }
-    let hash = commitment.map_to_scalar_field();
-    let mut key = [0u8; 32];
-    hash.serialize_compressed(&mut key[..])
-        .expect("serialize EIP-6800 Pedersen hash");
-    key[31] = 0;
-    key
 }
 
 fn chain_leaf_hash(address: &str, balance: i128) -> Hash {

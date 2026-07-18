@@ -222,6 +222,18 @@ pub fn write_init_proof(path: &Path, proof: &StoredInitProof) -> Result<(), Stri
         "sp1_public_values_hex={}",
         proof.sp1_public_values_hex
     ));
+    lines.push(format!(
+        "ownership_sp1_proof_hex={}",
+        proof.ownership_sp1_proof_hex
+    ));
+    lines.push(format!(
+        "ownership_sp1_vk_hex={}",
+        proof.ownership_sp1_vk_hex
+    ));
+    lines.push(format!(
+        "ownership_sp1_public_values_hex={}",
+        proof.ownership_sp1_public_values_hex
+    ));
     lines.push(format!("transcript_hex={}", proof.transcript_hex));
     lines.push(format!("srs_hash_hex={}", proof.srs_hash_hex));
     fs::write(path, lines.join("\n")).map_err(|err| format!("write {}: {err}", path.display()))
@@ -255,6 +267,15 @@ pub fn read_init_proof(path: &Path) -> Result<StoredInitProof, String> {
         sp1_proof_hex: kv.get("sp1_proof_hex").cloned().unwrap_or_default(),
         sp1_vk_hex: kv.get("sp1_vk_hex").cloned().unwrap_or_default(),
         sp1_public_values_hex: kv.get("sp1_public_values_hex").cloned().unwrap_or_default(),
+        ownership_sp1_proof_hex: kv
+            .get("ownership_sp1_proof_hex")
+            .cloned()
+            .unwrap_or_default(),
+        ownership_sp1_vk_hex: kv.get("ownership_sp1_vk_hex").cloned().unwrap_or_default(),
+        ownership_sp1_public_values_hex: kv
+            .get("ownership_sp1_public_values_hex")
+            .cloned()
+            .unwrap_or_default(),
         transcript_hex: req_string(&kv, "transcript_hex")?,
         srs_hash_hex: req_string(&kv, "srs_hash_hex")?,
     })
@@ -1183,6 +1204,18 @@ fn encode_stored_init_proof(proof: &StoredInitProof) -> Result<String, String> {
         "sp1_public_values_hex={}",
         proof.sp1_public_values_hex
     ));
+    lines.push(format!(
+        "ownership_sp1_proof_hex={}",
+        proof.ownership_sp1_proof_hex
+    ));
+    lines.push(format!(
+        "ownership_sp1_vk_hex={}",
+        proof.ownership_sp1_vk_hex
+    ));
+    lines.push(format!(
+        "ownership_sp1_public_values_hex={}",
+        proof.ownership_sp1_public_values_hex
+    ));
     lines.push(format!("transcript_hex={}", proof.transcript_hex));
     lines.push(format!("srs_hash_hex={}", proof.srs_hash_hex));
     Ok(lines.join(";"))
@@ -1216,6 +1249,15 @@ fn decode_stored_init_proof(raw: &str) -> Result<StoredInitProof, String> {
         sp1_proof_hex: kv.get("sp1_proof_hex").cloned().unwrap_or_default(),
         sp1_vk_hex: kv.get("sp1_vk_hex").cloned().unwrap_or_default(),
         sp1_public_values_hex: kv.get("sp1_public_values_hex").cloned().unwrap_or_default(),
+        ownership_sp1_proof_hex: kv
+            .get("ownership_sp1_proof_hex")
+            .cloned()
+            .unwrap_or_default(),
+        ownership_sp1_vk_hex: kv.get("ownership_sp1_vk_hex").cloned().unwrap_or_default(),
+        ownership_sp1_public_values_hex: kv
+            .get("ownership_sp1_public_values_hex")
+            .cloned()
+            .unwrap_or_default(),
         transcript_hex: req_string(&kv, "transcript_hex")?,
         srs_hash_hex: req_string(&kv, "srs_hash_hex")?,
     })
@@ -1258,6 +1300,9 @@ mod init_privacy_tests {
             sp1_proof_hex: String::new(),
             sp1_vk_hex: String::new(),
             sp1_public_values_hex: String::new(),
+            ownership_sp1_proof_hex: String::new(),
+            ownership_sp1_vk_hex: String::new(),
+            ownership_sp1_public_values_hex: String::new(),
             transcript_hex: "transcript".to_string(),
             srs_hash_hex: "srs".to_string(),
         };

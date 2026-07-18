@@ -118,6 +118,35 @@ impl KzgInsertWitness {
             },
         }
     }
+
+    pub fn ethereum_merkle(
+        chain_id: String,
+        address: String,
+        balance: i128,
+        signature_hex: String,
+        leaf_index: u64,
+        siblings: Vec<[u8; 32]>,
+    ) -> Self {
+        Self {
+            chain_id: chain_id.clone(),
+            address,
+            balance,
+            ownership: OwnershipWitnessInput::EthereumEoaSignatureHex { signature_hex },
+            chain_balance_proof: ChainBalanceProofInput::BinaryMerkleV1 {
+                chain_id,
+                leaf_index,
+                siblings,
+            },
+            ownership_artifact: ExternalProofArtifact {
+                scheme: "sp1-native-ownership".to_string(),
+                payload_hex: String::new(),
+            },
+            chain_balance_artifact: ExternalProofArtifact {
+                scheme: "sp1-native-chain-balance".to_string(),
+                payload_hex: String::new(),
+            },
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -463,7 +492,7 @@ pub fn apply_insert_with_adapter(
     };
 
     let proof = KzgInsertProof {
-        scheme: "kzg-nizk-insert-v6-salted-quotient-hash-bounded-range-mock-bound".to_string(),
+        scheme: "kzg-nizk-insert-v7-salted-quotient-hash-binary-merkle-bound".to_string(),
         chain_id: witness.chain_id.clone(),
         old_state_root: state.state_root.clone(),
         new_state_root: state.state_root.clone(),
@@ -561,7 +590,7 @@ pub fn verify_insert_with_srs_and_policy(
     {
         return Err("insert reserve count is outside the SRS-supported range".to_string());
     }
-    if proof.scheme != "kzg-nizk-insert-v6-salted-quotient-hash-bounded-range-mock-bound" {
+    if proof.scheme != "kzg-nizk-insert-v7-salted-quotient-hash-binary-merkle-bound" {
         return Err("insert proof is not a production ZK proof".to_string());
     }
     let quotient_commitment = parse_quotient_commitment(&proof.quotient_commitment_hex)?;

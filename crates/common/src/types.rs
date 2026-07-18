@@ -71,7 +71,7 @@ pub enum ChainBalanceProofInput {
     BinaryMerkleV1 {
         chain_id: String,
         leaf_index: u64,
-        siblings_hex: Vec<String>,
+        siblings: Vec<[u8; 32]>,
     },
     /// One key/value opening authenticated by the shared initialization
     /// multiproof in [`EthereumVerkleBatchProofInput`].
@@ -190,9 +190,15 @@ pub struct StoredInitProof {
     pub reserve_count: usize,
     pub zeta: Fr,
     pub kzg_opening_proof_hex: String,
+    /// Merkle-balance/polynomial SP1 proof.
     pub sp1_proof_hex: String,
     pub sp1_vk_hex: String,
     pub sp1_public_values_hex: String,
+    /// Separate ECDSA ownership SP1 proof, bound to the Merkle guest by the
+    /// same ordered reserve commitment.
+    pub ownership_sp1_proof_hex: String,
+    pub ownership_sp1_vk_hex: String,
+    pub ownership_sp1_public_values_hex: String,
     pub transcript_hex: String,
     pub srs_hash_hex: String,
 }

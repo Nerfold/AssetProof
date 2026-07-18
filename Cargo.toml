@@ -8,6 +8,7 @@ members = [
     "crates/smt-bench",
     "crates/sp1-programs/common",
     "crates/sp1-programs/init-merkle",
+    "crates/sp1-programs/init-ownership",
     "crates/sp1-programs/smt-update",
     "crates/sp1-programs/smt-insert",
     "crates/sp1-programs/kzg-insert",

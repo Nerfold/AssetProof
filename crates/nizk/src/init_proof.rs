@@ -5,8 +5,8 @@ use common::crypto::{
     hash_bytes, hash_to_scalar, hex_decode, point_g1_from_hex, point_g1_to_hex, scalar_to_hex,
 };
 use common::types::{
-    EthereumVerkleBatchProofInput, InitProvingContext, InitReserveWitness,
-    PreparedInitReserveWitness, PublicState, ReserveEntry, StoredInitProof, StoredState,
+    InitProvingContext, InitReserveWitness, PreparedInitReserveWitness, PublicState, ReserveEntry,
+    StoredInitProof, StoredState,
 };
 
 use crate::commitment::commit_balance;
@@ -179,57 +179,8 @@ pub fn initialize_from_witnesses_with_adapter(
     srs: &Srs,
     external: &impl ExternalProofAdapter,
 ) -> Result<InitProofResult, String> {
-    initialize_from_witnesses_with_optional_verkle_proof(
-        ctx,
-        reserve_witnesses,
-        None,
-        srs,
-        external,
-    )
-}
-
-pub fn initialize_from_witnesses_with_verkle_proof(
-    ctx: &InitProvingContext,
-    reserve_witnesses: &[InitReserveWitness],
-    verkle_proof: &EthereumVerkleBatchProofInput,
-    srs: &Srs,
-    external: &impl ExternalProofAdapter,
-) -> Result<InitProofResult, String> {
-    let expected_root = common::crypto::hex_encode(&verkle_proof.root_commitment);
-    if ctx.state_root.strip_prefix("0x").unwrap_or(&ctx.state_root) != expected_root {
-        return Err("Verkle batch proof root does not match initialization state_root".to_string());
-    }
-    initialize_from_witnesses_with_optional_verkle_proof(
-        ctx,
-        reserve_witnesses,
-        Some(verkle_proof),
-        srs,
-        external,
-    )
-}
-
-fn initialize_from_witnesses_with_optional_verkle_proof(
-    ctx: &InitProvingContext,
-    reserve_witnesses: &[InitReserveWitness],
-    verkle_proof: Option<&EthereumVerkleBatchProofInput>,
-    srs: &Srs,
-    external: &impl ExternalProofAdapter,
-) -> Result<InitProofResult, String> {
     if reserve_witnesses.is_empty() {
         return Err("reserve set must not be empty".to_string());
-    }
-    let verkle_member_count = reserve_witnesses
-        .iter()
-        .filter(|witness| {
-            matches!(
-                &witness.chain_balance_proof,
-                common::types::ChainBalanceProofInput::EthereumVerkleBatchMember { .. }
-            )
-        })
-        .count();
-    match ethereum_verkle_batch_shape(reserve_witnesses.len(), verkle_member_count, verkle_proof) {
-        Ok(()) => {}
-        Err(err) => return Err(err),
     }
     for witness in reserve_witnesses {
         validate_chain_id(&ctx.chain_id, &witness.chain_balance_proof)?;
@@ -246,33 +197,7 @@ fn initialize_from_witnesses_with_optional_verkle_proof(
             balance: witness.balance,
         })
         .collect::<Vec<_>>();
-    initialize_core(
-        ctx,
-        &reserve_entries,
-        reserve_witnesses,
-        &prepared,
-        verkle_proof,
-        srs,
-    )
-}
-
-fn ethereum_verkle_batch_shape(
-    reserve_count: usize,
-    member_count: usize,
-    proof: Option<&EthereumVerkleBatchProofInput>,
-) -> Result<(), String> {
-    match (member_count, proof) {
-        (0, None) => Ok(()),
-        (0, Some(_)) => Err("Verkle batch proof has no member openings".to_string()),
-        (_, None) => Err("Verkle batch members require a shared multiproof".to_string()),
-        (members, Some(_)) if members != reserve_count => Err(
-            "initialization cannot mix Verkle batch members with other chain proofs".to_string(),
-        ),
-        (_, Some(proof)) if proof.proof.is_empty() => {
-            Err("Verkle initialization multiproof is empty".to_string())
-        }
-        (_, Some(_)) => Ok(()),
-    }
+    initialize_core(ctx, &reserve_entries, reserve_witnesses, &prepared, srs)
 }
 
 pub fn initialize_with_proof(
@@ -311,14 +236,7 @@ pub fn initialize_with_proof_and_adapter(
         .iter()
         .map(|witness| external.prepare_init_witness(&ctx, witness))
         .collect::<Result<Vec<_>, _>>()?;
-    initialize_core(
-        &ctx,
-        reserve_entries,
-        &reserve_witnesses,
-        &prepared,
-        None,
-        srs,
-    )
+    initialize_core(&ctx, reserve_entries, &reserve_witnesses, &prepared, srs)
 }
 
 fn initialize_core(
@@ -326,7 +244,6 @@ fn initialize_core(
     reserve_entries: &[ReserveEntry],
     reserve_witnesses: &[InitReserveWitness],
     prepared_witnesses: &[PreparedInitReserveWitness],
-    ethereum_verkle_batch_proof: Option<&EthereumVerkleBatchProofInput>,
     srs: &Srs,
 ) -> Result<InitProofResult, String> {
     if reserve_entries.is_empty() {
@@ -349,19 +266,16 @@ fn initialize_core(
     }
 
     let mut canonical_entries = Vec::with_capacity(reserve_entries.len());
-    for ((entry, witness), prepared) in reserve_entries
+    for (index, ((entry, _witness), prepared)) in reserve_entries
         .iter()
         .zip(reserve_witnesses.iter())
         .zip(prepared_witnesses.iter())
+        .enumerate()
     {
         if prepared.address != entry.address || prepared.balance != entry.balance {
             return Err("external adapter changed the reserve address or balance".to_string());
         }
-        canonical_entries.push((
-            common::encoding::encode_address(&entry.address)?,
-            entry.clone(),
-            witness.clone(),
-        ));
+        canonical_entries.push((common::encoding::encode_address(&entry.address)?, index));
     }
     canonical_entries.sort_by(|left, right| left.0.into_bigint().cmp(&right.0.into_bigint()));
 
@@ -369,11 +283,12 @@ fn initialize_core(
     let mut reserve_balances = Vec::with_capacity(reserve_entries.len());
     let mut roots = Vec::with_capacity(reserve_entries.len());
     let mut canonical_witnesses = Vec::with_capacity(reserve_witnesses.len());
-    for (root, entry, witness) in canonical_entries {
+    for (root, index) in canonical_entries {
+        let entry = &reserve_entries[index];
         roots.push(root);
-        reserve_addresses.push(entry.address);
+        reserve_addresses.push(entry.address.clone());
         reserve_balances.push(entry.balance);
-        canonical_witnesses.push(witness);
+        canonical_witnesses.push(&reserve_witnesses[index]);
     }
     if !is_strictly_ordered(&roots) {
         return Err("reserve addresses must be canonical and duplicate-free".to_string());
@@ -441,7 +356,20 @@ fn initialize_core(
     let balance_blind_base = derive_generator("balance-h", 0);
     let eval_value_base = derive_generator("eval-v", 0);
     let eval_blind_base = derive_generator("eval-h", 0);
-    let sp1_stdin = sp1_host::init::build_init_stdin(
+    // Prove ownership first and release its linear-size stdin before building
+    // the Merkle/protocol stdin. This keeps the two SP1 executions genuinely
+    // sequential instead of retaining both witness encodings at peak memory.
+    let ownership_stdin = sp1_host::init::build_init_ownership_stdin(
+        &ctx.chain_id,
+        &ctx.state_root,
+        &ctx.session_id,
+        &reserve_addresses,
+        &reserve_balances,
+        &canonical_witnesses,
+    )?;
+    let ownership_sp1 = sp1_host::init::prove_init_ownership(ownership_stdin)?;
+
+    let merkle_stdin = sp1_host::init::build_init_merkle_stdin(
         &ctx.chain_id,
         &ctx.state_root,
         &ctx.session_id,
@@ -464,18 +392,21 @@ fn initialize_core(
         &roots,
         &reserve_balances,
         &canonical_witnesses,
-        ethereum_verkle_batch_proof,
     )?;
-    let (sp1_proof_hex, sp1_vk_hex, sp1_public_values_hex, _) =
-        sp1_host::init::prove_init(sp1_stdin)?;
+    let merkle_sp1 = sp1_host::init::prove_init_merkle(merkle_stdin)?;
+    if merkle_sp1.public.chain_id != ownership_sp1.public.chain_id
+        || merkle_sp1.public.state_root != ownership_sp1.public.state_root
+        || merkle_sp1.public.session_id != ownership_sp1.public.session_id
+        || merkle_sp1.public.reserve_count != ownership_sp1.public.reserve_count
+        || merkle_sp1.public.reserve_commitment != ownership_sp1.public.reserve_commitment
+    {
+        return Err(
+            "split initialization SP1 proofs are not bound to the same reserves".to_string(),
+        );
+    }
 
     let proof = StoredInitProof {
-        scheme: if ethereum_verkle_batch_proof.is_some() {
-            "kzg-nizk-init-v6-zkopen-salted-shape-hash-eip6800-verkle-bound"
-        } else {
-            "kzg-nizk-init-v6-zkopen-salted-shape-hash-mock-bound"
-        }
-        .to_string(),
+        scheme: "kzg-nizk-init-v7-zkopen-salted-shape-hash-binary-merkle-split".to_string(),
         mode: "sp1".to_string(),
         chain_id: ctx.chain_id.clone(),
         state_root: ctx.state_root.clone(),
@@ -487,9 +418,12 @@ fn initialize_core(
         reserve_count: reserve_entries.len(),
         zeta,
         kzg_opening_proof_hex,
-        sp1_proof_hex,
-        sp1_vk_hex,
-        sp1_public_values_hex,
+        sp1_proof_hex: merkle_sp1.proof_hex,
+        sp1_vk_hex: merkle_sp1.vk_hex,
+        sp1_public_values_hex: merkle_sp1.public_values_hex,
+        ownership_sp1_proof_hex: ownership_sp1.proof_hex,
+        ownership_sp1_vk_hex: ownership_sp1.vk_hex,
+        ownership_sp1_public_values_hex: ownership_sp1.public_values_hex,
         transcript_hex,
         srs_hash_hex,
     };
@@ -608,9 +542,7 @@ pub(crate) fn verify_init_public_proof(
     if proof.srs_hash_hex != point_hash_srs(srs)? {
         return Err("SRS hash mismatch".to_string());
     }
-    if proof.scheme != "kzg-nizk-init-v6-zkopen-salted-shape-hash-mock-bound"
-        && proof.scheme != "kzg-nizk-init-v6-zkopen-salted-shape-hash-eip6800-verkle-bound"
-    {
+    if proof.scheme != "kzg-nizk-init-v7-zkopen-salted-shape-hash-binary-merkle-split" {
         return Err("init proof is not a production ZK proof; use verify_init_debug only for transparent local tests".to_string());
     }
     if proof.mode != "sp1" {
@@ -619,6 +551,8 @@ pub(crate) fn verify_init_public_proof(
     if proof.kzg_opening_proof_hex.is_empty()
         || proof.sp1_proof_hex.is_empty()
         || proof.sp1_vk_hex.is_empty()
+        || proof.ownership_sp1_proof_hex.is_empty()
+        || proof.ownership_sp1_vk_hex.is_empty()
     {
         return Err("missing init proof-system artifact".to_string());
     }
@@ -647,7 +581,7 @@ pub(crate) fn verify_init_public_proof(
         "dynamic-poa-init-eval-zkopen",
     )?;
 
-    let sp1_public = sp1_host::init::verify_init_proof(proof)?;
+    let (sp1_public, ownership_public) = sp1_host::init::verify_init_proof(proof)?;
     let balance_value_base = derive_generator("balance-v", 0);
     let balance_blind_base = derive_generator("balance-h", 0);
     let eval_value_base = derive_generator("eval-v", 0);
@@ -667,6 +601,11 @@ pub(crate) fn verify_init_public_proof(
         || sp1_public.shape_commitment != c_shape
         || !sp1_host::kzg_insert::point_matches(&sp1_public.eval_commitment, &c_y)
         || sp1_public.commitment_params_digest_hex != expected_params_digest
+        || ownership_public.chain_id != proof.chain_id
+        || ownership_public.state_root != proof.state_root
+        || ownership_public.session_id != proof.session_id
+        || ownership_public.reserve_count != proof.reserve_count
+        || ownership_public.reserve_commitment != sp1_public.reserve_commitment
     {
         return Err("init SP1 public values mismatch".to_string());
     }
@@ -685,7 +624,7 @@ pub(crate) fn verify_init_public_proof(
     if expected_transcript != proof.transcript_hex {
         return Err("init transcript mismatch".to_string());
     }
-    Ok(sp1_public.uses_mock_inputs)
+    Ok(sp1_public.uses_mock_inputs || ownership_public.uses_mock_inputs)
 }
 
 fn commit_eval(value: Fr, blind: Fr) -> ark_bls12_381::G1Projective {

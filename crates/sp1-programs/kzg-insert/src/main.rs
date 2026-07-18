@@ -3,7 +3,6 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
-use banderwagon::trait_defs::CanonicalSerialize;
 use num::BigUint;
 use sp1_curves::params::FieldParameters;
 use sp1_curves::weierstrass::bls12_381::{Bls12381, Bls12381BaseField};
@@ -16,7 +15,6 @@ use sp1_programs_common::io::{
     Sp1KzgInsertStdin, Sp1OwnershipWitness,
 };
 use sp1_zkvm::entrypoint;
-use verkle_trie::{proof::VerkleProof, Element};
 
 entrypoint!(main);
 
@@ -378,67 +376,13 @@ fn verify_chain_balance(
             .expect("invalid Ethereum account proof");
         }
         Sp1ChainBalanceProof::EthereumVerkleBatchMember { .. } => {
-            panic!("insert requires a self-contained Verkle proof")
+            panic!("Verkle proofs are disabled in the Merkle insert guest")
         }
-        Sp1ChainBalanceProof::EthereumVerkleProof {
-            tree_key,
-            basic_data,
-            proof,
-        } => verify_ethereum_verkle_opening(
-            state_root, address, balance, tree_key, basic_data, proof,
-        ),
+        Sp1ChainBalanceProof::EthereumVerkleProof { .. } => {
+            panic!("Verkle proofs are disabled in the Merkle insert guest")
+        }
         Sp1ChainBalanceProof::UnsupportedGeneric { .. } => panic!("unsupported chain proof"),
     }
-}
-
-fn verify_ethereum_verkle_opening(
-    state_root: &str,
-    address: &str,
-    balance: i128,
-    tree_key: &Hash,
-    basic_data: &Hash,
-    proof_bytes: &[u8],
-) {
-    assert!(balance >= 0, "negative EIP-6800 balance");
-    let address_bytes = decode_address_bytes(address);
-    assert_eq!(
-        *tree_key,
-        eip6800_basic_data_key(&address_bytes),
-        "EIP-6800 account tree key mismatch"
-    );
-    assert_eq!(basic_data[0], 0, "unsupported EIP-6800 account version");
-    assert_eq!(
-        &basic_data[1..16],
-        &[0u8; 15],
-        "benchmark EOA metadata must be zero"
-    );
-    assert_eq!(
-        &basic_data[16..32],
-        &(balance as u128).to_be_bytes(),
-        "EIP-6800 account balance mismatch"
-    );
-
-    let root_bytes = decode_hash(state_root);
-    let root = Element::from_bytes(&root_bytes).expect("invalid Banderwagon root commitment");
-    let proof = VerkleProof::read(proof_bytes).expect("invalid Verkle proof encoding");
-    let (valid, _) = proof.check(vec![*tree_key], vec![Some(*basic_data)], root);
-    assert!(valid, "Ethereum Verkle account proof mismatch");
-}
-
-fn eip6800_basic_data_key(address: &[u8; 20]) -> Hash {
-    let mut input = [0u8; 64];
-    input[12..32].copy_from_slice(address);
-    let scalars = verkle_spec::chunk64(input).map(verkle_trie::Fr::from);
-    let mut commitment = Element::zero();
-    for (base, scalar) in verkle_trie::constants::CRS.G.iter().take(5).zip(scalars) {
-        commitment = commitment + (*base * scalar);
-    }
-    let hash = commitment.map_to_scalar_field();
-    let mut key = [0u8; 32];
-    hash.serialize_compressed(&mut key[..])
-        .expect("serialize EIP-6800 Pedersen hash");
-    key[31] = 0;
-    key
 }
 
 fn chain_leaf_hash(address: &str, balance: i128) -> Hash {

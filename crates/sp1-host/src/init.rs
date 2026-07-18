@@ -5,11 +5,11 @@ use ark_bls12_381::{Fr, G1Projective};
 use ark_ff::{BigInteger, PrimeField};
 use common::crypto::{hex_decode, hex_encode};
 use common::types::{
-    ChainBalanceProofInput, EthereumVerkleBatchProofInput, InitReserveWitness,
-    OwnershipWitnessInput, StoredInitProof,
+    ChainBalanceProofInput, InitReserveWitness, OwnershipWitnessInput, StoredInitProof,
 };
 use sp1_programs_common::io::{
-    Sp1ChainBalanceProof, Sp1EthereumVerkleBatchProof, Sp1G1Affine, Sp1OwnershipWitness,
+    Sp1ChainBalanceProof, Sp1G1Affine, Sp1InitOwnershipEntry, Sp1InitOwnershipPublicValues,
+    Sp1InitOwnershipStdin, Sp1OwnershipWitness,
 };
 use sp1_programs_common::io::{Sp1InitPublicValues, Sp1InitReserveEntry, Sp1InitStdin};
 use sp1_sdk::blocking::{ProveRequest, Prover as BlockingProver, ProverClient};
@@ -17,9 +17,12 @@ use sp1_sdk::include_elf;
 use sp1_sdk::{ProvingKey, SP1ProofWithPublicValues, SP1Stdin};
 
 use crate::proof_mode::{configured_proof_mode, ensure_trusted_vk, ConfiguredProofMode};
-use crate::setup::{default_setup_dir, ensure_protocol_setups, load_init_vk};
+use crate::setup::{
+    default_setup_dir, ensure_protocol_setups, load_init_ownership_vk, load_init_vk,
+};
 
 const INIT_ELF: sp1_sdk::Elf = include_elf!("sp1-init-merkle");
+const INIT_OWNERSHIP_ELF: sp1_sdk::Elf = include_elf!("sp1-init-ownership");
 const KZG_INSERT_ELF: sp1_sdk::Elf = include_elf!("sp1-kzg-insert");
 
 #[derive(Clone)]
@@ -29,49 +32,104 @@ struct Sp1InitContext {
 }
 
 static SP1_INIT_CONTEXT: OnceLock<Mutex<Option<Sp1InitContext>>> = OnceLock::new();
+static SP1_INIT_OWNERSHIP_CONTEXT: OnceLock<Mutex<Option<Sp1InitContext>>> = OnceLock::new();
+
+pub struct ProvedInitMerkle {
+    pub proof_hex: String,
+    pub vk_hex: String,
+    pub public_values_hex: String,
+    pub public: Sp1InitPublicValues,
+}
+
+pub struct ProvedInitOwnership {
+    pub proof_hex: String,
+    pub vk_hex: String,
+    pub public_values_hex: String,
+    pub public: Sp1InitOwnershipPublicValues,
+}
 
 pub fn ensure_sp1_setup(setup_dir: &Path) -> Result<(), String> {
-    ensure_protocol_setups(setup_dir, INIT_ELF, KZG_INSERT_ELF)
+    ensure_protocol_setups(setup_dir, INIT_ELF, INIT_OWNERSHIP_ELF, KZG_INSERT_ELF)
 }
 
-pub fn prove_init(
-    stdin_value: Sp1InitStdin,
-) -> Result<(String, String, String, Sp1InitPublicValues), String> {
-    let ctx = sp1_context()?;
-    let proof_bundle = run_sp1_proof(&ctx, &stdin_value)?;
-    let public_values = decode_public_values(&proof_bundle);
-    Ok((
-        serialize_sp1_proof(&proof_bundle)?,
-        serialize_sp1_vk(&ctx)?,
-        hex_encode(proof_bundle.public_values.as_slice()),
-        public_values,
-    ))
+pub fn prove_init_ownership(
+    ownership_stdin: Sp1InitOwnershipStdin,
+) -> Result<ProvedInitOwnership, String> {
+    let ownership_ctx = sp1_ownership_context()?;
+    let ownership_bundle = run_sp1_proof(&ownership_ctx, &ownership_stdin, "init ownership")?;
+    Ok(ProvedInitOwnership {
+        proof_hex: serialize_sp1_proof(&ownership_bundle)?,
+        vk_hex: serialize_sp1_vk(&ownership_ctx)?,
+        public_values_hex: hex_encode(ownership_bundle.public_values.as_slice()),
+        public: decode_ownership_public_values(&ownership_bundle),
+    })
 }
 
-pub fn verify_init_proof(proof: &StoredInitProof) -> Result<Sp1InitPublicValues, String> {
-    if proof.sp1_proof_hex.is_empty() || proof.sp1_vk_hex.is_empty() {
+pub fn prove_init_merkle(merkle_stdin: Sp1InitStdin) -> Result<ProvedInitMerkle, String> {
+    let merkle_ctx = sp1_context()?;
+    let merkle_bundle = run_sp1_proof(&merkle_ctx, &merkle_stdin, "init Merkle")?;
+    Ok(ProvedInitMerkle {
+        proof_hex: serialize_sp1_proof(&merkle_bundle)?,
+        vk_hex: serialize_sp1_vk(&merkle_ctx)?,
+        public_values_hex: hex_encode(merkle_bundle.public_values.as_slice()),
+        public: decode_public_values(&merkle_bundle),
+    })
+}
+
+pub fn verify_init_proof(
+    proof: &StoredInitProof,
+) -> Result<(Sp1InitPublicValues, Sp1InitOwnershipPublicValues), String> {
+    if proof.sp1_proof_hex.is_empty()
+        || proof.sp1_vk_hex.is_empty()
+        || proof.ownership_sp1_proof_hex.is_empty()
+        || proof.ownership_sp1_vk_hex.is_empty()
+    {
         return Err("missing serialized SP1 init proof artifacts".to_string());
     }
-    let ctx = sp1_context()?;
-    let bundle = deserialize_sp1_proof(&proof.sp1_proof_hex)?;
+    let merkle_ctx = sp1_context()?;
+    let ownership_ctx = sp1_ownership_context()?;
+    let merkle_bundle = deserialize_sp1_proof(&proof.sp1_proof_hex)?;
+    let ownership_bundle = deserialize_sp1_proof(&proof.ownership_sp1_proof_hex)?;
     if !proof.sp1_public_values_hex.is_empty()
-        && proof.sp1_public_values_hex != hex_encode(bundle.public_values.as_slice())
+        && proof.sp1_public_values_hex != hex_encode(merkle_bundle.public_values.as_slice())
     {
-        return Err("stored SP1 init public values do not match proof bundle".to_string());
+        return Err("stored SP1 init Merkle public values do not match proof bundle".to_string());
+    }
+    if !proof.ownership_sp1_public_values_hex.is_empty()
+        && proof.ownership_sp1_public_values_hex
+            != hex_encode(ownership_bundle.public_values.as_slice())
+    {
+        return Err(
+            "stored SP1 init ownership public values do not match proof bundle".to_string(),
+        );
     }
     ensure_trusted_vk(
         &proof.sp1_vk_hex,
-        ctx.pk.verifying_key(),
+        merkle_ctx.pk.verifying_key(),
         hex_decode,
-        "init",
+        "init Merkle",
     )?;
-    ctx.prover
-        .verify(&bundle, ctx.pk.verifying_key(), None)
-        .map_err(|err| format!("sp1 init verify failed: {err}"))?;
-    Ok(decode_public_values(&bundle))
+    ensure_trusted_vk(
+        &proof.ownership_sp1_vk_hex,
+        ownership_ctx.pk.verifying_key(),
+        hex_decode,
+        "init ownership",
+    )?;
+    merkle_ctx
+        .prover
+        .verify(&merkle_bundle, merkle_ctx.pk.verifying_key(), None)
+        .map_err(|err| format!("sp1 init Merkle verify failed: {err}"))?;
+    ownership_ctx
+        .prover
+        .verify(&ownership_bundle, ownership_ctx.pk.verifying_key(), None)
+        .map_err(|err| format!("sp1 init ownership verify failed: {err}"))?;
+    Ok((
+        decode_public_values(&merkle_bundle),
+        decode_ownership_public_values(&ownership_bundle),
+    ))
 }
 
-pub fn build_init_stdin(
+pub fn build_init_merkle_stdin(
     chain_id: &str,
     state_root: &str,
     session_id: &str,
@@ -93,8 +151,7 @@ pub fn build_init_stdin(
     addresses: &[String],
     encoded_addresses: &[Fr],
     balances: &[i128],
-    witnesses: &[InitReserveWitness],
-    ethereum_verkle_batch_proof: Option<&EthereumVerkleBatchProofInput>,
+    witnesses: &[&InitReserveWitness],
 ) -> Result<Sp1InitStdin, String> {
     if addresses.len() != encoded_addresses.len()
         || addresses.len() != balances.len()
@@ -112,7 +169,6 @@ pub fn build_init_stdin(
                 address: address.clone(),
                 encoded_address_le: fr_to_le_bytes(*encoded),
                 balance: *balance,
-                ownership: convert_ownership(&witness.ownership)?,
                 chain_balance_proof: convert_chain_proof(&witness.chain_balance_proof)?,
             })
         })
@@ -143,11 +199,37 @@ pub fn build_init_stdin(
             eval_value_base,
             eval_blind_base,
         ),
-        ethereum_verkle_batch_proof: ethereum_verkle_batch_proof.map(|proof| {
-            Sp1EthereumVerkleBatchProof {
-                proof: proof.proof.clone(),
-            }
-        }),
+        reserves,
+    })
+}
+
+pub fn build_init_ownership_stdin(
+    chain_id: &str,
+    state_root: &str,
+    session_id: &str,
+    addresses: &[String],
+    balances: &[i128],
+    witnesses: &[&InitReserveWitness],
+) -> Result<Sp1InitOwnershipStdin, String> {
+    if addresses.len() != balances.len() || addresses.len() != witnesses.len() {
+        return Err("init ownership SP1 stdin vector length mismatch".to_string());
+    }
+    let reserves = addresses
+        .iter()
+        .zip(balances.iter())
+        .zip(witnesses.iter())
+        .map(|((address, balance), witness)| {
+            Ok(Sp1InitOwnershipEntry {
+                address: address.clone(),
+                balance: *balance,
+                ownership: convert_ownership(&witness.ownership)?,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(Sp1InitOwnershipStdin {
+        chain_id: chain_id.to_string(),
+        state_root: state_root.to_string(),
+        session_id: session_id.to_string(),
         reserves,
     })
 }
@@ -224,19 +306,11 @@ pub(crate) fn convert_chain_proof(
         }),
         ChainBalanceProofInput::BinaryMerkleV1 {
             leaf_index,
-            siblings_hex,
+            siblings,
             ..
         } => Ok(Sp1ChainBalanceProof::BinaryMerkleV1 {
             leaf_index: *leaf_index,
-            siblings: siblings_hex
-                .iter()
-                .map(|value| {
-                    let bytes = hex_decode(value)?;
-                    bytes
-                        .try_into()
-                        .map_err(|_| "Merkle sibling must contain 32 bytes".to_string())
-                })
-                .collect::<Result<Vec<_>, String>>()?,
+            siblings: siblings.clone(),
         }),
         ChainBalanceProofInput::EthereumAccountProof {
             account_proof_rlp_hex,
@@ -293,9 +367,30 @@ fn sp1_context() -> Result<Sp1InitContext, String> {
     Ok(ctx)
 }
 
-fn run_sp1_proof(
+fn sp1_ownership_context() -> Result<Sp1InitContext, String> {
+    let slot = SP1_INIT_OWNERSHIP_CONTEXT.get_or_init(|| Mutex::new(None));
+    let mut guard = slot
+        .lock()
+        .map_err(|_| "sp1 init ownership context poisoned".to_string())?;
+    if let Some(ctx) = guard.as_ref() {
+        return Ok(ctx.clone());
+    }
+    let setup_dir = default_setup_dir();
+    let prover = ProverClient::builder().cpu().build();
+    let vk = load_init_ownership_vk(&setup_dir, INIT_OWNERSHIP_ELF)?;
+    let pk = sp1_sdk::SP1ProvingKey::new(vk, INIT_OWNERSHIP_ELF);
+    let ctx = Sp1InitContext {
+        prover,
+        pk: Arc::new(pk),
+    };
+    *guard = Some(ctx.clone());
+    Ok(ctx)
+}
+
+fn run_sp1_proof<T: serde::Serialize>(
     ctx: &Sp1InitContext,
-    stdin_value: &Sp1InitStdin,
+    stdin_value: &T,
+    label: &str,
 ) -> Result<SP1ProofWithPublicValues, String> {
     let mut stdin = SP1Stdin::new();
     stdin.write(stdin_value);
@@ -305,12 +400,19 @@ fn run_sp1_proof(
         ConfiguredProofMode::Plonk => request.plonk().run(),
         ConfiguredProofMode::Compressed => request.compressed().run(),
     };
-    result.map_err(|err| format!("sp1 init prove failed: {err}"))
+    result.map_err(|err| format!("sp1 {label} prove failed: {err}"))
 }
 
 fn decode_public_values(bundle: &SP1ProofWithPublicValues) -> Sp1InitPublicValues {
     let mut public_values = bundle.public_values.clone();
     public_values.read::<Sp1InitPublicValues>()
+}
+
+fn decode_ownership_public_values(
+    bundle: &SP1ProofWithPublicValues,
+) -> Sp1InitOwnershipPublicValues {
+    let mut public_values = bundle.public_values.clone();
+    public_values.read::<Sp1InitOwnershipPublicValues>()
 }
 
 fn serialize_sp1_proof(bundle: &SP1ProofWithPublicValues) -> Result<String, String> {

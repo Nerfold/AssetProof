@@ -33,6 +33,26 @@ where
     *hasher.finalize().as_bytes()
 }
 
+/// Binds the two split initialization guests to the exact same ordered
+/// `(address, balance)` witness vector.
+pub fn init_reserve_commitment<'a, I>(reserve_count: usize, reserves: I) -> Hash
+where
+    I: IntoIterator<Item = (&'a str, i128)>,
+{
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"dynamic-poa-init-reserves-blake3-v1");
+    hasher.update(&(reserve_count as u64).to_le_bytes());
+    let mut encoded_count = 0usize;
+    for (address, balance) in reserves {
+        hasher.update(&(address.len() as u64).to_le_bytes());
+        hasher.update(address.as_bytes());
+        hasher.update(&balance.to_le_bytes());
+        encoded_count += 1;
+    }
+    assert_eq!(encoded_count, reserve_count, "reserve count mismatch");
+    *hasher.finalize().as_bytes()
+}
+
 /// Binds the degree-bounded insertion quotient before its Fiat--Shamir
 /// evaluation point is derived. The salt and coefficients remain private SP1
 /// witnesses; the public digest replaces the linear-size HPolyCom commitment.
@@ -171,8 +191,32 @@ pub struct Sp1InitReserveEntry {
     pub address: String,
     pub encoded_address_le: [u8; 32],
     pub balance: i128,
-    pub ownership: Sp1OwnershipWitness,
     pub chain_balance_proof: Sp1ChainBalanceProof,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Sp1InitOwnershipEntry {
+    pub address: String,
+    pub balance: i128,
+    pub ownership: Sp1OwnershipWitness,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Sp1InitOwnershipStdin {
+    pub chain_id: String,
+    pub state_root: String,
+    pub session_id: String,
+    pub reserves: Vec<Sp1InitOwnershipEntry>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Sp1InitOwnershipPublicValues {
+    pub chain_id: String,
+    pub state_root: String,
+    pub session_id: String,
+    pub reserve_count: usize,
+    pub reserve_commitment: Hash,
+    pub uses_mock_inputs: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -217,11 +261,6 @@ pub enum Sp1ChainBalanceProof {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Sp1EthereumVerkleBatchProof {
-    pub proof: Vec<u8>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Sp1InitStdin {
     pub chain_id: String,
     pub state_root: String,
@@ -243,7 +282,6 @@ pub struct Sp1InitStdin {
     pub shape_commitment: Hash,
     pub eval_commitment: Sp1G1Affine,
     pub commitment_params_digest_hex: String,
-    pub ethereum_verkle_batch_proof: Option<Sp1EthereumVerkleBatchProof>,
     pub reserves: Vec<Sp1InitReserveEntry>,
 }
 
@@ -253,6 +291,7 @@ pub struct Sp1InitPublicValues {
     pub state_root: String,
     pub session_id: String,
     pub reserve_count: usize,
+    pub reserve_commitment: Hash,
     pub zeta_le: [u8; 32],
     pub balance_commitment: Sp1G1Affine,
     pub shape_commitment: Hash,

@@ -11,6 +11,7 @@ use sp1_sdk::SP1VerifyingKey;
 const UPDATE_ELF_NAME: &str = "smt-update";
 const INSERT_ELF_NAME: &str = "smt-insert";
 const INIT_ELF_NAME: &str = "init";
+const INIT_OWNERSHIP_ELF_NAME: &str = "init-ownership";
 const KZG_INSERT_ELF_NAME: &str = "kzg-insert";
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -34,9 +35,11 @@ pub fn default_setup_dir() -> PathBuf {
 pub fn ensure_protocol_setups(
     setup_dir: &Path,
     init_elf: Elf,
+    init_ownership_elf: Elf,
     kzg_insert_elf: Elf,
 ) -> Result<(), String> {
     ensure_setup_file(setup_dir, INIT_ELF_NAME, init_elf)?;
+    ensure_setup_file(setup_dir, INIT_OWNERSHIP_ELF_NAME, init_ownership_elf)?;
     ensure_setup_file(setup_dir, KZG_INSERT_ELF_NAME, kzg_insert_elf)?;
     Ok(())
 }
@@ -61,6 +64,13 @@ pub fn load_insert_vk(setup_dir: &Path, insert_elf: Elf) -> Result<SP1VerifyingK
 
 pub fn load_init_vk(setup_dir: &Path, init_elf: Elf) -> Result<SP1VerifyingKey, String> {
     load_setup_file(setup_dir, INIT_ELF_NAME, init_elf)
+}
+
+pub fn load_init_ownership_vk(
+    setup_dir: &Path,
+    init_ownership_elf: Elf,
+) -> Result<SP1VerifyingKey, String> {
+    load_setup_file(setup_dir, INIT_OWNERSHIP_ELF_NAME, init_ownership_elf)
 }
 
 fn ensure_setup_file(setup_dir: &Path, elf_name: &str, elf: Elf) -> Result<(), String> {

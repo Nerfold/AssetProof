@@ -215,10 +215,9 @@ initialization 和 KZG insert 生成 SP1 setup：
 
 本次 CRS 升级与旧的 `hash_to_scalar * G` 基点不兼容。旧 state 中的 balance
 commitment、旧 initialization/update/insert proof 都必须从 initialization 开始重新生成；
-不能在旧 state 上继续 update。初始化 scheme 已升级为
-`kzg-nizk-init-v6-zkopen-salted-shape-hash-mock-bound`（真实 Verkle 输入对应
-`...-eip6800-verkle-bound`），insert scheme 为
-`kzg-nizk-insert-v6-salted-quotient-hash-bounded-range-mock-bound`。修改过 SP1 guest 后也必须重新运行 `./poa sp1-setup`；
+不能在旧 state 上继续 update。Merkle 分支的初始化 scheme 为
+`kzg-nizk-init-v7-zkopen-salted-shape-hash-binary-merkle-split`，insert scheme 为
+`kzg-nizk-insert-v7-salted-quotient-hash-binary-merkle-bound`。修改过 SP1 guest 后也必须重新运行 `./poa sp1-setup`；
 loader 会比较 artifact 中记录的 ELF digest，旧 artifact 会 fail-closed 并提示重新 setup。
 本轮只修改代码、未重新生成 SP1 artifact，因此首次运行前必须执行一次该命令。
 
@@ -412,29 +411,23 @@ POA_TIMING=1 ./poa prove-update \
 
 完整协议矩阵由 `scripts/benchmark_protocol.sh` 运行。其 initialization fixture 在
 SP1 外一次性生成 `10^6+1` 个确定性的有效 secp256k1 私钥、未压缩公钥、由 Keccak
-派生的 Ethereum 地址、ECDSA ownership signatures、随机化余额、EIP-6800 basic-data leaves，以及一棵固定的 256 叉
-Banderwagon Verkle tree。各规模使用同一 canonical account store 的前 `n` 个账户；
+派生的 Ethereum 地址、ECDSA ownership signatures、随机化余额，以及一棵覆盖全部
+账户的固定高度二叉 Merkle tree。各规模使用同一 canonical account store 的前 `n` 个账户；
 最后一个账户只存在于同一个 Ethereum state 中，供所有 insert benchmark 使用。SP1
-内使用 secp256k1 预编译恢复签名公钥、用 Keccak 预编译派生并核对地址，然后执行
-EIP-6800 tree-key 与 basic-data 编码检查、Banderwagon
-commitment 解析和 IPA opening 验证，不再使用
+内使用 secp256k1 预编译恢复签名公钥、用 Keccak 预编译派生并核对地址；另一个 guest
+使用域分离的 BLAKE3 leaf/node hash 验证 Merkle path，不再使用
 `mock-private-key:<address>` / `mock-balance-proof:<address>` 标签。fixture 生成、磁盘
-加载不计入 prover/verifier time。准备脚本会对持久化账户、密钥和 Verkle proof 做一次
-完整密码学校验；正式 benchmark 只检查文件格式、规模、root 和 canonical 顺序，不再在
-每轮加载时重复同一套 host 校验，协议要求的检查仍由 SP1 guest 在 initialization/insert
-证明中执行。
+加载不计入 prover/verifier time。Initialization 的 ownership guest 与 Merkle/polynomial
+guest 分别产生 SP1 proof；两者公开相同的 chain/session、reserve count 和有序
+`(address,balance)` commitment，宿主和 verifier 只在这些字段完全相同时合并接受。
 
-初始化不会把同一份证明复制 `n` 次：每个账户有独立的 key/value opening，密码学上
-按 Verkle witness 的标准方式聚合为一份 multiproof，并在 SP1 guest 中验证一次。
-每个配置的 `n` 会从这棵主树导出一份独立 multiproof，因为 Verkle multiproof 不能直接
-截断；但账户、叶子和树只生成并持久化一份。Insert 使用同一 state root 下的固定单账户
-Verkle proof。准备阶段在主树上应用随机 delta、记录真实的新 root 后恢复原叶子；
+每个账户保存一条固定深度 Merkle path。不同 `n` 复用同一棵主树、同一个 state root 和
+相同高度，只持久化相应账户前缀的路径集合。Insert 使用同一 root 下候选账户的单条路径。
+准备阶段在主树上应用随机 delta、记录真实的新 root 后恢复原叶子；
 Sync/finality 证明仍按论文中的独立抽象处理，不计入 debug update verifier。
 
-该后端固定使用 `crate-crypto/rust-verkle` commit
-`e27b8b4edf1992b4afa636c2fc7983bcc27ddb88`，其 Pedersen basis、31-byte stem/1-byte
-suffix、leaf splitting 和 IPA transcript 与 EIP-6800 参考实现一致。它属于研究型
-benchmark 依赖，不应被描述为当前 Ethereum 主网共识状态树实现。
+该二叉 Merkle tree 是 Ethereum 风格账户/密钥 benchmark fixture，不是 Ethereum 主网
+MPT/Verkle 共识状态树；它用于隔离协议主体与 SP1 哈希路径性能。
 
 完整 benchmark 必须分两阶段执行。先初始化并持久化最大到 `10^6` 个账户的数据：
 
@@ -444,11 +437,11 @@ benchmark 依赖，不应被描述为当前 Ethereum 主网共识状态树实现
 
 默认会准备以下矩阵：
 
-- `n = 10^4, 10^5, 10^6`：共享一份 `10^6+1` 账户文件、一棵主 Verkle tree、同一个
-  state root 和 insert proof；每个 `n` 只额外持久化针对账户前缀的 initialization multiproof；
+- `n = 10^4, 10^5, 10^6`：共享一份 `10^6+1` 账户文件、一棵固定高度主 Merkle tree、
+  同一个 state root 和 insert proof；每个 `n` 持久化账户前缀的 Merkle paths；
 - `m = 10^2, 10^3`：每个 `n` 先确定性生成最大 `10^3` 个互不重复的随机更新，
   `10^2` 是同一更新序列的前缀；两种规模分别持久化 canonical delta list 及其重建后
-  的新 Verkle root；
+  的新 Merkle root；
 - 一套由全部规模共享的 development benchmark SRS。普通 G1 powers 覆盖
   `MASTER_N+1`（insert 会增加一个账户），G2 powers 只覆盖 verifier 实际会
   提交的最大更新消失多项式 `max(m)`。这与 KZG 关系一致，并避免生成约一百万个协议
@@ -463,13 +456,13 @@ benchmark 依赖，不应被描述为当前 Ethereum 主网共识状态树实现
 ```text
 data/mock/bench/generated/
   preparation-manifest.txt
-  master_n_1000000/ethereum-eip6800-verkle-v4-ecdsa/
+  master_n_1000000/ethereum-binary-merkle-v1-ecdsa/
     accounts.bin
     master-manifest.txt
-    insert-proof.bin
-    init-multiproof-n-10000.bin
-    init-multiproof-n-100000.bin
-    init-multiproof-n-1000000.bin
+    insert-merkle-proof.bin
+    init-merkle-proofs-n-10000.bin
+    init-merkle-proofs-n-100000.bin
+    init-merkle-proofs-n-1000000.bin
     deltas-n-*-m-*.csv
 
 params/srs/bench/
@@ -507,10 +500,9 @@ KZG ceremony、subgroup 和 power-sequence 检查属于 `setup/import-srs` 参�
 `.meta` 文件中的 BLAKE3 digest 绑定认证后的完整 SRS artifact。proof verifier 不重新
 审计 SRS，也不会扫描百万个 powers；benchmark 的 verifier time 只包含当前 proof 的验证。
 
-初始化脚本只构建一次最大规模主树，并在宿主侧验证各账户前缀的公私钥、basic-data、
-初始化 multiproof、共享 insert proof、delta 的旧 root 和生成的新 root；
-initialization/insert 的 SP1 guest 随后还会在证明
-过程中再次验证对应的 Verkle opening。百万规模准备过程本身可能消耗大量内存、磁盘和
+初始化脚本只构建一次最大规模主树并持久化账户、Merkle paths、delta roots 和初始化后
+多项式状态；initialization/insert 的 SP1 guest 在证明过程中验证对应的 Merkle path。
+百万规模准备过程本身可能消耗大量内存、磁盘和
 时间，但这些时间不会进入 protocol prover/verifier 统计。SRS 会按两个阶段显示进度，
 默认使用全部逻辑 CPU；可用 `SRS_THREADS=8 ./scripts/initialize_benchmark_data.sh` 限制
 并行度。文件名同时绑定最大 G1 degree 和最大 G2 degree，参数矩阵不变时会

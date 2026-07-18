@@ -47,10 +47,10 @@ if [[ ! -f "$FIXTURE_DIR/preparation-manifest.txt" ]]; then
   echo "Run scripts/initialize_benchmark_data.sh first." >&2
   exit 1
 fi
-if ! grep -Fxq "fixture_version=ethereum-eip6800-verkle-v4-ecdsa" "$FIXTURE_DIR/preparation-manifest.txt" \
+if ! grep -Fxq "fixture_version=ethereum-binary-merkle-v1-ecdsa" "$FIXTURE_DIR/preparation-manifest.txt" \
   || ! grep -Fxq "master.max_n=$MASTER_N" "$FIXTURE_DIR/preparation-manifest.txt"; then
   echo >&2
-  echo "Prepared fixtures do not match fixture v4 ECDSA / MASTER_N=$MASTER_N." >&2
+  echo "Prepared fixtures do not match binary-Merkle ECDSA fixture / MASTER_N=$MASTER_N." >&2
   echo "Run scripts/initialize_benchmark_data.sh again." >&2
   exit 1
 fi
@@ -58,7 +58,7 @@ fi
 case ",$BENCHMARK_OPERATIONS," in
   *,all,*|*,initialization,*|*,init,*|*,insert,*)
     echo
-    echo "Preparing protocol SP1 setup (initialization + KZG insert) outside benchmark timers..."
+    echo "Preparing protocol SP1 setup (init Merkle + init ownership + KZG insert) outside benchmark timers..."
     ./poa sp1-setup
     ;;
   *)

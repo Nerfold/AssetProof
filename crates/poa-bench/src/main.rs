@@ -8,12 +8,12 @@ use std::time::{Duration, Instant};
 use common::crypto::scalar_to_hex;
 use common::io::{encode_proof_binary, read_srs, read_state, write_init, write_srs, write_state};
 use common::types::{
-    Delta, EthereumVerkleBatchProofInput, InitProvingContext, InitReserveWitness, ReserveEntry,
-    StoredInitProof, StoredProof, StoredState,
+    Delta, InitProvingContext, InitReserveWitness, ReserveEntry, StoredInitProof, StoredProof,
+    StoredState,
 };
 use nizk_fixed_set::external::Sp1NativeProofAdapter;
 use nizk_fixed_set::init_proof::{
-    build_mock_initialized_state, initialize_from_witnesses_with_verkle_proof,
+    build_mock_initialized_state, initialize_from_witnesses_with_adapter,
     validate_mock_initialized_state_shape, verify_mock_initialized_state, InitProofResult,
 };
 use nizk_fixed_set::insert::{
@@ -27,7 +27,7 @@ use nizk_fixed_set::verifier::{
 
 mod ethereum_fixture;
 
-const FIXTURE_VERSION: &str = "ethereum-eip6800-verkle-v4-ecdsa";
+const FIXTURE_VERSION: &str = "ethereum-binary-merkle-v1-ecdsa";
 
 fn main() {
     if let Err(err) = run() {
@@ -160,7 +160,7 @@ fn run() -> Result<(), String> {
         let reserve_path = ethereum_fixture::init_proof_path(&master_dir, n);
         let initialized_state_path = mock_initialized_state_path(&master_dir, n);
         if config.require_existing {
-            require_existing(&reserve_path, "Ethereum Verkle initialization fixture")?;
+            require_existing(&reserve_path, "Ethereum Merkle initialization fixture")?;
             require_existing(
                 &ethereum_fixture::master_accounts_path(&master_dir),
                 "master Ethereum account store",
@@ -214,7 +214,6 @@ fn run() -> Result<(), String> {
                 &srs,
                 &fixture.state_root,
                 &fixture.witnesses,
-                &fixture.verkle_proof,
                 reserve_load,
                 srs_load,
                 &mut samples,
@@ -263,7 +262,7 @@ fn run() -> Result<(), String> {
                 }
                 let delta_path = ethereum_fixture::delta_fixture_path(&master_dir, n, m);
                 if config.require_existing {
-                    require_existing(&delta_path, "Ethereum Verkle transition fixture")?;
+                    require_existing(&delta_path, "Ethereum Merkle transition fixture")?;
                 }
                 let (deltas, new_state_root, fixture_time, delta_load, fixture_reused) =
                     ethereum_fixture::ensure_delta_fixture(&delta_path, &fixture, m)?;
@@ -345,7 +344,7 @@ fn prepare_benchmark_inputs(config: &Config) -> Result<(), String> {
 
     let master_dir = master_fixture_dir(&config.fixture_dir, config.master_n);
     println!(
-        "\n== generating one shared master Verkle tree master_n={} ==",
+        "\n== generating one shared master binary Merkle tree master_n={} ==",
         config.master_n
     );
     let (master_generation, master_reused) = ethereum_fixture::ensure_master_fixture(
@@ -377,7 +376,6 @@ fn prepare_benchmark_inputs(config: &Config) -> Result<(), String> {
     manifest.push(format!("srs_max_g2_degree={max_g2_degree}"));
     manifest.push(format!("srs_bytes={}", file_len(&prepared_srs_path)?));
 
-    let largest_n = config.n_sizes.iter().copied().max().unwrap_or_default();
     for &n in &config.n_sizes {
         println!("\n== loading persisted master-tree prefix n={n} ==");
         manifest.push(format!("n.{n}.srs_path={}", prepared_srs_path.display()));
@@ -385,13 +383,12 @@ fn prepare_benchmark_inputs(config: &Config) -> Result<(), String> {
 
         let init_path = ethereum_fixture::init_proof_path(&master_dir, n);
         let load_start = Instant::now();
-        let validation = if n == largest_n {
-            ethereum_fixture::FixtureValidation::Full
-        } else {
-            ethereum_fixture::FixtureValidation::Proofs
-        };
-        let fixture =
-            ethereum_fixture::load_init_fixture(&master_dir, config.master_n, n, validation)?;
+        let fixture = ethereum_fixture::load_init_fixture(
+            &master_dir,
+            config.master_n,
+            n,
+            ethereum_fixture::FixtureValidation::None,
+        )?;
         let load = load_start.elapsed();
         println!(
             "   init: generation={} validation={} bytes={} reused=true",
@@ -406,12 +403,12 @@ fn prepare_benchmark_inputs(config: &Config) -> Result<(), String> {
             ethereum_fixture::fixture_persisted_bytes(&master_dir, n)?
         ));
         manifest.push(format!(
-            "n.{n}.init_verkle_proof_bytes={}",
-            fixture.verkle_proof.proof.len()
+            "n.{n}.init_merkle_proof_bytes={}",
+            file_len(&init_path)?
         ));
         manifest.push(format!(
-            "n.{n}.insert_verkle_proof_bytes={}",
-            fixture.insert.proof.len()
+            "n.{n}.insert_merkle_proof_bytes={}",
+            file_len(&ethereum_fixture::insert_proof_path(&master_dir))?
         ));
 
         let initialized_state_path = mock_initialized_state_path(&master_dir, n);
@@ -539,7 +536,7 @@ fn ensure_initialized_state_matches_fixture(
             .any(|(actual, expected)| *actual != expected.balance)
     {
         return Err(
-            "initialization output does not preserve the canonical Verkle fixture state"
+            "initialization output does not preserve the canonical Merkle fixture state"
                 .to_string(),
         );
     }
@@ -552,7 +549,6 @@ fn benchmark_init(
     srs: &Srs,
     state_root: &str,
     witnesses: &[InitReserveWitness],
-    verkle_proof: &EthereumVerkleBatchProofInput,
     input_load: Duration,
     srs_load: Duration,
     raw: &mut Vec<SampleRecord>,
@@ -572,13 +568,8 @@ fn benchmark_init(
             state_root: state_root.to_string(),
             session_id: format!("bench-init-{n}-warmup-{warmup}"),
         };
-        let result = initialize_from_witnesses_with_verkle_proof(
-            &ctx,
-            witnesses,
-            verkle_proof,
-            srs,
-            &Sp1NativeProofAdapter,
-        )?;
+        let result =
+            initialize_from_witnesses_with_adapter(&ctx, witnesses, srs, &Sp1NativeProofAdapter)?;
         verify_init_with_policy(srs, &result.state.public_state(), &result.proof, &policy)?;
         black_box(result);
     }
@@ -594,13 +585,8 @@ fn benchmark_init(
             state_root: state_root.to_string(),
             session_id: format!("bench-init-{n}-sample-{sample}"),
         };
-        let result = initialize_from_witnesses_with_verkle_proof(
-            &ctx,
-            witnesses,
-            verkle_proof,
-            srs,
-            &Sp1NativeProofAdapter,
-        )?;
+        let result =
+            initialize_from_witnesses_with_adapter(&ctx, witnesses, srs, &Sp1NativeProofAdapter)?;
         let prover = prove_start.elapsed();
 
         let verify_start = Instant::now();
@@ -647,7 +633,7 @@ fn benchmark_init(
         &prover_samples,
         &verifier_samples,
         &proof_sizes,
-        "init-key-value-text-v3",
+        "init-key-value-text-v4-split-sp1",
     );
     Ok((result.state, summary))
 }
@@ -662,14 +648,13 @@ fn benchmark_insert(
     raw: &mut Vec<SampleRecord>,
 ) -> Result<SummaryRecord, String> {
     println!("-- insert n={n}");
-    let witness = KzgInsertWitness::ethereum_verkle(
+    let witness = KzgInsertWitness::ethereum_merkle(
         ethereum_fixture::CHAIN_ID.to_string(),
         insert.address.clone(),
         insert.balance,
         common::crypto::hex_encode(&insert.ownership_signature),
-        insert.tree_key,
-        insert.basic_data,
-        insert.proof.clone(),
+        insert.leaf_index,
+        insert.siblings.clone(),
     );
     let policy = ChainPolicy::development(
         ethereum_fixture::CHAIN_ID,
@@ -1139,17 +1124,17 @@ fn write_summary_markdown(
     body.push_str("- The release binary is compiled before the benchmark process starts.\n");
     body.push_str("- SP1 setup is performed by the wrapper script before timing.\n");
     body.push_str("- KZG ceremony and power-sequence validation belong to setup/import. Runtime loading authenticates the fixed SRS artifact; proof verification does not scan SRS powers.\n");
-    body.push_str("- All n sizes use prefixes of one persisted max-n Ethereum account store and proofs under one shared Verkle root; the tree is not rebuilt per n.\n");
-    body.push_str("- Initialization uses valid secp256k1 EOA witnesses and one EIP-6800 Banderwagon/IPA multiproof under a computed Verkle root.\n");
+    body.push_str("- All n sizes use prefixes of one persisted max-n Ethereum account store and fixed-height binary Merkle proofs under one shared root; the tree is not rebuilt per n.\n");
+    body.push_str("- Initialization uses valid secp256k1 EOA witnesses and one binary Merkle path per reserve. Ownership and Merkle/polynomial checks run in separate SP1 guests and are joined by a common ordered reserve commitment.\n");
     body.push_str("- Initialization verification uses a development policy because the benchmark SRS is deterministic.\n");
-    body.push_str("- Insert authenticates an additional EOA against the same Verkle root with a self-contained Verkle proof.\n");
+    body.push_str("- Insert authenticates an additional EOA against the same binary Merkle root with a self-contained path.\n");
     body.push_str("- Update verification uses the debug verifier and excludes canonical Sync/finality verification.\n");
     body.push_str("- Update-only mode loads a persisted, structurally valid initialized root polynomial and KZG/balance commitments; it skips only the initialization proof and excludes that state loading/validation from prover time.\n");
     body.push_str(
         "- Proof size is measured after the timer using the labeled artifact encoding.\n",
     );
-    body.push_str("- Ethereum keys, EIP-6800 basic-data leaves, balances, deltas, Verkle roots, and proofs are deterministically generated outside SP1; fixture preparation is excluded from prover time.\n");
-    body.push_str("- Banderwagon commitment parsing, EIP-6800 key/value binding, and IPA multiproof verification execute inside the SP1 guest.\n");
+    body.push_str("- Ethereum keys, balances, deltas, binary Merkle roots, and proofs are deterministically generated outside SP1; fixture preparation is excluded from prover time.\n");
+    body.push_str("- Merkle verification uses only domain-separated BLAKE3 leaf/node hashing inside SP1; no Banderwagon/IPA code remains in initialization or insert.\n");
 
     let path = config.output_dir.join("summary.md");
     fs::write(&path, body).map_err(|err| format!("write {}: {err}", path.display()))

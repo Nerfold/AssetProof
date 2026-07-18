@@ -397,13 +397,9 @@ fn prepare_chain_balance(
         ChainBalanceProofInput::BinaryMerkleV1 {
             chain_id,
             leaf_index,
-            siblings_hex,
+            siblings,
         } => {
-            let mut path = Vec::new();
-            for sibling in siblings_hex {
-                path.extend_from_slice(sibling.as_bytes());
-                path.push(b'|');
-            }
+            let path = siblings.iter().flatten().copied().collect::<Vec<_>>();
             PreparedChainBalanceWitness {
                 scheme: "binary-merkle-v1".to_string(),
                 proof_digest_hex: hex_hash(

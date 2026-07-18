@@ -25,9 +25,9 @@ echo "  SRS threads: $SRS_THREADS"
 echo "  manifest:   $OUTPUT_DIR/preparation-manifest.txt"
 echo
 echo "This stage can require substantial RAM, disk space, and time for n=1000000."
-echo "It builds one master_n+1 account store and one shared Verkle tree."
-echo "Each n reuses that tree/root and stores only its own prefix multiproof."
-echo "It validates persisted Verkle proofs, but does not run SP1 proving."
+echo "It builds one master_n+1 account store and one shared fixed-height binary Merkle tree."
+echo "Each n reuses that tree/root and stores its own prefix Merkle paths."
+echo "It does not run SP1 proving."
 echo "One shared SRS is generated: full G1 through master_n+1,"
 echo "and only the G2 prefix required through max(m). Existing matching SRS is reused."
 

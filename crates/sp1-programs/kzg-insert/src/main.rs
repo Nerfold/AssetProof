@@ -5,11 +5,13 @@ extern crate alloc;
 use alloc::vec::Vec;
 use num::BigUint;
 use sp1_curves::params::FieldParameters;
-use sp1_curves::weierstrass::bls12_381::{Bls12381, Bls12381BaseField};
-use sp1_curves::AffinePoint;
+use sp1_curves::weierstrass::bls12_381::Bls12381BaseField;
+use sp1_lib::bls12381::Bls12381Point;
+use sp1_lib::utils::AffinePoint as Sp1AffinePoint;
 use sp1_programs_common::bls12_381_scalar::{
     add_mod, from_le_bytes, mul_by_montgomery, to_le_bytes, to_montgomery,
 };
+use sp1_programs_common::ethereum_binary_merkle::{leaf_hash, node_hash};
 use sp1_programs_common::io::{
     insert_quotient_commitment, Hash, Sp1ChainBalanceProof, Sp1G1Affine, Sp1KzgInsertPublicValues,
     Sp1KzgInsertStdin, Sp1OwnershipWitness,
@@ -165,45 +167,36 @@ fn commit_two(
     left_scalar: &BigUint,
     right_base: &Sp1G1Affine,
     right_scalar: &BigUint,
-) -> AffinePoint<Bls12381> {
+) -> Bls12381Point {
     let left_base = point_from_io(left_base);
     let right_base = point_from_io(right_base);
-    assert_on_curve(&left_base);
-    assert_on_curve(&right_base);
     let left = (!is_zero(left_scalar)).then(|| scalar_mul_safe(&left_base, left_scalar));
     let right = (!is_zero(right_scalar)).then(|| scalar_mul_safe(&right_base, right_scalar));
     match (left, right) {
-        (Some(left), Some(right)) => add_safe(&left, &right),
+        (Some(mut left), Some(right)) => {
+            left.complete_add_assign(&right);
+            assert!(!left.is_identity(), "commitment addition produced identity");
+            left
+        }
         (Some(left), None) => left,
         (None, Some(right)) => right,
         (None, None) => panic!("commitment cannot be the identity"),
     }
 }
 
-fn scalar_mul_safe(base: &AffinePoint<Bls12381>, scalar: &BigUint) -> AffinePoint<Bls12381> {
-    let mut result = None;
-    let mut power = base.clone();
-    for byte in scalar.to_bytes_le() {
-        for bit in 0..8 {
-            if byte & (1 << bit) != 0 {
-                result = Some(match result {
-                    Some(current) => add_safe(&current, &power),
-                    None => power.clone(),
-                });
-            }
-            power = power.sw_double();
-        }
-    }
-    result.expect("non-zero commitment scalar")
-}
-
-fn add_safe(left: &AffinePoint<Bls12381>, right: &AffinePoint<Bls12381>) -> AffinePoint<Bls12381> {
-    if left == right {
-        left.sw_double()
-    } else {
-        assert!(left.x != right.x, "commitment addition produced identity");
-        left + right
-    }
+fn scalar_mul_safe(base: &Bls12381Point, scalar: &BigUint) -> Bls12381Point {
+    assert!(!is_zero(scalar), "zero commitment scalar");
+    let digits = scalar.to_u64_digits();
+    assert!(digits.len() <= 6, "BLS12-381 scalar is too large");
+    let mut words = [0u64; 6];
+    words[..digits.len()].copy_from_slice(&digits);
+    let mut result = *base;
+    result.mul_assign(&words);
+    assert!(
+        !result.is_identity(),
+        "commitment scalar multiplication produced identity"
+    );
+    result
 }
 
 fn commitment_params_digest(
@@ -212,13 +205,13 @@ fn commitment_params_digest(
     balance_value: &Sp1G1Affine,
     balance_blind: &Sp1G1Affine,
 ) -> alloc::string::String {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"dynamic-poa-insert-commitment-params-v1");
+    let mut hasher = sp1_programs_common::ethereum_eoa::Keccak256Stream::new();
+    hasher.update(b"dynamic-poa-insert-commitment-params-keccak-v2");
     for point in [eval_value, eval_blind, balance_value, balance_blind] {
         hasher.update(&point.x_be);
         hasher.update(&point.y_be);
     }
-    hex_hash(hasher.finalize().as_bytes())
+    hex_hash(&hasher.finalize())
 }
 
 fn hex_hash(bytes: &[u8]) -> alloc::string::String {
@@ -231,32 +224,42 @@ fn hex_hash(bytes: &[u8]) -> alloc::string::String {
     out
 }
 
-fn point_from_io(value: &Sp1G1Affine) -> AffinePoint<Bls12381> {
+fn point_from_io(value: &Sp1G1Affine) -> Bls12381Point {
     assert!(
         value.x_be.len() <= 48 && value.y_be.len() <= 48,
         "invalid G1 coordinate length"
     );
-    AffinePoint::new(
-        BigUint::from_bytes_be(&value.x_be),
-        BigUint::from_bytes_be(&value.y_be),
-    )
+    let x = BigUint::from_bytes_be(&value.x_be);
+    let y = BigUint::from_bytes_be(&value.y_be);
+    assert_on_curve(&x, &y);
+    let mut x_le = fixed_be(&x, 48);
+    let mut y_le = fixed_be(&y, 48);
+    x_le.reverse();
+    y_le.reverse();
+    <Bls12381Point as Sp1AffinePoint<12>>::from(&x_le, &y_le)
 }
 
-fn point_to_io(value: &AffinePoint<Bls12381>) -> Sp1G1Affine {
-    Sp1G1Affine {
-        x_be: fixed_be(&value.x, 48),
-        y_be: fixed_be(&value.y, 48),
-    }
+fn point_to_io(value: &Bls12381Point) -> Sp1G1Affine {
+    assert!(!value.is_identity(), "cannot encode identity commitment");
+    let limbs = value.limbs_ref();
+    let mut x_be = limbs[..6]
+        .iter()
+        .flat_map(|word| word.to_le_bytes())
+        .collect::<Vec<_>>();
+    let mut y_be = limbs[6..]
+        .iter()
+        .flat_map(|word| word.to_le_bytes())
+        .collect::<Vec<_>>();
+    x_be.reverse();
+    y_be.reverse();
+    Sp1G1Affine { x_be, y_be }
 }
 
-fn assert_on_curve(point: &AffinePoint<Bls12381>) {
+fn assert_on_curve(x: &BigUint, y: &BigUint) {
     let modulus = Bls12381BaseField::modulus();
-    assert!(
-        point.x < modulus && point.y < modulus,
-        "G1 coordinate out of range"
-    );
-    let lhs = (&point.y * &point.y) % &modulus;
-    let rhs = ((&point.x * &point.x % &modulus) * &point.x + BigUint::from(4u32)) % &modulus;
+    assert!(x < &modulus && y < &modulus, "G1 coordinate out of range");
+    let lhs = (y * y) % &modulus;
+    let rhs = ((x * x % &modulus) * x + BigUint::from(4u32)) % &modulus;
     assert_eq!(lhs, rhs, "point is not on BLS12-381 G1");
 }
 
@@ -350,13 +353,14 @@ fn verify_chain_balance(
             leaf_index,
             siblings,
         } => {
-            let mut current = chain_leaf_hash(address, balance);
+            let address_bytes = decode_address_bytes(address);
+            let mut current = leaf_hash(&address_bytes, balance);
             let mut index = *leaf_index;
             for (level, sibling) in siblings.iter().enumerate() {
                 current = if index & 1 == 0 {
-                    chain_node_hash(level, &current, sibling)
+                    node_hash(level, &current, sibling)
                 } else {
-                    chain_node_hash(level, sibling, &current)
+                    node_hash(level, sibling, &current)
                 };
                 index >>= 1;
             }
@@ -383,24 +387,6 @@ fn verify_chain_balance(
         }
         Sp1ChainBalanceProof::UnsupportedGeneric { .. } => panic!("unsupported chain proof"),
     }
-}
-
-fn chain_leaf_hash(address: &str, balance: i128) -> Hash {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"dpoa-chain-leaf-v1");
-    hasher.update(&(address.len() as u64).to_le_bytes());
-    hasher.update(address.as_bytes());
-    hasher.update(&balance.to_le_bytes());
-    *hasher.finalize().as_bytes()
-}
-
-fn chain_node_hash(level: usize, left: &Hash, right: &Hash) -> Hash {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"dpoa-chain-node-v1");
-    hasher.update(&(level as u64).to_le_bytes());
-    hasher.update(left);
-    hasher.update(right);
-    *hasher.finalize().as_bytes()
 }
 
 fn decode_hash(value: &str) -> Hash {

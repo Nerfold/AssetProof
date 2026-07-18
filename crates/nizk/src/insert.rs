@@ -340,6 +340,8 @@ pub fn apply_insert_with_adapter(
     let new_opening_poly = new_p.quotient_at(zeta, y_prime)?;
     let old_eval_opening = commit_g1(srs, &old_opening_poly)?;
     let new_eval_opening = commit_g1(srs, &new_opening_poly)?;
+    drop(old_opening_poly);
+    drop(new_opening_poly);
     let old_eval_opening_proof_hex = prove_committed_opening(
         srs,
         &old_accumulator_hex,
@@ -456,6 +458,10 @@ pub fn apply_insert_with_adapter(
         next_reserve_count,
         &transcript_hex,
     )?;
+    // `sp1_stdin` now owns the coefficient encoding.  Keep only `new_p` for
+    // the returned state while the zkVM prover allocates its trace.
+    drop(q_poly);
+    drop(old_p);
     let (sp1_proof_hex, sp1_vk_hex, sp1_public_values_hex, sp1_public) =
         sp1_host::kzg_insert::prove(sp1_stdin)?;
     if sp1_public.chain_id != witness.chain_id
@@ -492,7 +498,7 @@ pub fn apply_insert_with_adapter(
     };
 
     let proof = KzgInsertProof {
-        scheme: "kzg-nizk-insert-v7-salted-quotient-hash-binary-merkle-bound".to_string(),
+        scheme: "kzg-nizk-insert-v8-salted-quotient-hash-keccak-merkle-bound".to_string(),
         chain_id: witness.chain_id.clone(),
         old_state_root: state.state_root.clone(),
         new_state_root: state.state_root.clone(),
@@ -590,7 +596,7 @@ pub fn verify_insert_with_srs_and_policy(
     {
         return Err("insert reserve count is outside the SRS-supported range".to_string());
     }
-    if proof.scheme != "kzg-nizk-insert-v7-salted-quotient-hash-binary-merkle-bound" {
+    if proof.scheme != "kzg-nizk-insert-v8-salted-quotient-hash-keccak-merkle-bound" {
         return Err("insert proof is not a production ZK proof".to_string());
     }
     let quotient_commitment = parse_quotient_commitment(&proof.quotient_commitment_hex)?;

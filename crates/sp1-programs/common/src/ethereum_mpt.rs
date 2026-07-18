@@ -1,5 +1,5 @@
+use crate::ethereum_eoa::keccak256;
 use alloc::vec::Vec;
-use sha3::{Digest, Keccak256};
 
 #[derive(Clone, Copy)]
 struct RlpItem<'a> {
@@ -17,7 +17,7 @@ pub fn verify_account_balance(
     if expected_balance < 0 || proof_nodes.is_empty() {
         return Err("invalid Ethereum account proof input");
     }
-    let key = Keccak256::digest(address);
+    let key = keccak256(address);
     let mut nibbles = [0u8; 64];
     for (index, byte) in key.iter().enumerate() {
         nibbles[index * 2] = byte >> 4;
@@ -26,7 +26,7 @@ pub fn verify_account_balance(
 
     let mut proof_index = 0usize;
     let mut node_bytes = proof_nodes[0].as_slice();
-    if Keccak256::digest(node_bytes).as_slice() != state_root {
+    if &keccak256(node_bytes) != state_root {
         return Err("Ethereum state root mismatch");
     }
     let mut path_offset = 0usize;
@@ -98,7 +98,7 @@ fn resolve_child<'a>(
         let next = proof_nodes
             .get(*proof_index)
             .ok_or("missing Ethereum trie proof node")?;
-        if Keccak256::digest(next).as_slice() != child.payload {
+        if keccak256(next).as_slice() != child.payload {
             return Err("Ethereum trie child hash mismatch");
         }
         return Ok(next);
@@ -247,6 +247,7 @@ fn parse_length(input: &[u8], len_of_len: usize) -> Result<usize, &'static str> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha3::{Digest, Keccak256};
 
     #[test]
     fn verifies_single_leaf_ethereum_account_proof() {

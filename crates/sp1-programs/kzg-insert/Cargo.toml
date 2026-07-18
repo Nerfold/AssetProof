@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-blake3 = { version = "1.8", default-features = false }
 num = { version = "0.4", default-features = false }
 sp1-curves = "6.2.4"
+sp1-lib = { version = "6.2.4", default-features = false }
 sp1-programs-common = { path = "../common" }
 sp1-zkvm = { version = "6.2.2" }

@@ -5,11 +5,12 @@ use ark_bls12_381::{Fr, G1Projective};
 use ark_ff::{BigInteger, PrimeField};
 use common::crypto::{hex_decode, hex_encode};
 use common::types::{
-    ChainBalanceProofInput, InitReserveWitness, OwnershipWitnessInput, StoredInitProof,
+    ChainBalanceProofInput, InitChainBatchProofInput, InitReserveWitness, OwnershipWitnessInput,
+    StoredInitProof,
 };
 use sp1_programs_common::io::{
-    Sp1ChainBalanceProof, Sp1G1Affine, Sp1InitOwnershipEntry, Sp1InitOwnershipPublicValues,
-    Sp1InitOwnershipStdin, Sp1OwnershipWitness,
+    Sp1BinaryMerklePrefixProof, Sp1ChainBalanceProof, Sp1G1Affine, Sp1InitOwnershipEntry,
+    Sp1InitOwnershipPublicValues, Sp1InitOwnershipStdin, Sp1MerkleSubtree, Sp1OwnershipWitness,
 };
 use sp1_programs_common::io::{Sp1InitPublicValues, Sp1InitReserveEntry, Sp1InitStdin};
 use sp1_sdk::blocking::{ProveRequest, Prover as BlockingProver, ProverClient};
@@ -18,7 +19,8 @@ use sp1_sdk::{ProvingKey, SP1ProofWithPublicValues, SP1Stdin};
 
 use crate::proof_mode::{configured_proof_mode, ensure_trusted_vk, ConfiguredProofMode};
 use crate::setup::{
-    default_setup_dir, ensure_protocol_setups, load_init_ownership_vk, load_init_vk,
+    default_setup_dir, ensure_protocol_setup_components, ensure_protocol_setups,
+    load_init_ownership_vk, load_init_vk,
 };
 
 const INIT_ELF: sp1_sdk::Elf = include_elf!("sp1-init-merkle");
@@ -52,11 +54,24 @@ pub fn ensure_sp1_setup(setup_dir: &Path) -> Result<(), String> {
     ensure_protocol_setups(setup_dir, INIT_ELF, INIT_OWNERSHIP_ELF, KZG_INSERT_ELF)
 }
 
+pub fn ensure_sp1_setup_components(
+    setup_dir: &Path,
+    include_init: bool,
+    include_insert: bool,
+) -> Result<(), String> {
+    ensure_protocol_setup_components(
+        setup_dir,
+        include_init.then_some(INIT_ELF),
+        include_init.then_some(INIT_OWNERSHIP_ELF),
+        include_insert.then_some(KZG_INSERT_ELF),
+    )
+}
+
 pub fn prove_init_ownership(
     ownership_stdin: Sp1InitOwnershipStdin,
 ) -> Result<ProvedInitOwnership, String> {
     let ownership_ctx = sp1_ownership_context()?;
-    let ownership_bundle = run_sp1_proof(&ownership_ctx, &ownership_stdin, "init ownership")?;
+    let ownership_bundle = run_sp1_proof(&ownership_ctx, ownership_stdin, "init ownership")?;
     Ok(ProvedInitOwnership {
         proof_hex: serialize_sp1_proof(&ownership_bundle)?,
         vk_hex: serialize_sp1_vk(&ownership_ctx)?,
@@ -67,7 +82,7 @@ pub fn prove_init_ownership(
 
 pub fn prove_init_merkle(merkle_stdin: Sp1InitStdin) -> Result<ProvedInitMerkle, String> {
     let merkle_ctx = sp1_context()?;
-    let merkle_bundle = run_sp1_proof(&merkle_ctx, &merkle_stdin, "init Merkle")?;
+    let merkle_bundle = run_sp1_proof(&merkle_ctx, merkle_stdin, "init Merkle")?;
     Ok(ProvedInitMerkle {
         proof_hex: serialize_sp1_proof(&merkle_bundle)?,
         vk_hex: serialize_sp1_vk(&merkle_ctx)?,
@@ -152,6 +167,7 @@ pub fn build_init_merkle_stdin(
     encoded_addresses: &[Fr],
     balances: &[i128],
     witnesses: &[&InitReserveWitness],
+    chain_batch_proof: Option<&InitChainBatchProofInput>,
 ) -> Result<Sp1InitStdin, String> {
     if addresses.len() != encoded_addresses.len()
         || addresses.len() != balances.len()
@@ -173,6 +189,21 @@ pub fn build_init_merkle_stdin(
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
+    let merkle_prefix_proof = chain_batch_proof.map(|proof| match proof {
+        InitChainBatchProofInput::BinaryMerklePrefixV2 {
+            depth,
+            suffix_subtrees,
+        } => Sp1BinaryMerklePrefixProof {
+            depth: *depth,
+            suffix_subtrees: suffix_subtrees
+                .iter()
+                .map(|(level, root)| Sp1MerkleSubtree {
+                    level: *level,
+                    root: *root,
+                })
+                .collect(),
+        },
+    });
     Ok(Sp1InitStdin {
         chain_id: chain_id.to_string(),
         state_root: state_root.to_string(),
@@ -199,6 +230,7 @@ pub fn build_init_merkle_stdin(
             eval_value_base,
             eval_blind_base,
         ),
+        merkle_prefix_proof,
         reserves,
     })
 }
@@ -244,13 +276,13 @@ pub fn commitment_params_digest(
         .into_iter()
         .map(crate::kzg_insert::point_to_io)
         .collect::<Vec<Sp1G1Affine>>();
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"dynamic-poa-init-commitment-params-v2-salted-shape-hash");
+    let mut hasher = sp1_programs_common::ethereum_eoa::Keccak256Stream::new();
+    hasher.update(b"dynamic-poa-init-commitment-params-keccak-v3");
     for point in &points {
         hasher.update(&point.x_be);
         hasher.update(&point.y_be);
     }
-    hex_encode(hasher.finalize().as_bytes())
+    hex_encode(&hasher.finalize())
 }
 
 pub fn shape_commitment(alpha: Fr, roots: &[Fr], salt: &[u8; 32]) -> [u8; 32] {
@@ -389,11 +421,12 @@ fn sp1_ownership_context() -> Result<Sp1InitContext, String> {
 
 fn run_sp1_proof<T: serde::Serialize>(
     ctx: &Sp1InitContext,
-    stdin_value: &T,
+    stdin_value: T,
     label: &str,
 ) -> Result<SP1ProofWithPublicValues, String> {
     let mut stdin = SP1Stdin::new();
-    stdin.write(stdin_value);
+    stdin.write(&stdin_value);
+    drop(stdin_value);
     let request = ctx.prover.prove(&ctx.pk, stdin);
     let result = match configured_proof_mode()? {
         ConfiguredProofMode::Groth16 => request.groth16().run(),

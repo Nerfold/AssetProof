@@ -47,19 +47,38 @@ if [[ ! -f "$FIXTURE_DIR/preparation-manifest.txt" ]]; then
   echo "Run scripts/initialize_benchmark_data.sh first." >&2
   exit 1
 fi
-if ! grep -Fxq "fixture_version=ethereum-binary-merkle-v1-ecdsa" "$FIXTURE_DIR/preparation-manifest.txt" \
+if ! grep -Fxq "fixture_version=ethereum-keccak-merkle-prefix-v2-ecdsa" "$FIXTURE_DIR/preparation-manifest.txt" \
   || ! grep -Fxq "master.max_n=$MASTER_N" "$FIXTURE_DIR/preparation-manifest.txt"; then
   echo >&2
-  echo "Prepared fixtures do not match binary-Merkle ECDSA fixture / MASTER_N=$MASTER_N." >&2
+  echo "Prepared fixtures do not match Keccak-Merkle prefix fixture / MASTER_N=$MASTER_N." >&2
   echo "Run scripts/initialize_benchmark_data.sh again." >&2
   exit 1
 fi
 
+SETUP_COMPONENTS=""
 case ",$BENCHMARK_OPERATIONS," in
-  *,all,*|*,initialization,*|*,init,*|*,insert,*)
+  *,all,*) SETUP_COMPONENTS="all" ;;
+  *)
+    case ",$BENCHMARK_OPERATIONS," in
+      *,initialization,*|*,init,*) SETUP_COMPONENTS="init" ;;
+    esac
+    case ",$BENCHMARK_OPERATIONS," in
+      *,insert,*)
+        if [[ -n "$SETUP_COMPONENTS" ]]; then
+          SETUP_COMPONENTS="$SETUP_COMPONENTS,insert"
+        else
+          SETUP_COMPONENTS="insert"
+        fi
+        ;;
+    esac
+    ;;
+esac
+
+case "$SETUP_COMPONENTS" in
+  all|init|insert|init,insert)
     echo
-    echo "Preparing protocol SP1 setup (init Merkle + init ownership + KZG insert) outside benchmark timers..."
-    ./poa sp1-setup
+    echo "Preparing protocol SP1 setup components [$SETUP_COMPONENTS] outside benchmark timers..."
+    POA_SP1_SETUP_COMPONENTS="$SETUP_COMPONENTS" ./poa sp1-setup
     ;;
   *)
     echo

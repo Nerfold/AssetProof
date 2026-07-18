@@ -11,6 +11,17 @@ pub struct InitProvingContext {
     pub chain_id: String,
     pub state_root: String,
     pub session_id: String,
+    /// Optional shared state-tree proof used to authenticate the entire
+    /// ordered reserve prefix without repeating one Merkle path per account.
+    pub chain_batch_proof: Option<InitChainBatchProofInput>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InitChainBatchProofInput {
+    BinaryMerklePrefixV2 {
+        depth: usize,
+        suffix_subtrees: Vec<(u32, [u8; 32])>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

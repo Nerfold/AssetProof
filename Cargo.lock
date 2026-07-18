@@ -2927,6 +2927,7 @@ dependencies = [
  "common",
  "k256",
  "nizk-fixed-set",
+ "rayon",
  "sha3",
  "sp1-programs-common",
 ]
@@ -4509,7 +4510,6 @@ dependencies = [
  "ark-ec",
  "ark-ff",
  "bincode",
- "blake3",
  "common",
  "serde",
  "smt",
@@ -4571,9 +4571,9 @@ dependencies = [
 name = "sp1-init-merkle"
 version = "0.1.0"
 dependencies = [
- "blake3",
  "num",
  "sp1-curves",
+ "sp1-lib",
  "sp1-programs-common",
  "sp1-zkvm",
 ]
@@ -4607,9 +4607,9 @@ dependencies = [
 name = "sp1-kzg-insert"
 version = "0.1.0"
 dependencies = [
- "blake3",
  "num",
  "sp1-curves",
+ "sp1-lib",
  "sp1-programs-common",
  "sp1-zkvm",
 ]
@@ -4654,7 +4654,6 @@ dependencies = [
 name = "sp1-programs-common"
 version = "0.1.0"
 dependencies = [
- "blake3",
  "k256",
  "serde",
  "sha3",

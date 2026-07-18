@@ -147,6 +147,100 @@ pub fn keccak256(input: &[u8]) -> [u8; 32] {
     }
 }
 
+/// Incremental Keccak-256 with the same SP1 permutation syscall as
+/// [`keccak256`].  Large protocol vectors can therefore be committed without
+/// first allocating one contiguous encoded buffer and without executing a
+/// software hash inside the zkVM.
+#[cfg(target_os = "zkvm")]
+pub struct Keccak256Stream {
+    state: [u64; 25],
+    buffer: [u8; 136],
+    buffer_len: usize,
+}
+
+#[cfg(not(target_os = "zkvm"))]
+pub struct Keccak256Stream(sha3::Keccak256);
+
+impl Keccak256Stream {
+    pub fn new() -> Self {
+        #[cfg(target_os = "zkvm")]
+        {
+            Self {
+                state: [0u64; 25],
+                buffer: [0u8; 136],
+                buffer_len: 0,
+            }
+        }
+        #[cfg(not(target_os = "zkvm"))]
+        {
+            use sha3::Digest;
+            Self(sha3::Keccak256::new())
+        }
+    }
+
+    #[allow(unused_mut)]
+    pub fn update(&mut self, mut input: &[u8]) {
+        #[cfg(target_os = "zkvm")]
+        {
+            const RATE: usize = 136;
+            while !input.is_empty() {
+                let count = core::cmp::min(RATE - self.buffer_len, input.len());
+                self.buffer[self.buffer_len..self.buffer_len + count]
+                    .copy_from_slice(&input[..count]);
+                self.buffer_len += count;
+                input = &input[count..];
+                if self.buffer_len == RATE {
+                    absorb_keccak_block(&mut self.state, &self.buffer);
+                    self.buffer.fill(0);
+                    self.buffer_len = 0;
+                }
+            }
+        }
+        #[cfg(not(target_os = "zkvm"))]
+        {
+            use sha3::Digest;
+            self.0.update(input);
+        }
+    }
+
+    #[allow(unused_mut)]
+    pub fn finalize(mut self) -> [u8; 32] {
+        #[cfg(target_os = "zkvm")]
+        {
+            const RATE: usize = 136;
+            self.buffer[self.buffer_len] ^= 0x01;
+            self.buffer[RATE - 1] ^= 0x80;
+            absorb_keccak_block(&mut self.state, &self.buffer);
+            let mut digest = [0u8; 32];
+            for (index, lane) in self.state[..4].iter().enumerate() {
+                digest[index * 8..(index + 1) * 8].copy_from_slice(&lane.to_le_bytes());
+            }
+            digest
+        }
+        #[cfg(not(target_os = "zkvm"))]
+        {
+            use sha3::Digest;
+            self.0.finalize().into()
+        }
+    }
+}
+
+impl Default for Keccak256Stream {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(target_os = "zkvm")]
+fn absorb_keccak_block(state: &mut [u64; 25], block: &[u8; 136]) {
+    for (index, byte) in block.iter().enumerate() {
+        state[index / 8] ^= (*byte as u64) << ((index % 8) * 8);
+    }
+    unsafe {
+        sp1_lib::syscall_keccak_permute(state);
+    }
+}
+
 #[cfg(target_os = "zkvm")]
 fn keccak256_sp1(input: &[u8]) -> [u8; 32] {
     const RATE: usize = 136;
@@ -201,11 +295,26 @@ fn hex_nibble(value: u8) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use super::{ownership_digest, verify_ownership_signature, OwnershipOperation};
+    use super::{
+        keccak256, ownership_digest, verify_ownership_signature, Keccak256Stream,
+        OwnershipOperation,
+    };
     use k256::ecdsa::SigningKey;
 
     const ADDRESS: &str = "0x7e5f4552091a69125d5dfcb7b8c2659029395bdf";
     const STATE_ROOT: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+
+    #[test]
+    fn streaming_keccak_matches_one_shot_across_rate_boundaries() {
+        let input = (0..600).map(|index| index as u8).collect::<Vec<_>>();
+        for chunks in [1usize, 17, 135, 136, 137, 271] {
+            let mut stream = Keccak256Stream::new();
+            for chunk in input.chunks(chunks) {
+                stream.update(chunk);
+            }
+            assert_eq!(stream.finalize(), keccak256(&input));
+        }
+    }
 
     #[test]
     fn recovers_ethereum_owner_and_binds_context() {

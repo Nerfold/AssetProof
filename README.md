@@ -216,8 +216,8 @@ initialization 和 KZG insert 生成 SP1 setup：
 本次 CRS 升级与旧的 `hash_to_scalar * G` 基点不兼容。旧 state 中的 balance
 commitment、旧 initialization/update/insert proof 都必须从 initialization 开始重新生成；
 不能在旧 state 上继续 update。Merkle 分支的初始化 scheme 为
-`kzg-nizk-init-v7-zkopen-salted-shape-hash-binary-merkle-split`，insert scheme 为
-`kzg-nizk-insert-v7-salted-quotient-hash-binary-merkle-bound`。修改过 SP1 guest 后也必须重新运行 `./poa sp1-setup`；
+`kzg-nizk-init-v8-zkopen-keccak-merkle-prefix-split`，insert scheme 为
+`kzg-nizk-insert-v8-salted-quotient-hash-keccak-merkle-bound`。修改过 SP1 guest 后也必须重新运行 `./poa sp1-setup`；
 loader 会比较 artifact 中记录的 ELF digest，旧 artifact 会 fail-closed 并提示重新 setup。
 本轮只修改代码、未重新生成 SP1 artifact，因此首次运行前必须执行一次该命令。
 
@@ -239,10 +239,10 @@ powers-of-tau 后仍必须重新生成依赖它的 state 和 proof。
 把 evaluation 和 Pedersen blinding 直接写入 proof。
 
 论文中的 initialization `C_shape` 是一个长度随最大集合规模增长的向量 Pedersen
-commitment。当前 SP1 后端改用 domain-separated salted BLAKE3 commitment：prover
+commitment。当前 SP1 后端改用 domain-separated salted Keccak commitment：prover
 先以 32-byte 私有随机 salt 提交 `(alpha, n, ordered address roots)`，再把 32-byte
 摘要放入 Fiat–Shamir transcript 派生 `zeta`；SP1 guest 使用私有 salt 和地址 witness
-重算摘要并检查相等。它保留 commit-before-challenge 的绑定关系（依赖 BLAKE3 的碰撞
+重算摘要并检查相等。它保留 commit-before-challenge 的绑定关系（依赖 Keccak 的碰撞
 抗性，隐藏性依赖私有高熵 salt），同时避免在 SP1 内进行约 `n` 次 BLS12-381
 variable-base multiplication，也不再需要 initialization shape 的百万级 Pedersen 基点。
 余额 commitment、evaluation commitment 和 KZG ZKOpen 不受此替换影响，仍分别
@@ -414,15 +414,18 @@ SP1 外一次性生成 `10^6+1` 个确定性的有效 secp256k1 私钥、未压�
 派生的 Ethereum 地址、ECDSA ownership signatures、随机化余额，以及一棵覆盖全部
 账户的固定高度二叉 Merkle tree。各规模使用同一 canonical account store 的前 `n` 个账户；
 最后一个账户只存在于同一个 Ethereum state 中，供所有 insert benchmark 使用。SP1
-内使用 secp256k1 预编译恢复签名公钥、用 Keccak 预编译派生并核对地址；另一个 guest
-使用域分离的 BLAKE3 leaf/node hash 验证 Merkle path，不再使用
+内使用 patched `k256`/secp256k1 预编译恢复签名公钥、用 Keccak permutation syscall
+派生并核对地址；另一个 guest 使用同一 Keccak syscall 验证域分离的 leaf/node hash，不再使用
 `mock-private-key:<address>` / `mock-balance-proof:<address>` 标签。fixture 生成、磁盘
 加载不计入 prover/verifier time。Initialization 的 ownership guest 与 Merkle/polynomial
 guest 分别产生 SP1 proof；两者公开相同的 chain/session、reserve count 和有序
 `(address,balance)` commitment，宿主和 verifier 只在这些字段完全相同时合并接受。
 
-每个账户保存一条固定深度 Merkle path。不同 `n` 复用同一棵主树、同一个 state root 和
-相同高度，只持久化相应账户前缀的路径集合。Insert 使用同一 root 下候选账户的单条路径。
+Initialization 不再为每个账户保存一条固定深度路径。不同 `n` 复用同一棵主树、同一个
+state root 和相同高度，只持久化一个由后缀子树 frontier 组成的 shared-prefix proof；
+guest 对前 `n` 个叶子做一次流式栈归并，工作量从 `O(n log N)` 降为 `O(n + log N)`，
+且不再把约 `n log N` 个 sibling hash 写入 stdin。Insert 仍使用同一 root 下候选账户的
+一条完整路径。
 准备阶段在主树上应用随机 delta、记录真实的新 root 后恢复原叶子；
 Sync/finality 证明仍按论文中的独立抽象处理，不计入 debug update verifier。
 
@@ -438,7 +441,7 @@ MPT/Verkle 共识状态树；它用于隔离协议主体与 SP1 哈希路径性�
 默认会准备以下矩阵：
 
 - `n = 10^4, 10^5, 10^6`：共享一份 `10^6+1` 账户文件、一棵固定高度主 Merkle tree、
-  同一个 state root 和 insert proof；每个 `n` 持久化账户前缀的 Merkle paths；
+  同一个 state root 和 insert proof；每个 `n` 只持久化一个紧凑 shared-prefix proof；
 - `m = 10^2, 10^3`：每个 `n` 先确定性生成最大 `10^3` 个互不重复的随机更新，
   `10^2` 是同一更新序列的前缀；两种规模分别持久化 canonical delta list 及其重建后
   的新 Merkle root；
@@ -456,7 +459,7 @@ MPT/Verkle 共识状态树；它用于隔离协议主体与 SP1 哈希路径性�
 ```text
 data/mock/bench/generated/
   preparation-manifest.txt
-  master_n_1000000/ethereum-binary-merkle-v1-ecdsa/
+  master_n_1000000/ethereum-keccak-merkle-prefix-v2-ecdsa/
     accounts.bin
     master-manifest.txt
     insert-merkle-proof.bin
@@ -483,7 +486,8 @@ BENCHMARK_OPERATIONS=update SAMPLES=3 WARMUP=1 \
   ./scripts/benchmark_protocol.sh
 ```
 
-update-only 模式会跳过 `poa sp1-setup`。初始化后状态的加载和一致性校验记录在
+update-only 模式会跳过 `poa sp1-setup`；initialization-only 只准备两个 initialization
+guest，insert-only 只准备 insert guest。初始化后状态的加载和一致性校验记录在
 `loading.csv`，不计入 update prover/verifier time；MultiZKOpen、BP/IPA、range proof 和
 update verifier 仍完整运行。
 
@@ -500,8 +504,10 @@ KZG ceremony、subgroup 和 power-sequence 检查属于 `setup/import-srs` 参�
 `.meta` 文件中的 BLAKE3 digest 绑定认证后的完整 SRS artifact。proof verifier 不重新
 审计 SRS，也不会扫描百万个 powers；benchmark 的 verifier time 只包含当前 proof 的验证。
 
-初始化脚本只构建一次最大规模主树并持久化账户、Merkle paths、delta roots 和初始化后
-多项式状态；initialization/insert 的 SP1 guest 在证明过程中验证对应的 Merkle path。
+初始化脚本只构建一次最大规模主树并持久化账户、初始化 shared-prefix proof、insert
+单路径、delta roots 和初始化后多项式状态；initialization/insert 的 SP1 guest 在证明
+过程中验证各自的证明。普通 benchmark 加载不会把百万份私钥、公钥长期保留在内存；
+这些字段仍在账户文件中，只有 full fixture validation 才临时读取并校验。
 百万规模准备过程本身可能消耗大量内存、磁盘和
 时间，但这些时间不会进入 protocol prover/verifier 统计。SRS 会按两个阶段显示进度，
 默认使用全部逻辑 CPU；可用 `SRS_THREADS=8 ./scripts/initialize_benchmark_data.sh` 限制

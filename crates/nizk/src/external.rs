@@ -11,6 +11,18 @@ pub trait ExternalProofAdapter {
         witness: &InitReserveWitness,
     ) -> Result<PreparedInitReserveWitness, String>;
 
+    fn validate_init_witness(
+        &self,
+        ctx: &InitProvingContext,
+        witness: &InitReserveWitness,
+    ) -> Result<(), String> {
+        let prepared = self.prepare_init_witness(ctx, witness)?;
+        if prepared.address != witness.address || prepared.balance != witness.balance {
+            return Err("external adapter changed the reserve address or balance".to_string());
+        }
+        Ok(())
+    }
+
     fn verify_insert_ownership(
         &self,
         state_root: &str,
@@ -223,6 +235,17 @@ impl ExternalProofAdapter for Sp1NativeProofAdapter {
         })
     }
 
+    fn validate_init_witness(
+        &self,
+        _ctx: &InitProvingContext,
+        witness: &InitReserveWitness,
+    ) -> Result<(), String> {
+        // The native ownership and chain witnesses are consumed and bound by
+        // the two SP1 proofs themselves. Avoid building two unused host-side
+        // digest strings per account in the initialization hot path.
+        validate_sp1_native_init_types(witness)
+    }
+
     fn verify_insert_ownership(
         &self,
         state_root: &str,
@@ -280,6 +303,23 @@ impl ExternalProofAdapter for Sp1NativeProofAdapter {
     ) -> Result<(), String> {
         Err("SP1-native witness adapter cannot verify Sync transitions".to_string())
     }
+}
+
+fn validate_sp1_native_init_types(witness: &InitReserveWitness) -> Result<(), String> {
+    match &witness.ownership {
+        OwnershipWitnessInput::EthereumEoaSignatureHex { .. }
+        | OwnershipWitnessInput::MockPrivateKey { .. } => {}
+        OwnershipWitnessInput::ExternalOwnershipProof { .. } => {
+            return Err("unsupported external ownership witness".to_string())
+        }
+    }
+    if matches!(
+        &witness.chain_balance_proof,
+        ChainBalanceProofInput::GenericMerkleProof { .. }
+    ) {
+        return Err("unsupported generic chain balance proof".to_string());
+    }
+    Ok(())
 }
 
 fn prepare_ownership(

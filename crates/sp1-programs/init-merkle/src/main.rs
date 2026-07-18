@@ -4,12 +4,14 @@ extern crate alloc;
 
 use num::BigUint;
 use sp1_curves::params::FieldParameters;
-use sp1_curves::weierstrass::bls12_381::{Bls12381, Bls12381BaseField};
-use sp1_curves::AffinePoint;
+use sp1_curves::weierstrass::bls12_381::Bls12381BaseField;
+use sp1_lib::bls12381::Bls12381Point;
+use sp1_lib::utils::AffinePoint as Sp1AffinePoint;
 use sp1_programs_common::bls12_381_scalar::{
     from_le_bytes as scalar_from_le_bytes, mul_mod, sub_mod, to_le_bytes as scalar_to_le_bytes,
     Scalar,
 };
+use sp1_programs_common::ethereum_binary_merkle::{leaf_hash, node_hash};
 use sp1_programs_common::io::{
     init_reserve_commitment, init_shape_commitment, Hash, Sp1ChainBalanceProof, Sp1G1Affine,
     Sp1InitPublicValues, Sp1InitReserveEntry, Sp1InitStdin,
@@ -40,9 +42,20 @@ fn verify_init(input: Sp1InitStdin) -> Sp1InitPublicValues {
     let zeta = scalar_from_le_bytes(input.zeta_le);
     let claimed_product = scalar_from_le_bytes(input.product_zeta_le);
     let mut previous_x = None;
+    let mut uses_mock_inputs = false;
+    let expected_root = decode_hash(&input.state_root);
+    if let Some(prefix_proof) = input.merkle_prefix_proof.as_ref() {
+        verify_merkle_prefix(&expected_root, &input.reserves, prefix_proof);
+    }
     for reserve in &input.reserves {
         assert!(reserve.balance >= 0, "negative reserve balance");
-        verify_chain_balance(&input.chain_id, &input.state_root, reserve);
+        uses_mock_inputs |= matches!(
+            &reserve.chain_balance_proof,
+            Sp1ChainBalanceProof::MockBinding { .. }
+        );
+        if input.merkle_prefix_proof.is_none() {
+            verify_chain_balance(&input.chain_id, &expected_root, reserve);
+        }
         let x = scalar_from_le_bytes(reserve.encoded_address_le);
         assert_eq!(
             reserve.encoded_address_le,
@@ -72,13 +85,6 @@ fn verify_init(input: Sp1InitStdin) -> Sp1InitPublicValues {
         "p(zeta) and product(zeta) mismatch"
     );
     verify_private_commitment_openings(&input);
-
-    let uses_mock_inputs = input.reserves.iter().any(|reserve| {
-        matches!(
-            &reserve.chain_balance_proof,
-            Sp1ChainBalanceProof::MockBinding { .. }
-        )
-    });
 
     Sp1InitPublicValues {
         chain_id: input.chain_id,
@@ -157,7 +163,7 @@ fn commit_many(
     scalars: &[BigUint],
     blind_base: &Sp1G1Affine,
     blind: &BigUint,
-) -> AffinePoint<Bls12381> {
+) -> Bls12381Point {
     assert_eq!(bases.len(), scalars.len(), "commitment arity mismatch");
     let mut terms = bases
         .iter()
@@ -165,69 +171,69 @@ fn commit_many(
         .filter(|(_, scalar)| !is_zero(scalar))
         .map(|(base, scalar)| {
             let base = point_from_io(base);
-            assert_on_curve(&base);
             scalar_mul_safe(&base, scalar)
         })
         .collect::<Vec<_>>();
     if !is_zero(blind) {
         let base = point_from_io(blind_base);
-        assert_on_curve(&base);
         terms.push(scalar_mul_safe(&base, blind));
     }
     let mut terms = terms.into_iter();
     let mut result = terms.next().expect("commitment cannot be identity");
     for term in terms {
-        result = add_safe(&result, &term);
+        result.complete_add_assign(&term);
     }
     result
 }
 
-fn scalar_mul_safe(base: &AffinePoint<Bls12381>, scalar: &BigUint) -> AffinePoint<Bls12381> {
-    let mut result = None;
-    let mut power = base.clone();
-    for byte in scalar.to_bytes_le() {
-        for bit in 0..8 {
-            if byte & (1 << bit) != 0 {
-                result = Some(match result {
-                    Some(current) => add_safe(&current, &power),
-                    None => power.clone(),
-                });
-            }
-            power = power.sw_double();
-        }
-    }
-    result.expect("non-zero commitment scalar")
+fn scalar_mul_safe(base: &Bls12381Point, scalar: &BigUint) -> Bls12381Point {
+    assert!(!is_zero(scalar), "zero commitment scalar");
+    let digits = scalar.to_u64_digits();
+    assert!(digits.len() <= 6, "BLS12-381 scalar is too large");
+    let mut words = [0u64; 6];
+    words[..digits.len()].copy_from_slice(&digits);
+    let mut result = *base;
+    result.mul_assign(&words);
+    assert!(
+        !result.is_identity(),
+        "commitment scalar multiplication produced identity"
+    );
+    result
 }
 
-fn add_safe(left: &AffinePoint<Bls12381>, right: &AffinePoint<Bls12381>) -> AffinePoint<Bls12381> {
-    if left == right {
-        left.sw_double()
-    } else {
-        assert!(left.x != right.x, "commitment addition produced identity");
-        left + right
-    }
-}
-
-fn point_from_io(value: &Sp1G1Affine) -> AffinePoint<Bls12381> {
+fn point_from_io(value: &Sp1G1Affine) -> Bls12381Point {
     assert!(value.x_be.len() <= 48 && value.y_be.len() <= 48);
-    AffinePoint::new(
-        BigUint::from_bytes_be(&value.x_be),
-        BigUint::from_bytes_be(&value.y_be),
-    )
+    let x = BigUint::from_bytes_be(&value.x_be);
+    let y = BigUint::from_bytes_be(&value.y_be);
+    assert_on_curve(&x, &y);
+    let mut x_le = fixed_be(&x, 48);
+    let mut y_le = fixed_be(&y, 48);
+    x_le.reverse();
+    y_le.reverse();
+    <Bls12381Point as Sp1AffinePoint<12>>::from(&x_le, &y_le)
 }
 
-fn point_to_io(value: &AffinePoint<Bls12381>) -> Sp1G1Affine {
-    Sp1G1Affine {
-        x_be: fixed_be(&value.x, 48),
-        y_be: fixed_be(&value.y, 48),
-    }
+fn point_to_io(value: &Bls12381Point) -> Sp1G1Affine {
+    assert!(!value.is_identity(), "cannot encode identity commitment");
+    let limbs = value.limbs_ref();
+    let mut x_be = limbs[..6]
+        .iter()
+        .flat_map(|word| word.to_le_bytes())
+        .collect::<Vec<_>>();
+    let mut y_be = limbs[6..]
+        .iter()
+        .flat_map(|word| word.to_le_bytes())
+        .collect::<Vec<_>>();
+    x_be.reverse();
+    y_be.reverse();
+    Sp1G1Affine { x_be, y_be }
 }
 
-fn assert_on_curve(point: &AffinePoint<Bls12381>) {
+fn assert_on_curve(x: &BigUint, y: &BigUint) {
     let modulus = Bls12381BaseField::modulus();
-    assert!(point.x < modulus && point.y < modulus);
-    let lhs = (&point.y * &point.y) % &modulus;
-    let rhs = ((&point.x * &point.x % &modulus) * &point.x + BigUint::from(4u32)) % &modulus;
+    assert!(x < &modulus && y < &modulus);
+    let lhs = (y * y) % &modulus;
+    let rhs = ((x * x % &modulus) * x + BigUint::from(4u32)) % &modulus;
     assert_eq!(lhs, rhs, "point is not on BLS12-381 G1");
 }
 
@@ -249,13 +255,13 @@ fn commitment_params_digest(
     eval_value: &Sp1G1Affine,
     eval_blind: &Sp1G1Affine,
 ) -> alloc::string::String {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"dynamic-poa-init-commitment-params-v2-salted-shape-hash");
+    let mut hasher = sp1_programs_common::ethereum_eoa::Keccak256Stream::new();
+    hasher.update(b"dynamic-poa-init-commitment-params-keccak-v3");
     for point in [balance_value, balance_blind, eval_value, eval_blind] {
         hasher.update(&point.x_be);
         hasher.update(&point.y_be);
     }
-    hex_hash(hasher.finalize().as_bytes())
+    hex_hash(&hasher.finalize())
 }
 
 fn hex_hash(bytes: &[u8]) -> alloc::string::String {
@@ -291,7 +297,7 @@ fn decode_address(address: &str) -> [u8; 20] {
     out
 }
 
-fn verify_chain_balance(chain_id: &str, state_root: &str, reserve: &Sp1InitReserveEntry) {
+fn verify_chain_balance(chain_id: &str, expected_root: &Hash, reserve: &Sp1InitReserveEntry) {
     match &reserve.chain_balance_proof {
         Sp1ChainBalanceProof::MockBinding { proof_label } => {
             assert_eq!(
@@ -308,25 +314,27 @@ fn verify_chain_balance(chain_id: &str, state_root: &str, reserve: &Sp1InitReser
             leaf_index,
             siblings,
         } => {
-            let expected_root = decode_hash(state_root);
-            let mut current = chain_leaf_hash(&reserve.address, reserve.balance);
+            let address = decode_address(&reserve.address);
+            let mut current = leaf_hash(&address, reserve.balance);
             let mut index = *leaf_index;
             for (level, sibling) in siblings.iter().enumerate() {
                 current = if index & 1 == 0 {
-                    chain_node_hash(level, &current, sibling)
+                    node_hash(level, &current, sibling)
                 } else {
-                    chain_node_hash(level, sibling, &current)
+                    node_hash(level, sibling, &current)
                 };
                 index >>= 1;
             }
             assert_eq!(index, 0, "Merkle leaf index exceeds proof depth");
-            assert_eq!(current, expected_root, "native chain Merkle proof mismatch");
+            assert_eq!(
+                &current, expected_root,
+                "native chain Merkle proof mismatch"
+            );
         }
         Sp1ChainBalanceProof::EthereumAccountProof { nodes } => {
-            let root = decode_hash(state_root);
             let address = decode_address(&reserve.address);
             sp1_programs_common::ethereum_mpt::verify_account_balance(
-                &root,
+                expected_root,
                 &address,
                 reserve.balance,
                 nodes,
@@ -345,22 +353,95 @@ fn verify_chain_balance(chain_id: &str, state_root: &str, reserve: &Sp1InitReser
     }
 }
 
-fn chain_leaf_hash(address: &str, balance: i128) -> Hash {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"dpoa-chain-leaf-v1");
-    hasher.update(&(address.len() as u64).to_le_bytes());
-    hasher.update(address.as_bytes());
-    hasher.update(&balance.to_le_bytes());
-    *hasher.finalize().as_bytes()
+fn verify_merkle_prefix(
+    expected_root: &Hash,
+    reserves: &[Sp1InitReserveEntry],
+    proof: &sp1_programs_common::io::Sp1BinaryMerklePrefixProof,
+) {
+    assert!(
+        proof.depth < usize::BITS as usize,
+        "Merkle depth is too large"
+    );
+    let capacity = 1usize << proof.depth;
+    assert!(
+        reserves.len() <= capacity,
+        "reserve prefix exceeds Merkle capacity"
+    );
+    assert!(
+        proof.suffix_subtrees.len() <= proof.depth + 1,
+        "Merkle prefix contains too many suffix subtrees"
+    );
+    let mut stack = vec![None; proof.depth + 1];
+    let mut cursor = 0usize;
+    for (expected_index, reserve) in reserves.iter().enumerate() {
+        let Sp1ChainBalanceProof::BinaryMerkleV1 {
+            leaf_index,
+            siblings,
+        } = &reserve.chain_balance_proof
+        else {
+            panic!("shared Merkle prefix proof requires binary Merkle members")
+        };
+        assert_eq!(
+            *leaf_index as usize, expected_index,
+            "non-canonical Merkle prefix index"
+        );
+        assert!(
+            siblings.is_empty(),
+            "prefix member repeated an individual Merkle path"
+        );
+        let address = decode_address(&reserve.address);
+        append_subtree(
+            &mut stack,
+            &mut cursor,
+            0,
+            leaf_hash(&address, reserve.balance),
+        );
+    }
+    for subtree in &proof.suffix_subtrees {
+        append_subtree(
+            &mut stack,
+            &mut cursor,
+            subtree.level as usize,
+            subtree.root,
+        );
+    }
+    assert_eq!(
+        cursor, capacity,
+        "Merkle prefix proof did not cover the tree"
+    );
+    assert!(
+        stack[..proof.depth].iter().all(Option::is_none),
+        "Merkle prefix proof left an incomplete frontier"
+    );
+    assert_eq!(
+        stack[proof.depth].expect("missing reconstructed Merkle root"),
+        *expected_root,
+        "native chain Merkle prefix proof mismatch"
+    );
 }
 
-fn chain_node_hash(level: usize, left: &Hash, right: &Hash) -> Hash {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"dpoa-chain-node-v1");
-    hasher.update(&(level as u64).to_le_bytes());
-    hasher.update(left);
-    hasher.update(right);
-    *hasher.finalize().as_bytes()
+fn append_subtree(
+    stack: &mut [Option<Hash>],
+    cursor: &mut usize,
+    mut level: usize,
+    mut current: Hash,
+) {
+    assert!(
+        level < stack.len(),
+        "Merkle subtree level exceeds tree depth"
+    );
+    let width = 1usize << level;
+    assert_eq!(*cursor % width, 0, "unaligned Merkle suffix subtree");
+    *cursor = cursor.checked_add(width).expect("Merkle cursor overflow");
+    loop {
+        let Some(left) = stack[level].take() else {
+            stack[level] = Some(current);
+            return;
+        };
+        current = node_hash(level, &left, &current);
+        level += 1;
+        assert!(level < stack.len(), "Merkle prefix exceeded declared depth");
+    }
 }
 
 fn decode_hash(value: &str) -> Hash {

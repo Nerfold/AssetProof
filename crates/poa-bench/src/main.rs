@@ -8,8 +8,7 @@ use std::time::{Duration, Instant};
 use common::crypto::scalar_to_hex;
 use common::io::{encode_proof_binary, read_srs, read_state, write_init, write_srs, write_state};
 use common::types::{
-    Delta, InitProvingContext, InitReserveWitness, ReserveEntry, StoredInitProof, StoredProof,
-    StoredState,
+    Delta, InitProvingContext, InitReserveWitness, StoredInitProof, StoredProof, StoredState,
 };
 use nizk_fixed_set::external::Sp1NativeProofAdapter;
 use nizk_fixed_set::init_proof::{
@@ -27,7 +26,7 @@ use nizk_fixed_set::verifier::{
 
 mod ethereum_fixture;
 
-const FIXTURE_VERSION: &str = "ethereum-binary-merkle-v1-ecdsa";
+const FIXTURE_VERSION: &str = "ethereum-keccak-merkle-prefix-v2-ecdsa";
 
 fn main() {
     if let Err(err) = run() {
@@ -159,61 +158,66 @@ fn run() -> Result<(), String> {
 
         let reserve_path = ethereum_fixture::init_proof_path(&master_dir, n);
         let initialized_state_path = mock_initialized_state_path(&master_dir, n);
+        let runs_initialization = includes_operation(&config, BenchmarkOperation::Initialization);
+        let runs_insert = includes_operation(&config, BenchmarkOperation::Insert);
         if config.require_existing {
-            require_existing(&reserve_path, "Ethereum Merkle initialization fixture")?;
-            require_existing(
-                &ethereum_fixture::master_accounts_path(&master_dir),
-                "master Ethereum account store",
-            )?;
-            if includes_operation(&config, BenchmarkOperation::Insert) {
+            if runs_initialization {
+                require_existing(&reserve_path, "Ethereum Merkle initialization fixture")?;
+            }
+            if runs_initialization || runs_insert {
+                require_existing(
+                    &ethereum_fixture::master_accounts_path(&master_dir),
+                    "master Ethereum account store",
+                )?;
+            }
+            if runs_insert {
                 require_existing(
                     &ethereum_fixture::insert_proof_path(&master_dir),
                     "master Ethereum insertion proof",
                 )?;
             }
-            if !includes_operation(&config, BenchmarkOperation::Initialization) {
+            if !runs_initialization {
                 require_existing(&initialized_state_path, "mock initialized polynomial state")?;
             }
         }
-        let reserve_load_start = Instant::now();
-        let fixture = ethereum_fixture::load_init_fixture(
-            &master_dir,
-            config.master_n,
-            n,
-            ethereum_fixture::FixtureValidation::None,
-        )?;
-        let reserve_load = reserve_load_start.elapsed();
-        loads.push(LoadRecord {
-            n,
-            m: 0,
-            phase: "ethereum_state_fixture_generation",
-            elapsed: Duration::ZERO,
-            bytes: ethereum_fixture::fixture_persisted_bytes(&master_dir, n)?,
-            reused: true,
-        });
-        if fixture.witnesses.len() != n {
-            return Err(format!(
-                "fixture {} contains {} witnesses, expected {n}",
-                reserve_path.display(),
-                fixture.witnesses.len()
-            ));
-        }
-        loads.push(LoadRecord {
-            n,
-            m: 0,
-            phase: "ethereum_state_fixture_load",
-            elapsed: reserve_load,
-            bytes: ethereum_fixture::fixture_persisted_bytes(&master_dir, n)?,
-            reused: true,
-        });
+        let (fixture, reserve_load) = if runs_initialization {
+            let reserve_load_start = Instant::now();
+            let fixture = ethereum_fixture::load_init_fixture(
+                &master_dir,
+                config.master_n,
+                n,
+                ethereum_fixture::FixtureValidation::None,
+            )?;
+            let reserve_load = reserve_load_start.elapsed();
+            let fixture_bytes = ethereum_fixture::fixture_persisted_bytes(&master_dir, n)?;
+            if fixture.witnesses.len() != n {
+                return Err(format!(
+                    "fixture {} contains {} witnesses, expected {n}",
+                    reserve_path.display(),
+                    fixture.witnesses.len()
+                ));
+            }
+            loads.push(LoadRecord {
+                n,
+                m: 0,
+                phase: "ethereum_state_fixture_load",
+                elapsed: reserve_load,
+                bytes: fixture_bytes,
+                reused: true,
+            });
+            (Some(fixture), reserve_load)
+        } else {
+            (None, Duration::ZERO)
+        };
 
-        let base_state = if includes_operation(&config, BenchmarkOperation::Initialization) {
+        let base_state = if let Some(fixture) = fixture.as_ref() {
             let (state, init_summary) = benchmark_init(
                 &config,
                 n,
                 &srs,
                 &fixture.state_root,
                 &fixture.witnesses,
+                &fixture.merkle_prefix_proof,
                 reserve_load,
                 srs_load,
                 &mut samples,
@@ -240,15 +244,52 @@ fn run() -> Result<(), String> {
             );
             state
         };
-        ensure_initialized_state_matches_fixture(&base_state, &fixture)?;
+        if let Some(fixture) = fixture.as_ref() {
+            ensure_initialized_state_matches_fixture(&base_state, fixture)?;
+        } else if base_state.reserve_addresses.len() != n || base_state.reserve_balances.len() != n
+        {
+            return Err("persisted initialized state does not match requested n".to_string());
+        }
 
-        if includes_operation(&config, BenchmarkOperation::Insert) {
+        // The initialization witness contains n signatures and proof tags.
+        // Retain at most the one small insert witness before running later
+        // operations so update/insert peak memory does not include it.
+        let insert_from_init = runs_insert
+            .then(|| fixture.as_ref().map(|value| value.insert.clone()))
+            .flatten();
+        drop(fixture);
+
+        if runs_insert {
+            let insert_fixture = if let Some(insert) = insert_from_init {
+                insert
+            } else {
+                let insert_load_start = Instant::now();
+                let (state_root, insert) = ethereum_fixture::load_insert_fixture(
+                    &master_dir,
+                    config.master_n,
+                    ethereum_fixture::FixtureValidation::None,
+                )?;
+                if state_root != base_state.state_root {
+                    return Err(
+                        "insert fixture state root does not match initialized state".to_string()
+                    );
+                }
+                loads.push(LoadRecord {
+                    n,
+                    m: 0,
+                    phase: "ethereum_insert_fixture_load",
+                    elapsed: insert_load_start.elapsed(),
+                    bytes: file_len(&ethereum_fixture::insert_proof_path(&master_dir))?,
+                    reused: true,
+                });
+                insert
+            };
             let insert_summary = benchmark_insert(
                 &config,
                 n,
                 &srs,
                 &base_state,
-                &fixture.insert,
+                &insert_fixture,
                 srs_load,
                 &mut samples,
             )?;
@@ -265,7 +306,12 @@ fn run() -> Result<(), String> {
                     require_existing(&delta_path, "Ethereum Merkle transition fixture")?;
                 }
                 let (deltas, new_state_root, fixture_time, delta_load, fixture_reused) =
-                    ethereum_fixture::ensure_delta_fixture(&delta_path, &fixture, m)?;
+                    ethereum_fixture::ensure_delta_fixture(
+                        &delta_path,
+                        &base_state.state_root,
+                        n,
+                        m,
+                    )?;
                 loads.push(LoadRecord {
                     n,
                     m,
@@ -383,12 +429,8 @@ fn prepare_benchmark_inputs(config: &Config) -> Result<(), String> {
 
         let init_path = ethereum_fixture::init_proof_path(&master_dir, n);
         let load_start = Instant::now();
-        let fixture = ethereum_fixture::load_init_fixture(
-            &master_dir,
-            config.master_n,
-            n,
-            ethereum_fixture::FixtureValidation::None,
-        )?;
+        let (state_root, entries) =
+            ethereum_fixture::load_reserve_entries(&master_dir, config.master_n, n)?;
         let load = load_start.elapsed();
         println!(
             "   init: generation={} validation={} bytes={} reused=true",
@@ -396,7 +438,7 @@ fn prepare_benchmark_inputs(config: &Config) -> Result<(), String> {
             human_duration(load),
             human_bytes(ethereum_fixture::fixture_persisted_bytes(&master_dir, n)? as usize),
         );
-        manifest.push(format!("n.{n}.state_root={}", fixture.state_root));
+        manifest.push(format!("n.{n}.state_root={state_root}"));
         manifest.push(format!("n.{n}.init_path={}", init_path.display()));
         manifest.push(format!(
             "n.{n}.input_bytes={}",
@@ -419,19 +461,19 @@ fn prepare_benchmark_inputs(config: &Config) -> Result<(), String> {
             verify_mock_initialized_state(&srs, &state)?;
             state
         } else {
-            let entries = fixture
-                .witnesses
-                .iter()
-                .map(|witness| ReserveEntry {
-                    address: witness.address.clone(),
-                    balance: witness.balance,
-                })
-                .collect::<Vec<_>>();
-            let state = build_mock_initialized_state(&entries, &fixture.state_root, &srs)?;
+            let state = build_mock_initialized_state(&entries, &state_root, &srs)?;
             write_state(&initialized_state_path, &state)?;
             state
         };
-        ensure_initialized_state_matches_fixture(&initialized_state, &fixture)?;
+        if initialized_state.state_root != state_root
+            || initialized_state.reserve_addresses.len() != n
+            || initialized_state.reserve_balances.len() != n
+        {
+            return Err(format!(
+                "persisted initialized state for n={n} does not match its fixture"
+            ));
+        }
+        drop(entries);
         println!(
             "   mock initialized polynomial: preparation={} bytes={} reused={state_reused}",
             human_duration(state_prepare_start.elapsed()),
@@ -452,7 +494,7 @@ fn prepare_benchmark_inputs(config: &Config) -> Result<(), String> {
             }
             let delta_path = ethereum_fixture::delta_fixture_path(&master_dir, n, m);
             let (_, new_root, generation, validation, reused) =
-                ethereum_fixture::ensure_delta_fixture(&delta_path, &fixture, m)?;
+                ethereum_fixture::ensure_delta_fixture(&delta_path, &state_root, n, m)?;
             println!(
                 "   delta m={m}: generation={} validation={} bytes={} reused={reused}",
                 human_duration(generation),
@@ -549,6 +591,7 @@ fn benchmark_init(
     srs: &Srs,
     state_root: &str,
     witnesses: &[InitReserveWitness],
+    merkle_prefix_proof: &common::types::InitChainBatchProofInput,
     input_load: Duration,
     srs_load: Duration,
     raw: &mut Vec<SampleRecord>,
@@ -567,6 +610,7 @@ fn benchmark_init(
             chain_id: ethereum_fixture::CHAIN_ID.to_string(),
             state_root: state_root.to_string(),
             session_id: format!("bench-init-{n}-warmup-{warmup}"),
+            chain_batch_proof: Some(merkle_prefix_proof.clone()),
         };
         let result =
             initialize_from_witnesses_with_adapter(&ctx, witnesses, srs, &Sp1NativeProofAdapter)?;
@@ -584,6 +628,7 @@ fn benchmark_init(
             chain_id: ethereum_fixture::CHAIN_ID.to_string(),
             state_root: state_root.to_string(),
             session_id: format!("bench-init-{n}-sample-{sample}"),
+            chain_batch_proof: Some(merkle_prefix_proof.clone()),
         };
         let result =
             initialize_from_witnesses_with_adapter(&ctx, witnesses, srs, &Sp1NativeProofAdapter)?;
@@ -1124,8 +1169,8 @@ fn write_summary_markdown(
     body.push_str("- The release binary is compiled before the benchmark process starts.\n");
     body.push_str("- SP1 setup is performed by the wrapper script before timing.\n");
     body.push_str("- KZG ceremony and power-sequence validation belong to setup/import. Runtime loading authenticates the fixed SRS artifact; proof verification does not scan SRS powers.\n");
-    body.push_str("- All n sizes use prefixes of one persisted max-n Ethereum account store and fixed-height binary Merkle proofs under one shared root; the tree is not rebuilt per n.\n");
-    body.push_str("- Initialization uses valid secp256k1 EOA witnesses and one binary Merkle path per reserve. Ownership and Merkle/polynomial checks run in separate SP1 guests and are joined by a common ordered reserve commitment.\n");
+    body.push_str("- All n sizes use prefixes of one persisted max-n Ethereum account store and one fixed-height Keccak-Merkle tree under a shared root; the tree is not rebuilt per n.\n");
+    body.push_str("- Initialization uses valid secp256k1 EOA witnesses and one compact shared-prefix Merkle proof. Ownership and Merkle/polynomial checks run in separate SP1 guests and are joined by a common ordered reserve commitment.\n");
     body.push_str("- Initialization verification uses a development policy because the benchmark SRS is deterministic.\n");
     body.push_str("- Insert authenticates an additional EOA against the same binary Merkle root with a self-contained path.\n");
     body.push_str("- Update verification uses the debug verifier and excludes canonical Sync/finality verification.\n");
@@ -1134,7 +1179,7 @@ fn write_summary_markdown(
         "- Proof size is measured after the timer using the labeled artifact encoding.\n",
     );
     body.push_str("- Ethereum keys, balances, deltas, binary Merkle roots, and proofs are deterministically generated outside SP1; fixture preparation is excluded from prover time.\n");
-    body.push_str("- Merkle verification uses only domain-separated BLAKE3 leaf/node hashing inside SP1; no Banderwagon/IPA code remains in initialization or insert.\n");
+    body.push_str("- Merkle and large salted witness commitments use SP1's Keccak permutation syscall; ECDSA uses the patched k256 precompiles and BLS12-381 commitment checks use SP1 BLS add/double syscalls.\n");
 
     let path = config.output_dir.join("summary.md");
     fs::write(&path, body).map_err(|err| format!("write {}: {err}", path.display()))

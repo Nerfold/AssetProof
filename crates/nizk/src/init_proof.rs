@@ -5,8 +5,7 @@ use common::crypto::{
     hash_bytes, hash_to_scalar, hex_decode, point_g1_from_hex, point_g1_to_hex, scalar_to_hex,
 };
 use common::types::{
-    InitProvingContext, InitReserveWitness, PreparedInitReserveWitness, PublicState, ReserveEntry,
-    StoredInitProof, StoredState,
+    InitProvingContext, InitReserveWitness, PublicState, ReserveEntry, StoredInitProof, StoredState,
 };
 
 use crate::commitment::commit_balance;
@@ -186,10 +185,9 @@ pub fn initialize_from_witnesses_with_adapter(
         validate_chain_id(&ctx.chain_id, &witness.chain_balance_proof)?;
     }
 
-    let prepared = reserve_witnesses
-        .iter()
-        .map(|witness| external.prepare_init_witness(ctx, witness))
-        .collect::<Result<Vec<_>, _>>()?;
+    for witness in reserve_witnesses {
+        external.validate_init_witness(ctx, witness)?;
+    }
     let reserve_entries = reserve_witnesses
         .iter()
         .map(|witness| ReserveEntry {
@@ -197,7 +195,7 @@ pub fn initialize_from_witnesses_with_adapter(
             balance: witness.balance,
         })
         .collect::<Vec<_>>();
-    initialize_core(ctx, &reserve_entries, reserve_witnesses, &prepared, srs)
+    initialize_core(ctx, &reserve_entries, reserve_witnesses, srs)
 }
 
 pub fn initialize_with_proof(
@@ -218,6 +216,7 @@ pub fn initialize_with_proof_and_adapter(
         chain_id: "mock-chain".to_string(),
         state_root: state_root.to_string(),
         session_id: "mock-init-session".to_string(),
+        chain_batch_proof: None,
     };
     let reserve_witnesses = reserve_entries
         .iter()
@@ -232,18 +231,16 @@ pub fn initialize_with_proof_and_adapter(
             },
         })
         .collect::<Vec<_>>();
-    let prepared = reserve_witnesses
-        .iter()
-        .map(|witness| external.prepare_init_witness(&ctx, witness))
-        .collect::<Result<Vec<_>, _>>()?;
-    initialize_core(&ctx, reserve_entries, &reserve_witnesses, &prepared, srs)
+    for witness in &reserve_witnesses {
+        external.validate_init_witness(&ctx, witness)?;
+    }
+    initialize_core(&ctx, reserve_entries, &reserve_witnesses, srs)
 }
 
 fn initialize_core(
     ctx: &InitProvingContext,
     reserve_entries: &[ReserveEntry],
     reserve_witnesses: &[InitReserveWitness],
-    prepared_witnesses: &[PreparedInitReserveWitness],
     srs: &Srs,
 ) -> Result<InitProofResult, String> {
     if reserve_entries.is_empty() {
@@ -259,22 +256,16 @@ fn initialize_core(
             srs.max_degree
         ));
     }
-    if reserve_entries.len() != prepared_witnesses.len()
-        || reserve_entries.len() != reserve_witnesses.len()
-    {
+    if reserve_entries.len() != reserve_witnesses.len() {
         return Err("reserve entries and init witnesses length mismatch".to_string());
     }
 
     let mut canonical_entries = Vec::with_capacity(reserve_entries.len());
-    for (index, ((entry, _witness), prepared)) in reserve_entries
+    for (index, (entry, _witness)) in reserve_entries
         .iter()
         .zip(reserve_witnesses.iter())
-        .zip(prepared_witnesses.iter())
         .enumerate()
     {
-        if prepared.address != entry.address || prepared.balance != entry.balance {
-            return Err("external adapter changed the reserve address or balance".to_string());
-        }
         canonical_entries.push((common::encoding::encode_address(&entry.address)?, index));
     }
     canonical_entries.sort_by(|left, right| left.0.into_bigint().cmp(&right.0.into_bigint()));
@@ -305,6 +296,7 @@ fn initialize_core(
 
     let f_s = product_from_roots(&roots);
     let p_s = f_s.mul_scalar(alpha);
+    drop(f_s);
     let accumulator = commit_g1(srs, &p_s)?;
     let balance_total = reserve_balances.iter().try_fold(0i128, |sum, balance| {
         sum.checked_add(*balance)
@@ -392,6 +384,7 @@ fn initialize_core(
         &roots,
         &reserve_balances,
         &canonical_witnesses,
+        ctx.chain_batch_proof.as_ref(),
     )?;
     let merkle_sp1 = sp1_host::init::prove_init_merkle(merkle_stdin)?;
     if merkle_sp1.public.chain_id != ownership_sp1.public.chain_id
@@ -406,7 +399,7 @@ fn initialize_core(
     }
 
     let proof = StoredInitProof {
-        scheme: "kzg-nizk-init-v7-zkopen-salted-shape-hash-binary-merkle-split".to_string(),
+        scheme: "kzg-nizk-init-v8-zkopen-keccak-merkle-prefix-split".to_string(),
         mode: "sp1".to_string(),
         chain_id: ctx.chain_id.clone(),
         state_root: ctx.state_root.clone(),
@@ -542,7 +535,7 @@ pub(crate) fn verify_init_public_proof(
     if proof.srs_hash_hex != point_hash_srs(srs)? {
         return Err("SRS hash mismatch".to_string());
     }
-    if proof.scheme != "kzg-nizk-init-v7-zkopen-salted-shape-hash-binary-merkle-split" {
+    if proof.scheme != "kzg-nizk-init-v8-zkopen-keccak-merkle-prefix-split" {
         return Err("init proof is not a production ZK proof; use verify_init_debug only for transparent local tests".to_string());
     }
     if proof.mode != "sp1" {

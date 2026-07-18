@@ -108,14 +108,14 @@ pub fn commitment_params_digest(
     balance_value: &G1Projective,
     balance_blind: &G1Projective,
 ) -> String {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"dynamic-poa-insert-commitment-params-v1");
+    let mut hasher = sp1_programs_common::ethereum_eoa::Keccak256Stream::new();
+    hasher.update(b"dynamic-poa-insert-commitment-params-keccak-v2");
     for point in [eval_value, eval_blind, balance_value, balance_blind] {
         let point = point_to_io(point);
         hasher.update(&point.x_be);
         hasher.update(&point.y_be);
     }
-    hex_encode(hasher.finalize().as_bytes())
+    hex_encode(&hasher.finalize())
 }
 
 pub fn prove(
@@ -124,6 +124,7 @@ pub fn prove(
     let ctx = context()?;
     let mut stdin = SP1Stdin::new();
     stdin.write(&stdin_value);
+    drop(stdin_value);
     let request = ctx.prover.prove(&ctx.pk, stdin);
     let bundle = match configured_proof_mode()? {
         ConfiguredProofMode::Groth16 => request.groth16().run(),

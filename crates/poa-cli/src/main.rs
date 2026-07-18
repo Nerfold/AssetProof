@@ -218,6 +218,7 @@ fn real_main() -> Result<(), String> {
                 chain_id: args[4].clone(),
                 state_root: args[5].clone(),
                 session_id: args[6].clone(),
+                chain_batch_proof: None,
             };
             let init =
                 nizk_fixed_set::init_proof::initialize_from_witnesses(&ctx, &witnesses, &srs)?;

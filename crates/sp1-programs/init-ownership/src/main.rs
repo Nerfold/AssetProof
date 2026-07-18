@@ -13,27 +13,22 @@ entrypoint!(main);
 fn main() {
     let input: Sp1InitOwnershipStdin = sp1_zkvm::io::read();
     assert!(!input.reserves.is_empty(), "empty reserve set");
-    let ownership_context = input
-        .reserves
-        .iter()
-        .any(|reserve| {
-            matches!(
-                reserve.ownership,
-                Sp1OwnershipWitness::EthereumEoaSignature { .. }
-            )
-        })
-        .then(|| {
-            sp1_programs_common::ethereum_eoa::ownership_context_hash(
-                sp1_programs_common::ethereum_eoa::OwnershipOperation::Initialization,
-                &input.chain_id,
-                &input.state_root,
-            )
-        });
+    // A single fixed-size Keccak is cheaper than scanning the million-entry
+    // vector once merely to decide whether the context will be needed.
+    let ownership_context = (input.chain_id != "mock-chain").then(|| {
+        sp1_programs_common::ethereum_eoa::ownership_context_hash(
+            sp1_programs_common::ethereum_eoa::OwnershipOperation::Initialization,
+            &input.chain_id,
+            &input.state_root,
+        )
+    });
+    let mut uses_mock_inputs = false;
 
     for reserve in &input.reserves {
         assert!(reserve.balance >= 0, "negative reserve balance");
         match &reserve.ownership {
             Sp1OwnershipWitness::MockPrivateKey { private_key } => {
+                uses_mock_inputs = true;
                 assert_eq!(
                     input.chain_id, "mock-chain",
                     "mock ownership used outside mock chain"
@@ -73,12 +68,7 @@ fn main() {
                 .iter()
                 .map(|reserve| (reserve.address.as_str(), reserve.balance)),
         ),
-        uses_mock_inputs: input.reserves.iter().any(|reserve| {
-            matches!(
-                reserve.ownership,
-                Sp1OwnershipWitness::MockPrivateKey { .. }
-            )
-        }),
+        uses_mock_inputs,
     };
     sp1_zkvm::io::commit(&public);
 }

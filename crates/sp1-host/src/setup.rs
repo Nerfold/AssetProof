@@ -44,6 +44,24 @@ pub fn ensure_protocol_setups(
     Ok(())
 }
 
+pub fn ensure_protocol_setup_components(
+    setup_dir: &Path,
+    init_elf: Option<Elf>,
+    init_ownership_elf: Option<Elf>,
+    kzg_insert_elf: Option<Elf>,
+) -> Result<(), String> {
+    if let Some(elf) = init_elf {
+        ensure_setup_file(setup_dir, INIT_ELF_NAME, elf)?;
+    }
+    if let Some(elf) = init_ownership_elf {
+        ensure_setup_file(setup_dir, INIT_OWNERSHIP_ELF_NAME, elf)?;
+    }
+    if let Some(elf) = kzg_insert_elf {
+        ensure_setup_file(setup_dir, KZG_INSERT_ELF_NAME, elf)?;
+    }
+    Ok(())
+}
+
 pub fn ensure_smt_setups(setup_dir: &Path, update_elf: Elf, insert_elf: Elf) -> Result<(), String> {
     ensure_setup_file(setup_dir, UPDATE_ELF_NAME, update_elf)?;
     ensure_setup_file(setup_dir, INSERT_ELF_NAME, insert_elf)?;

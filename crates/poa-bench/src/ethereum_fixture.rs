@@ -5,20 +5,25 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use common::crypto::{hex_decode, hex_encode};
-use common::types::{ChainBalanceProofInput, Delta, InitReserveWitness, OwnershipWitnessInput};
+use common::types::{
+    ChainBalanceProofInput, Delta, InitChainBatchProofInput, InitReserveWitness,
+    OwnershipWitnessInput, ReserveEntry,
+};
 use k256::ecdsa::{RecoveryId, Signature, SigningKey, VerifyingKey};
 use k256::elliptic_curve::sec1::ToEncodedPoint;
 use k256::SecretKey;
+use rayon::prelude::*;
 use sha3::{Digest, Keccak256};
+use sp1_programs_common::ethereum_binary_merkle::{empty_leaf_hash, leaf_hash, node_hash};
 use sp1_programs_common::ethereum_eoa::{
     ownership_context_hash, ownership_digest_from_context, OwnershipOperation,
 };
 
 pub const CHAIN_ID: &str = "0x1";
-const VERSION_NAME: &str = "ethereum-binary-merkle-v1-ecdsa";
-const VERSION: u32 = 1;
-const ACCOUNT_MAGIC: &[u8; 8] = b"DPMERK01";
-const PROOF_MAGIC: &[u8; 8] = b"DPMPRF01";
+const VERSION_NAME: &str = "ethereum-keccak-merkle-prefix-v2-ecdsa";
+const VERSION: u32 = 2;
+const ACCOUNT_MAGIC: &[u8; 8] = b"DPMERK02";
+const PROOF_MAGIC: &[u8; 8] = b"DPPREF02";
 const ACCOUNT_HEADER_BYTES: u64 = 8 + 4 + 8 + 4 + 32;
 const ACCOUNT_RECORD_BYTES: u64 = 32 + 65 + 20 + 16 + 65;
 const OWNERSHIP_SIGNATURE_BYTES: usize = 65;
@@ -29,6 +34,7 @@ type Hash = [u8; 32];
 pub struct EthereumInitFixture {
     pub state_root: String,
     pub witnesses: Vec<InitReserveWitness>,
+    pub merkle_prefix_proof: InitChainBatchProofInput,
     pub insert: EthereumInsertFixture,
 }
 
@@ -56,6 +62,25 @@ struct AccountRecord {
     ownership_signature: [u8; OWNERSHIP_SIGNATURE_BYTES],
 }
 
+/// Runtime view used by proving. Private/public keys remain in the persisted
+/// master store for reproducibility and full fixture validation, but retaining
+/// them for every account would waste roughly 97 MB per million entries.
+struct LoadedAccount {
+    address: [u8; 20],
+    balance: i128,
+    ownership_signature: [u8; OWNERSHIP_SIGNATURE_BYTES],
+}
+
+impl From<AccountRecord> for LoadedAccount {
+    fn from(value: AccountRecord) -> Self {
+        Self {
+            address: value.address,
+            balance: value.balance,
+            ownership_signature: value.ownership_signature,
+        }
+    }
+}
+
 struct BinaryMerkleTree {
     layers: Vec<Vec<Hash>>,
 }
@@ -67,23 +92,24 @@ impl BinaryMerkleTree {
         }
         let capacity = accounts.len().next_power_of_two();
         let mut leaves = Vec::with_capacity(capacity);
-        for account in accounts {
-            leaves.push(chain_leaf_hash(
-                &format!("0x{}", hex_encode(&account.address)),
-                account.balance,
-            ));
-        }
-        for index in accounts.len()..capacity {
-            leaves.push(empty_leaf_hash(index));
-        }
+        leaves.par_extend(
+            accounts
+                .par_iter()
+                .map(|account| leaf_hash(&account.address, account.balance)),
+        );
+        leaves.par_extend(
+            (accounts.len()..capacity)
+                .into_par_iter()
+                .map(empty_leaf_hash),
+        );
         let mut layers = vec![leaves];
         let mut level = 0usize;
         while layers.last().map_or(0, Vec::len) > 1 {
             let previous = layers.last().expect("Merkle layer exists");
-            let mut next = Vec::with_capacity(previous.len() / 2);
-            for pair in previous.chunks_exact(2) {
-                next.push(chain_node_hash(level, &pair[0], &pair[1]));
-            }
+            let next = previous
+                .par_chunks_exact(2)
+                .map(|pair| node_hash(level, &pair[0], &pair[1]))
+                .collect();
             layers.push(next);
             level += 1;
         }
@@ -111,14 +137,31 @@ impl BinaryMerkleTree {
         Ok(siblings)
     }
 
+    fn suffix_subtrees(&self, mut start: usize) -> Result<Vec<(u32, Hash)>, String> {
+        let capacity = self.layers[0].len();
+        if start > capacity {
+            return Err("Merkle prefix exceeds tree capacity".to_string());
+        }
+        let mut out = Vec::with_capacity(self.depth());
+        while start < capacity {
+            let remaining = capacity - start;
+            let alignment_level = start.trailing_zeros() as usize;
+            let remaining_level = (usize::BITS - 1 - remaining.leading_zeros()) as usize;
+            let level = alignment_level.min(remaining_level).min(self.depth());
+            out.push((level as u32, self.layers[level][start >> level]));
+            start += 1usize << level;
+        }
+        Ok(out)
+    }
+
     fn set_account_balance(&mut self, index: usize, address: &[u8; 20], balance: i128) {
-        self.layers[0][index] = chain_leaf_hash(&format!("0x{}", hex_encode(address)), balance);
+        self.layers[0][index] = leaf_hash(address, balance);
         let mut node_index = index;
         for level in 0..self.depth() {
             let parent = node_index >> 1;
             let left = self.layers[level][parent * 2];
             let right = self.layers[level][parent * 2 + 1];
-            self.layers[level + 1][parent] = chain_node_hash(level, &left, &right);
+            self.layers[level + 1][parent] = node_hash(level, &left, &right);
             node_index = parent;
         }
     }
@@ -139,6 +182,7 @@ pub fn ensure_master_fixture(
     let start = Instant::now();
     let seed = fixture_seed(max_n);
     let mut accounts = (0..=max_n)
+        .into_par_iter()
         .map(|index| derive_account(&seed, index))
         .collect::<Result<Vec<_>, _>>()?;
     accounts.sort_unstable_by(|left, right| left.address.cmp(&right.address));
@@ -148,24 +192,28 @@ pub fn ensure_master_fixture(
     let init_context =
         ownership_context_hash(OwnershipOperation::Initialization, CHAIN_ID, &state_root);
     let insert_context = ownership_context_hash(OwnershipOperation::Insert, CHAIN_ID, &state_root);
-    for (index, account) in accounts.iter_mut().enumerate() {
-        let context = if index == max_n {
-            &insert_context
-        } else {
-            &init_context
-        };
-        account.ownership_signature = sign_ownership(account, context)?;
-    }
+    accounts
+        .par_iter_mut()
+        .enumerate()
+        .try_for_each(|(index, account)| {
+            let context = if index == max_n {
+                &insert_context
+            } else {
+                &init_context
+            };
+            account.ownership_signature = sign_ownership(account, context)?;
+            Ok::<_, String>(())
+        })?;
     write_master_accounts(dir, max_n, tree.depth(), &root, &accounts)?;
 
     for &n in &canonical_sizes(n_sizes) {
-        write_merkle_proofs(
+        write_prefix_proof(
             &init_proof_path(dir, n),
             max_n,
             n,
             tree.depth(),
             &root,
-            (0..n).map(|index| (index, tree.proof(index).expect("valid prefix index"))),
+            &tree.suffix_subtrees(n)?,
         )?;
     }
     write_merkle_proofs(
@@ -178,7 +226,7 @@ pub fn ensure_master_fixture(
     )?;
 
     for &n in &canonical_sizes(n_sizes) {
-        generate_delta_artifacts(dir, max_n, n, m_sizes, &root, &accounts, &mut tree)?;
+        generate_delta_artifacts(dir, n, m_sizes, &root, &accounts, &mut tree)?;
     }
     write_master_manifest(dir, max_n, tree.depth(), n_sizes, m_sizes, &root)?;
     Ok((start.elapsed(), false))
@@ -197,14 +245,11 @@ pub fn load_init_fixture(
     }
     let (root, depth, accounts, candidate) =
         read_master_account_prefix(dir, max_n, n, validation == FixtureValidation::Full)?;
-    let proofs = read_merkle_proofs(&init_proof_path(dir, n), max_n, n, depth, &root)?;
-    if proofs.len() != accounts.len() {
-        return Err("Merkle proof/account count mismatch".to_string());
-    }
+    let suffix_subtrees = read_prefix_proof(&init_proof_path(dir, n), max_n, n, depth, &root)?;
     let witnesses = accounts
         .into_iter()
-        .zip(proofs)
-        .map(|(account, (leaf_index, siblings))| init_witness(account, leaf_index, siblings))
+        .enumerate()
+        .map(|(leaf_index, account)| init_witness(account, leaf_index as u64, Vec::new()))
         .collect::<Vec<_>>();
     let insert_proofs = read_merkle_proofs(&insert_proof_path(dir), max_n, 1, depth, &root)?;
     let (insert_index, insert_siblings) = insert_proofs
@@ -214,6 +259,10 @@ pub fn load_init_fixture(
     let fixture = EthereumInitFixture {
         state_root: hex_encode(&root),
         witnesses,
+        merkle_prefix_proof: InitChainBatchProofInput::BinaryMerklePrefixV2 {
+            depth,
+            suffix_subtrees,
+        },
         insert: EthereumInsertFixture {
             address: format!("0x{}", hex_encode(&candidate.address)),
             balance: candidate.balance,
@@ -230,14 +279,12 @@ pub fn load_init_fixture(
 
 pub fn ensure_delta_fixture(
     path: &Path,
-    fixture: &EthereumInitFixture,
+    state_root: &str,
+    reserve_count: usize,
     m: usize,
 ) -> Result<(Vec<Delta>, String, Duration, Duration, bool), String> {
-    if m > fixture.witnesses.len() {
-        return Err(format!(
-            "m={m} exceeds reserve count {}",
-            fixture.witnesses.len()
-        ));
+    if m > reserve_count {
+        return Err(format!("m={m} exceeds reserve count {reserve_count}",));
     }
     if !path.is_file() {
         return Err(format!(
@@ -247,15 +294,111 @@ pub fn ensure_delta_fixture(
     }
     let start = Instant::now();
     let (deltas, old_root, new_root) = read_delta_fixture(path)?;
-    if deltas.len() != m || old_root != fixture.state_root {
+    if deltas.len() != m || old_root != state_root {
         return Err("persisted delta fixture does not match requested state".to_string());
     }
     Ok((deltas, new_root, Duration::ZERO, start.elapsed(), true))
 }
 
-fn generate_delta_artifacts(
+pub fn load_insert_fixture(
     dir: &Path,
     max_n: usize,
+    validation: FixtureValidation,
+) -> Result<(String, EthereumInsertFixture), String> {
+    let (root, depth, accounts, candidate) =
+        read_master_account_prefix(dir, max_n, 0, validation == FixtureValidation::Full)?;
+    debug_assert!(accounts.is_empty());
+    let proofs = read_merkle_proofs(&insert_proof_path(dir), max_n, 1, depth, &root)?;
+    let (leaf_index, siblings) = proofs
+        .into_iter()
+        .next()
+        .ok_or_else(|| "missing insertion Merkle proof".to_string())?;
+    let fixture = EthereumInsertFixture {
+        address: format!("0x{}", hex_encode(&candidate.address)),
+        balance: candidate.balance,
+        ownership_signature: candidate.ownership_signature,
+        leaf_index,
+        siblings,
+    };
+    if validation != FixtureValidation::None {
+        verify_merkle_proof(
+            &root,
+            &fixture.address,
+            fixture.balance,
+            fixture.leaf_index,
+            &fixture.siblings,
+        )?;
+    }
+    Ok((hex_encode(&root), fixture))
+}
+
+/// Loads only the fields needed to materialize the persisted initialized
+/// polynomial.  Preparation does not need signatures, private keys, public
+/// keys, or Merkle proof objects at this stage.
+pub fn load_reserve_entries(
+    dir: &Path,
+    expected_max_n: usize,
+    n: usize,
+) -> Result<(String, Vec<ReserveEntry>), String> {
+    if n == 0 || n > expected_max_n {
+        return Err(format!(
+            "reserve prefix n={n} is outside master size {expected_max_n}"
+        ));
+    }
+    let path = master_accounts_path(dir);
+    let expected = ACCOUNT_HEADER_BYTES + (expected_max_n as u64 + 1) * ACCOUNT_RECORD_BYTES;
+    if fs::metadata(&path).map_err(io_error(&path, "stat"))?.len() != expected {
+        return Err("master Merkle account store has unexpected size".to_string());
+    }
+    let mut reader = BufReader::new(File::open(&path).map_err(io_error(&path, "open"))?);
+    let mut magic = [0u8; 8];
+    reader
+        .read_exact(&mut magic)
+        .map_err(io_error(&path, "read magic"))?;
+    let version = read_u32(&mut reader, &path)?;
+    let max_n = read_u64(&mut reader, &path)? as usize;
+    let _depth = read_u32(&mut reader, &path)?;
+    let mut root = [0u8; 32];
+    reader
+        .read_exact(&mut root)
+        .map_err(io_error(&path, "read root"))?;
+    if &magic != ACCOUNT_MAGIC || version != VERSION || max_n != expected_max_n {
+        return Err("unsupported master Merkle account store".to_string());
+    }
+
+    let mut entries = Vec::with_capacity(n);
+    let mut previous = None;
+    let mut discarded_keys = [0u8; 32 + 65];
+    let mut discarded_signature = [0u8; 65];
+    for _ in 0..n {
+        let mut address = [0u8; 20];
+        let mut balance = [0u8; 16];
+        reader
+            .read_exact(&mut discarded_keys)
+            .map_err(io_error(&path, "read account keys"))?;
+        reader
+            .read_exact(&mut address)
+            .map_err(io_error(&path, "read address"))?;
+        reader
+            .read_exact(&mut balance)
+            .map_err(io_error(&path, "read balance"))?;
+        reader
+            .read_exact(&mut discarded_signature)
+            .map_err(io_error(&path, "read signature"))?;
+        if previous.is_some_and(|value| value >= address) {
+            return Err("master account prefix is not canonical".to_string());
+        }
+        previous = Some(address);
+        entries.push(ReserveEntry {
+            address: format!("0x{}", hex_encode(&address)),
+            balance: i128::from_le_bytes(balance),
+        });
+    }
+    Ok((hex_encode(&root), entries))
+}
+
+fn generate_delta_artifacts(
+    dir: &Path,
     n: usize,
     m_sizes: &[usize],
     base_root: &Hash,
@@ -267,21 +410,21 @@ fn generate_delta_artifacts(
         return Ok(());
     };
     let (offset, step) = permutation_parameters(n);
-    let mut balances = accounts[..n]
-        .iter()
-        .map(|account| account.balance)
-        .collect::<Vec<_>>();
     let mut updates = Vec::with_capacity(max_m);
     for ordinal in 0..max_m {
         let index = (offset + ordinal * step) % n;
-        let delta = deterministic_delta(n, ordinal, balances[index]);
-        balances[index] = balances[index]
-            .checked_add(delta)
+        // The permutation visits every index exactly once before wrapping at
+        // n, and fixture validation requires max_m <= n.  Reading the original
+        // account directly avoids another O(n) balance allocation.
+        let old_balance = accounts[index].balance;
+        let new_balance = old_balance
+            .checked_add(deterministic_delta(n, ordinal, old_balance))
             .ok_or_else(|| "benchmark delta overflowed balance".to_string())?;
-        if balances[index] < 0 {
+        let delta = new_balance - old_balance;
+        if new_balance < 0 {
             return Err("benchmark delta made a balance negative".to_string());
         }
-        tree.set_account_balance(index, &accounts[index].address, balances[index]);
+        tree.set_account_balance(index, &accounts[index].address, new_balance);
         updates.push((index, delta));
         if targets.binary_search(&(ordinal + 1)).is_ok() {
             let mut deltas = updates
@@ -306,7 +449,6 @@ fn generate_delta_artifacts(
     if &tree.root() != base_root {
         return Err("failed to restore Merkle tree after delta generation".to_string());
     }
-    let _ = max_n;
     Ok(())
 }
 
@@ -359,7 +501,7 @@ fn read_master_account_prefix(
     expected_max_n: usize,
     n: usize,
     validate_crypto: bool,
-) -> Result<(Hash, usize, Vec<AccountRecord>, AccountRecord), String> {
+) -> Result<(Hash, usize, Vec<LoadedAccount>, LoadedAccount), String> {
     let path = master_accounts_path(dir);
     let expected = ACCOUNT_HEADER_BYTES + (expected_max_n as u64 + 1) * ACCOUNT_RECORD_BYTES;
     if fs::metadata(&path).map_err(io_error(&path, "stat"))?.len() != expected {
@@ -391,13 +533,16 @@ fn read_master_account_prefix(
     let mut accounts = Vec::with_capacity(n);
     let mut previous = None;
     for index in 0..n {
-        let account = read_account(&mut reader, &path)?;
-        if previous.is_some_and(|value| value >= account.address) {
-            return Err("master account prefix is not canonical".to_string());
-        }
-        if validate_crypto {
+        let account = if validate_crypto {
+            let account = read_account(&mut reader, &path)?;
             validate_account(&account, &init_context)
                 .map_err(|err| format!("account {index}: {err}"))?;
+            account.into()
+        } else {
+            read_loaded_account(&mut reader, &path)?
+        };
+        if previous.is_some_and(|value| value >= account.address) {
+            return Err("master account prefix is not canonical".to_string());
         }
         previous = Some(account.address);
         accounts.push(account);
@@ -407,11 +552,39 @@ fn read_master_account_prefix(
             ACCOUNT_HEADER_BYTES + expected_max_n as u64 * ACCOUNT_RECORD_BYTES,
         ))
         .map_err(io_error(&path, "seek insert account"))?;
-    let candidate = read_account(&mut reader, &path)?;
-    if validate_crypto {
-        validate_account(&candidate, &insert_context)?;
-    }
+    let candidate = if validate_crypto {
+        let account = read_account(&mut reader, &path)?;
+        validate_account(&account, &insert_context)?;
+        account.into()
+    } else {
+        read_loaded_account(&mut reader, &path)?
+    };
     Ok((root, depth, accounts, candidate))
+}
+
+fn read_loaded_account(reader: &mut impl Read, path: &Path) -> Result<LoadedAccount, String> {
+    // Consume but do not retain private/public keys during ordinary proving.
+    let mut keys = [0u8; 32 + 65];
+    let mut address = [0u8; 20];
+    let mut balance = [0u8; 16];
+    let mut ownership_signature = [0u8; 65];
+    reader
+        .read_exact(&mut keys)
+        .map_err(io_error(path, "read account keys"))?;
+    reader
+        .read_exact(&mut address)
+        .map_err(io_error(path, "read address"))?;
+    reader
+        .read_exact(&mut balance)
+        .map_err(io_error(path, "read balance"))?;
+    reader
+        .read_exact(&mut ownership_signature)
+        .map_err(io_error(path, "read signature"))?;
+    Ok(LoadedAccount {
+        address,
+        balance: i128::from_le_bytes(balance),
+        ownership_signature,
+    })
 }
 
 fn read_account(reader: &mut impl Read, path: &Path) -> Result<AccountRecord, String> {
@@ -442,6 +615,92 @@ fn read_account(reader: &mut impl Read, path: &Path) -> Result<AccountRecord, St
         balance: i128::from_le_bytes(balance),
         ownership_signature,
     })
+}
+
+fn write_prefix_proof(
+    path: &Path,
+    max_n: usize,
+    prefix_count: usize,
+    depth: usize,
+    root: &Hash,
+    suffix_subtrees: &[(u32, Hash)],
+) -> Result<(), String> {
+    let mut writer = BufWriter::new(File::create(path).map_err(io_error(path, "create prefix"))?);
+    writer
+        .write_all(PROOF_MAGIC)
+        .map_err(io_error(path, "write prefix magic"))?;
+    writer
+        .write_all(&VERSION.to_le_bytes())
+        .map_err(io_error(path, "write prefix version"))?;
+    writer
+        .write_all(&(max_n as u64).to_le_bytes())
+        .map_err(io_error(path, "write prefix max_n"))?;
+    writer
+        .write_all(&(prefix_count as u64).to_le_bytes())
+        .map_err(io_error(path, "write prefix count"))?;
+    writer
+        .write_all(&(depth as u32).to_le_bytes())
+        .map_err(io_error(path, "write prefix depth"))?;
+    writer
+        .write_all(root)
+        .map_err(io_error(path, "write prefix root"))?;
+    writer
+        .write_all(&(suffix_subtrees.len() as u32).to_le_bytes())
+        .map_err(io_error(path, "write suffix count"))?;
+    for (level, hash) in suffix_subtrees {
+        writer
+            .write_all(&level.to_le_bytes())
+            .map_err(io_error(path, "write suffix level"))?;
+        writer
+            .write_all(hash)
+            .map_err(io_error(path, "write suffix root"))?;
+    }
+    writer.flush().map_err(io_error(path, "flush prefix"))
+}
+
+fn read_prefix_proof(
+    path: &Path,
+    expected_max_n: usize,
+    expected_count: usize,
+    expected_depth: usize,
+    expected_root: &Hash,
+) -> Result<Vec<(u32, Hash)>, String> {
+    let mut reader = BufReader::new(File::open(path).map_err(io_error(path, "open prefix"))?);
+    let mut magic = [0u8; 8];
+    reader
+        .read_exact(&mut magic)
+        .map_err(io_error(path, "read prefix magic"))?;
+    let version = read_u32(&mut reader, path)?;
+    let max_n = read_u64(&mut reader, path)? as usize;
+    let count = read_u64(&mut reader, path)? as usize;
+    let depth = read_u32(&mut reader, path)? as usize;
+    let mut root = [0u8; 32];
+    reader
+        .read_exact(&mut root)
+        .map_err(io_error(path, "read prefix root"))?;
+    if &magic != PROOF_MAGIC
+        || version != VERSION
+        || max_n != expected_max_n
+        || count != expected_count
+        || depth != expected_depth
+        || root != *expected_root
+    {
+        return Err(format!("invalid Merkle prefix artifact {}", path.display()));
+    }
+    let suffix_count = read_u32(&mut reader, path)? as usize;
+    if suffix_count > depth + 1 {
+        return Err("Merkle prefix contains too many suffix subtrees".to_string());
+    }
+    let mut suffix = Vec::with_capacity(suffix_count);
+    for _ in 0..suffix_count {
+        let level = read_u32(&mut reader, path)?;
+        let mut hash = [0u8; 32];
+        reader
+            .read_exact(&mut hash)
+            .map_err(io_error(path, "read suffix root"))?;
+        suffix.push((level, hash));
+    }
+    Ok(suffix)
 }
 
 fn write_merkle_proofs(
@@ -538,7 +797,7 @@ fn read_merkle_proofs(
 }
 
 fn init_witness(
-    account: AccountRecord,
+    account: LoadedAccount,
     leaf_index: u64,
     siblings: Vec<Hash>,
 ) -> InitReserveWitness {
@@ -559,23 +818,11 @@ fn init_witness(
 
 fn verify_fixture_proofs(fixture: &EthereumInitFixture) -> Result<(), String> {
     let expected_root = decode_hash(&fixture.state_root)?;
-    for witness in &fixture.witnesses {
-        let ChainBalanceProofInput::BinaryMerkleV1 {
-            leaf_index,
-            siblings,
-            ..
-        } = &witness.chain_balance_proof
-        else {
-            return Err("fixture witness is not a binary Merkle proof".to_string());
-        };
-        verify_merkle_proof(
-            &expected_root,
-            &witness.address,
-            witness.balance,
-            *leaf_index,
-            siblings,
-        )?;
-    }
+    verify_prefix_proof(
+        &expected_root,
+        &fixture.witnesses,
+        &fixture.merkle_prefix_proof,
+    )?;
     verify_merkle_proof(
         &expected_root,
         &fixture.insert.address,
@@ -592,13 +839,14 @@ fn verify_merkle_proof(
     leaf_index: u64,
     siblings: &[Hash],
 ) -> Result<(), String> {
-    let mut current = chain_leaf_hash(address, balance);
+    let address = decode_address(address)?;
+    let mut current = leaf_hash(&address, balance);
     let mut index = leaf_index;
     for (level, sibling) in siblings.iter().enumerate() {
         current = if index & 1 == 0 {
-            chain_node_hash(level, &current, sibling)
+            node_hash(level, &current, sibling)
         } else {
-            chain_node_hash(level, sibling, &current)
+            node_hash(level, sibling, &current)
         };
         index >>= 1;
     }
@@ -606,6 +854,88 @@ fn verify_merkle_proof(
         return Err("binary Merkle proof mismatch".to_string());
     }
     Ok(())
+}
+
+fn verify_prefix_proof(
+    root: &Hash,
+    witnesses: &[InitReserveWitness],
+    proof: &InitChainBatchProofInput,
+) -> Result<(), String> {
+    let InitChainBatchProofInput::BinaryMerklePrefixV2 {
+        depth,
+        suffix_subtrees,
+    } = proof;
+    if *depth >= usize::BITS as usize {
+        return Err("Merkle prefix depth is too large".to_string());
+    }
+    let capacity = 1usize << depth;
+    let mut stack = vec![None; depth + 1];
+    let mut cursor = 0usize;
+    for (expected_index, witness) in witnesses.iter().enumerate() {
+        let ChainBalanceProofInput::BinaryMerkleV1 {
+            leaf_index,
+            siblings,
+            ..
+        } = &witness.chain_balance_proof
+        else {
+            return Err("Merkle prefix contains a non-binary member".to_string());
+        };
+        if *leaf_index as usize != expected_index || !siblings.is_empty() {
+            return Err("Merkle prefix member repeated or reordered a path".to_string());
+        }
+        let address = decode_address(&witness.address)?;
+        append_subtree(
+            &mut stack,
+            &mut cursor,
+            0,
+            leaf_hash(&address, witness.balance),
+        )?;
+    }
+    for (level, hash) in suffix_subtrees {
+        append_subtree(&mut stack, &mut cursor, *level as usize, *hash)?;
+    }
+    if cursor != capacity
+        || stack[..*depth].iter().any(Option::is_some)
+        || stack[*depth] != Some(*root)
+    {
+        return Err("binary Merkle prefix proof mismatch".to_string());
+    }
+    Ok(())
+}
+
+fn append_subtree(
+    stack: &mut [Option<Hash>],
+    cursor: &mut usize,
+    mut level: usize,
+    mut current: Hash,
+) -> Result<(), String> {
+    if level >= stack.len() {
+        return Err("Merkle suffix level exceeds depth".to_string());
+    }
+    let width = 1usize << level;
+    if *cursor % width != 0 {
+        return Err("unaligned Merkle suffix subtree".to_string());
+    }
+    *cursor = cursor
+        .checked_add(width)
+        .ok_or_else(|| "Merkle cursor overflow".to_string())?;
+    loop {
+        let Some(left) = stack[level].take() else {
+            stack[level] = Some(current);
+            return Ok(());
+        };
+        current = node_hash(level, &left, &current);
+        level += 1;
+        if level >= stack.len() {
+            return Err("Merkle prefix exceeded declared depth".to_string());
+        }
+    }
+}
+
+fn decode_address(value: &str) -> Result<[u8; 20], String> {
+    hex_decode(value.strip_prefix("0x").unwrap_or(value))?
+        .try_into()
+        .map_err(|_| "Ethereum address must contain 20 bytes".to_string())
 }
 
 fn derive_account(seed: &Hash, index: usize) -> Result<AccountRecord, String> {
@@ -684,31 +1014,6 @@ fn validate_account(account: &AccountRecord, context: &Hash) -> Result<(), Strin
         return Err("ownership signature recovered wrong public key".to_string());
     }
     Ok(())
-}
-
-fn chain_leaf_hash(address: &str, balance: i128) -> Hash {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"dpoa-chain-leaf-v1");
-    hasher.update(&(address.len() as u64).to_le_bytes());
-    hasher.update(address.as_bytes());
-    hasher.update(&balance.to_le_bytes());
-    *hasher.finalize().as_bytes()
-}
-
-fn empty_leaf_hash(index: usize) -> Hash {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"dpoa-chain-empty-leaf-v1");
-    hasher.update(&(index as u64).to_le_bytes());
-    *hasher.finalize().as_bytes()
-}
-
-fn chain_node_hash(level: usize, left: &Hash, right: &Hash) -> Hash {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"dpoa-chain-node-v1");
-    hasher.update(&(level as u64).to_le_bytes());
-    hasher.update(left);
-    hasher.update(right);
-    *hasher.finalize().as_bytes()
 }
 
 fn fixture_seed(max_n: usize) -> Hash {
@@ -928,17 +1233,30 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        let (elapsed, reused) = ensure_master_fixture(&dir, 8, &[4, 8], &[2]).unwrap();
+        let (elapsed, reused) = ensure_master_fixture(&dir, 8, &[3, 5, 8], &[2]).unwrap();
         assert!(!reused);
         assert!(!elapsed.is_zero());
 
+        for n in [3, 5] {
+            let prefix = load_init_fixture(&dir, 8, n, FixtureValidation::Full).unwrap();
+            assert_eq!(prefix.witnesses.len(), n);
+        }
         let fixture = load_init_fixture(&dir, 8, 8, FixtureValidation::Full).unwrap();
         assert_eq!(fixture.witnesses.len(), 8);
+        assert!(fixture.witnesses.iter().all(|witness| matches!(
+            &witness.chain_balance_proof,
+            ChainBalanceProofInput::BinaryMerkleV1 { siblings, .. } if siblings.is_empty()
+        )));
+        assert!(fs::metadata(init_proof_path(&dir, 8)).unwrap().len() < 1024);
         assert_eq!(fixture.insert.leaf_index, 8);
         assert_eq!(fixture.insert.siblings.len(), 4);
+        let (insert_root, insert) = load_insert_fixture(&dir, 8, FixtureValidation::Full).unwrap();
+        assert_eq!(insert_root, fixture.state_root);
+        assert_eq!(insert.address, fixture.insert.address);
         let delta_path = delta_fixture_path(&dir, 8, 2);
         let (deltas, new_root, _, _, reused) =
-            ensure_delta_fixture(&delta_path, &fixture, 2).unwrap();
+            ensure_delta_fixture(&delta_path, &fixture.state_root, fixture.witnesses.len(), 2)
+                .unwrap();
         assert!(reused);
         assert_eq!(deltas.len(), 2);
         assert_ne!(new_root, fixture.state_root);

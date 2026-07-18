@@ -2,6 +2,8 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use serde::{Deserialize, Serialize};
 
+use crate::ethereum_eoa::Keccak256Stream;
+
 pub type Hash = [u8; 32];
 
 /// Commits to the ordered initialization roots before deriving the Fiat--Shamir
@@ -17,8 +19,8 @@ pub fn init_shape_commitment<I>(
 where
     I: IntoIterator<Item = Hash>,
 {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"dynamic-poa-init-shape-salted-blake3-v1");
+    let mut hasher = Keccak256Stream::new();
+    hasher.update(b"dynamic-poa-init-shape-salted-keccak-v2");
     hasher.update(salt);
     hasher.update(&(root_count as u64).to_le_bytes());
     hasher.update(alpha_le);
@@ -30,7 +32,7 @@ where
     }
     assert_eq!(encoded_count, root_count, "shape root count mismatch");
 
-    *hasher.finalize().as_bytes()
+    hasher.finalize()
 }
 
 /// Binds the two split initialization guests to the exact same ordered
@@ -39,8 +41,8 @@ pub fn init_reserve_commitment<'a, I>(reserve_count: usize, reserves: I) -> Hash
 where
     I: IntoIterator<Item = (&'a str, i128)>,
 {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"dynamic-poa-init-reserves-blake3-v1");
+    let mut hasher = Keccak256Stream::new();
+    hasher.update(b"dynamic-poa-init-reserves-keccak-v2");
     hasher.update(&(reserve_count as u64).to_le_bytes());
     let mut encoded_count = 0usize;
     for (address, balance) in reserves {
@@ -50,7 +52,7 @@ where
         encoded_count += 1;
     }
     assert_eq!(encoded_count, reserve_count, "reserve count mismatch");
-    *hasher.finalize().as_bytes()
+    hasher.finalize()
 }
 
 /// Binds the degree-bounded insertion quotient before its Fiat--Shamir
@@ -64,8 +66,8 @@ pub fn insert_quotient_commitment<I>(
 where
     I: IntoIterator<Item = Hash>,
 {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"dynamic-poa-insert-quotient-salted-blake3-v1");
+    let mut hasher = Keccak256Stream::new();
+    hasher.update(b"dynamic-poa-insert-quotient-salted-keccak-v2");
     hasher.update(salt);
     hasher.update(&(coefficient_count as u64).to_le_bytes());
 
@@ -79,7 +81,7 @@ where
         "quotient coefficient count mismatch"
     );
 
-    *hasher.finalize().as_bytes()
+    hasher.finalize()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -195,6 +197,18 @@ pub struct Sp1InitReserveEntry {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Sp1MerkleSubtree {
+    pub level: u32,
+    pub root: Hash,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Sp1BinaryMerklePrefixProof {
+    pub depth: usize,
+    pub suffix_subtrees: Vec<Sp1MerkleSubtree>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Sp1InitOwnershipEntry {
     pub address: String,
     pub balance: i128,
@@ -282,6 +296,7 @@ pub struct Sp1InitStdin {
     pub shape_commitment: Hash,
     pub eval_commitment: Sp1G1Affine,
     pub commitment_params_digest_hex: String,
+    pub merkle_prefix_proof: Option<Sp1BinaryMerklePrefixProof>,
     pub reserves: Vec<Sp1InitReserveEntry>,
 }
 

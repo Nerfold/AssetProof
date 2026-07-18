@@ -8,5 +8,6 @@ blake3 = "1.8"
 common = { path = "../common" }
 k256 = { version = "0.13", features = ["arithmetic"] }
 nizk-fixed-set = { path = "../nizk" }
+rayon = "1.11"
 sha3 = "0.10"
 sp1-programs-common = { path = "../sp1-programs/common" }

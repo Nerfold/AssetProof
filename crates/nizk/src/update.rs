@@ -147,18 +147,9 @@ pub fn apply_update(
         }
     }
 
-    let next_state = StoredState {
-        state_root: new_state_root.to_string(),
-        srs_max_degree: state.srs_max_degree,
-        alpha: state.alpha,
-        reserve_addresses: state.reserve_addresses.clone(),
-        reserve_balances: next_reserve_balances,
-        masked_polynomial_coeffs: state.masked_polynomial_coeffs.clone(),
-        accumulator_hex: state.accumulator_hex.clone(),
-        balance_total: next_balance_total,
-        balance_blind: next_balance_blind,
-        balance_commitment_hex: next_balance_commitment_hex.clone(),
-    };
+    let mut next_public_state = state.public_state();
+    next_public_state.state_root = new_state_root.to_string();
+    next_public_state.balance_commitment_hex = next_balance_commitment_hex.clone();
 
     let c_u_hex = point_g1_to_hex(&c_u)?;
     let d_y_hex = point_g1_to_hex(&d_y)?;
@@ -227,12 +218,12 @@ pub fn apply_update(
         let range_start = Instant::now();
         let range_proof = prove_threshold(
             &ThresholdStatement {
-                public_state: next_state.public_state(),
+                public_state: next_public_state.clone(),
                 threshold: 0,
             },
             &ThresholdWitness {
-                asset_total: next_state.balance_total,
-                asset_blind: next_state.balance_blind,
+                asset_total: next_balance_total,
+                asset_blind: next_balance_blind,
             },
         )?;
         if emit_timing {
@@ -277,6 +268,7 @@ pub fn apply_update(
                 balance_range_proof_hex,
             )
         };
+    drop(quotient);
     if emit_timing {
         eprintln!(
             "stage=update_parallel_proof_phase millis={} enabled={}",
@@ -316,6 +308,21 @@ pub fn apply_update(
         committed_input_link_ipa_proof: zero_test_proof.committed_input_link_ipa_proof,
         projection_ipa_proof,
         balance_range_proof_hex,
+    };
+
+    // Materialize the linear-size successor only after the parallel proof
+    // workers have released their large MSM/IPA scratch buffers.
+    let next_state = StoredState {
+        state_root: new_state_root.to_string(),
+        srs_max_degree: state.srs_max_degree,
+        alpha: state.alpha,
+        reserve_addresses: state.reserve_addresses.clone(),
+        reserve_balances: next_reserve_balances,
+        masked_polynomial_coeffs: state.masked_polynomial_coeffs.clone(),
+        accumulator_hex: state.accumulator_hex.clone(),
+        balance_total: next_balance_total,
+        balance_blind: next_balance_blind,
+        balance_commitment_hex: next_balance_commitment_hex,
     };
 
     Ok(UpdateResult {

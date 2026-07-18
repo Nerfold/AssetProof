@@ -23,6 +23,148 @@ pub struct InitProofResult {
     pub proof: StoredInitProof,
 }
 
+/// Builds the private state that a successful initialization would leave
+/// behind, without producing or accepting an initialization proof.
+///
+/// This is intentionally restricted to benchmark/fixture preparation.  It
+/// preserves the real root-polynomial, KZG accumulator, reserve balances, and
+/// Pedersen balance commitment consumed by `apply_update`; only the expensive
+/// SP1 ownership/chain-state proof is skipped.
+pub fn build_mock_initialized_state(
+    reserve_entries: &[ReserveEntry],
+    state_root: &str,
+    srs: &Srs,
+) -> Result<StoredState, String> {
+    if reserve_entries.is_empty() {
+        return Err("reserve set must not be empty".to_string());
+    }
+    if reserve_entries.len() > srs.max_degree {
+        return Err(format!(
+            "reserve set size {} exceeds SRS degree bound {}",
+            reserve_entries.len(),
+            srs.max_degree
+        ));
+    }
+    if reserve_entries.iter().any(|entry| entry.balance < 0) {
+        return Err("reserve balances must be non-negative".to_string());
+    }
+
+    let mut canonical_entries = reserve_entries
+        .iter()
+        .map(|entry| {
+            Ok((
+                common::encoding::encode_address(&entry.address)?,
+                entry.clone(),
+            ))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    canonical_entries.sort_by(|left, right| left.0.into_bigint().cmp(&right.0.into_bigint()));
+
+    let mut roots = Vec::with_capacity(canonical_entries.len());
+    let mut reserve_addresses = Vec::with_capacity(canonical_entries.len());
+    let mut reserve_balances = Vec::with_capacity(canonical_entries.len());
+    for (root, entry) in canonical_entries {
+        roots.push(root);
+        reserve_addresses.push(entry.address);
+        reserve_balances.push(entry.balance);
+    }
+    if !is_strictly_ordered(&roots) {
+        return Err("reserve addresses must be canonical and duplicate-free".to_string());
+    }
+
+    let mut rng = rand::rngs::OsRng;
+    let mut alpha = Fr::rand(&mut rng);
+    while alpha.is_zero() {
+        alpha = Fr::rand(&mut rng);
+    }
+    let polynomial = product_from_roots(&roots).mul_scalar(alpha);
+    let accumulator = commit_g1(srs, &polynomial)?;
+    let balance_total = reserve_balances.iter().try_fold(0i128, |sum, balance| {
+        sum.checked_add(*balance)
+            .ok_or_else(|| "reserve balance total overflow".to_string())
+    })?;
+    let balance_blind = Fr::rand(&mut rng);
+    let balance_commitment = commit_balance(balance_total, balance_blind);
+
+    Ok(StoredState {
+        state_root: state_root.to_string(),
+        srs_max_degree: srs.max_degree,
+        alpha,
+        reserve_addresses,
+        reserve_balances,
+        masked_polynomial_coeffs: polynomial.coeffs,
+        accumulator_hex: point_g1_to_hex(&accumulator)?,
+        balance_total,
+        balance_blind,
+        balance_commitment_hex: point_g1_to_hex(&balance_commitment)?,
+    })
+}
+
+/// Validates a persisted mock-initialized state before it is used as the
+/// untimed starting point of an update benchmark.
+pub fn validate_mock_initialized_state_shape(srs: &Srs, state: &StoredState) -> Result<(), String> {
+    if state.srs_max_degree != srs.max_degree {
+        return Err("mock initialized state SRS degree mismatch".to_string());
+    }
+    if state.reserve_addresses.is_empty()
+        || state.reserve_addresses.len() != state.reserve_balances.len()
+    {
+        return Err("invalid mock initialized reserve vectors".to_string());
+    }
+    if state.reserve_addresses.len() > srs.max_degree {
+        return Err("mock initialized reserve set exceeds SRS degree".to_string());
+    }
+    if state.masked_polynomial_coeffs.len() != state.reserve_addresses.len() + 1 {
+        return Err("mock initialized polynomial degree mismatch".to_string());
+    }
+    if state.reserve_balances.iter().any(|balance| *balance < 0) {
+        return Err("mock initialized state contains a negative balance".to_string());
+    }
+    if state.alpha.is_zero() {
+        return Err("mock initialized alpha is zero".to_string());
+    }
+    let balance_total = state
+        .reserve_balances
+        .iter()
+        .try_fold(0i128, |sum, balance| {
+            sum.checked_add(*balance)
+                .ok_or_else(|| "mock initialized balance total overflow".to_string())
+        })?;
+    if balance_total != state.balance_total {
+        return Err("mock initialized balance total mismatch".to_string());
+    }
+    let balance_commitment = commit_balance(state.balance_total, state.balance_blind);
+    if point_g1_to_hex(&balance_commitment)? != state.balance_commitment_hex {
+        return Err("mock initialized balance commitment mismatch".to_string());
+    }
+    let _ = point_g1_from_hex(&state.accumulator_hex)
+        .map_err(|err| format!("invalid mock initialized accumulator: {err}"))?;
+    Ok(())
+}
+
+/// Performs the expensive one-time polynomial and accumulator validation used
+/// while preparing the persisted benchmark artifact.
+pub fn verify_mock_initialized_state(srs: &Srs, state: &StoredState) -> Result<(), String> {
+    validate_mock_initialized_state_shape(srs, state)?;
+    let roots = state
+        .reserve_addresses
+        .iter()
+        .map(|address| common::encoding::encode_address(address))
+        .collect::<Result<Vec<_>, _>>()?;
+    if !is_strictly_ordered(&roots) {
+        return Err("mock initialized addresses are not canonical".to_string());
+    }
+    let polynomial = product_from_roots(&roots).mul_scalar(state.alpha);
+    if polynomial.coeffs != state.masked_polynomial_coeffs {
+        return Err("mock initialized polynomial does not match reserve roots".to_string());
+    }
+    let accumulator = commit_g1(srs, &polynomial)?;
+    if point_g1_to_hex(&accumulator)? != state.accumulator_hex {
+        return Err("mock initialized accumulator mismatch".to_string());
+    }
+    Ok(())
+}
+
 pub fn initialize_from_witnesses(
     ctx: &InitProvingContext,
     reserve_witnesses: &[InitReserveWitness],

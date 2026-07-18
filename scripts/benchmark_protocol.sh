@@ -10,6 +10,7 @@ MASTER_N="${MASTER_N:-1000000}"
 SAMPLES="${SAMPLES:-3}"
 WARMUP="${WARMUP:-1}"
 POA_SP1_PROOF_MODE="${POA_SP1_PROOF_MODE:-groth16}"
+BENCHMARK_OPERATIONS="${BENCHMARK_OPERATIONS:-initialization,insert,update}"
 # SP1's defaults target large proving machines (2^24-cycle shards and very
 # large trace buffers). Keep protocol benchmarks bounded on workstation-class
 # machines while allowing every value to be overridden explicitly.
@@ -34,6 +35,7 @@ echo "  master n:   $MASTER_N"
 echo "  samples:    $SAMPLES"
 echo "  warmup:     $WARMUP"
 echo "  SP1 mode:   $POA_SP1_PROOF_MODE"
+echo "  operations: $BENCHMARK_OPERATIONS"
 echo "  SP1 shard:  $SHARD_SIZE cycles"
 echo "  trace:      chunk=$MINIMAL_TRACE_CHUNK_THRESHOLD slots=$TRACE_CHUNK_SLOTS"
 echo "  gas trace:  chunk=$GAS_TRACE_CHUNK_THRESHOLD slots=$GAS_TRACE_CHUNK_SLOTS"
@@ -53,9 +55,17 @@ if ! grep -Fxq "fixture_version=ethereum-eip6800-verkle-v4-ecdsa" "$FIXTURE_DIR/
   exit 1
 fi
 
-echo
-echo "Preparing protocol SP1 setup (initialization + KZG insert) outside benchmark timers..."
-./poa sp1-setup
+case ",$BENCHMARK_OPERATIONS," in
+  *,all,*|*,initialization,*|*,init,*|*,insert,*)
+    echo
+    echo "Preparing protocol SP1 setup (initialization + KZG insert) outside benchmark timers..."
+    ./poa sp1-setup
+    ;;
+  *)
+    echo
+    echo "Skipping SP1 setup: selected operations do not use an SP1 guest."
+    ;;
+esac
 
 echo
 echo "Building release benchmark binary outside benchmark timers..."
@@ -71,5 +81,6 @@ exec ./target/release/poa-bench \
   --master-n "$MASTER_N" \
   --n "$N_SIZES" \
   --m "$M_SIZES" \
+  --operations "$BENCHMARK_OPERATIONS" \
   --samples "$SAMPLES" \
   --warmup "$WARMUP"

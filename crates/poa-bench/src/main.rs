@@ -6,13 +6,16 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use common::crypto::scalar_to_hex;
-use common::io::{encode_proof_binary, read_srs, write_init, write_srs};
+use common::io::{encode_proof_binary, read_srs, read_state, write_init, write_srs, write_state};
 use common::types::{
-    Delta, EthereumVerkleBatchProofInput, InitProvingContext, InitReserveWitness, StoredInitProof,
-    StoredProof, StoredState,
+    Delta, EthereumVerkleBatchProofInput, InitProvingContext, InitReserveWitness, ReserveEntry,
+    StoredInitProof, StoredProof, StoredState,
 };
 use nizk_fixed_set::external::Sp1NativeProofAdapter;
-use nizk_fixed_set::init_proof::{initialize_from_witnesses_with_verkle_proof, InitProofResult};
+use nizk_fixed_set::init_proof::{
+    build_mock_initialized_state, initialize_from_witnesses_with_verkle_proof,
+    validate_mock_initialized_state_shape, verify_mock_initialized_state, InitProofResult,
+};
 use nizk_fixed_set::insert::{
     apply_insert, verify_insert_with_srs_and_policy, KzgInsertProof, KzgInsertWitness,
 };
@@ -43,6 +46,7 @@ struct Config {
     master_n: usize,
     n_sizes: Vec<usize>,
     m_sizes: Vec<usize>,
+    operations: Vec<BenchmarkOperation>,
     samples: usize,
     warmup: usize,
 }
@@ -51,6 +55,13 @@ struct Config {
 enum RunMode {
     Prepare,
     Benchmark,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BenchmarkOperation {
+    Initialization,
+    Insert,
+    Update,
 }
 
 #[derive(Debug)]
@@ -130,6 +141,7 @@ fn run() -> Result<(), String> {
     println!("Dynamic PoA benchmark suite");
     println!("  n sizes: {:?}", config.n_sizes);
     println!("  m sizes: {:?}", config.m_sizes);
+    println!("  operations: {}", operations_label(&config.operations));
     println!("  samples: {}, warmup: {}", config.samples, config.warmup);
     println!("  output: {}", config.output_dir.display());
 
@@ -146,16 +158,22 @@ fn run() -> Result<(), String> {
         }
 
         let reserve_path = ethereum_fixture::init_proof_path(&master_dir, n);
+        let initialized_state_path = mock_initialized_state_path(&master_dir, n);
         if config.require_existing {
             require_existing(&reserve_path, "Ethereum Verkle initialization fixture")?;
             require_existing(
                 &ethereum_fixture::master_accounts_path(&master_dir),
                 "master Ethereum account store",
             )?;
-            require_existing(
-                &ethereum_fixture::insert_proof_path(&master_dir),
-                "master Ethereum insertion proof",
-            )?;
+            if includes_operation(&config, BenchmarkOperation::Insert) {
+                require_existing(
+                    &ethereum_fixture::insert_proof_path(&master_dir),
+                    "master Ethereum insertion proof",
+                )?;
+            }
+            if !includes_operation(&config, BenchmarkOperation::Initialization) {
+                require_existing(&initialized_state_path, "mock initialized polynomial state")?;
+            }
         }
         let reserve_load_start = Instant::now();
         let fixture = ethereum_fixture::load_init_fixture(
@@ -189,76 +207,102 @@ fn run() -> Result<(), String> {
             reused: true,
         });
 
-        let (base_state, init_summary) = benchmark_init(
-            &config,
-            n,
-            &srs,
-            &fixture.state_root,
-            &fixture.witnesses,
-            &fixture.verkle_proof,
-            reserve_load,
-            srs_load,
-            &mut samples,
-        )?;
-        summaries.push(init_summary);
-        ensure_initialized_state_matches_fixture(&base_state, &fixture)?;
-
-        let insert_summary = benchmark_insert(
-            &config,
-            n,
-            &srs,
-            &base_state,
-            &fixture.insert,
-            srs_load,
-            &mut samples,
-        )?;
-        summaries.push(insert_summary);
-
-        for &m in &config.m_sizes {
-            if m > n {
-                return Err(format!("m={m} cannot exceed n={n}"));
-            }
-            let delta_path = ethereum_fixture::delta_fixture_path(&master_dir, n, m);
-            if config.require_existing {
-                require_existing(&delta_path, "Ethereum Verkle transition fixture")?;
-            }
-            let (deltas, new_state_root, fixture_time, delta_load, fixture_reused) =
-                ethereum_fixture::ensure_delta_fixture(&delta_path, &fixture, m)?;
-            loads.push(LoadRecord {
-                n,
-                m,
-                phase: "ethereum_transition_fixture_generation",
-                elapsed: fixture_time,
-                bytes: file_len(&delta_path)?,
-                reused: fixture_reused,
-            });
-            if deltas.len() != m {
-                return Err(format!(
-                    "fixture {} contains {} deltas, expected {m}",
-                    delta_path.display(),
-                    deltas.len()
-                ));
-            }
-            loads.push(LoadRecord {
-                n,
-                m,
-                phase: "ethereum_transition_fixture_load",
-                elapsed: delta_load,
-                bytes: file_len(&delta_path)?,
-                reused: true,
-            });
-            summaries.push(benchmark_update(
+        let base_state = if includes_operation(&config, BenchmarkOperation::Initialization) {
+            let (state, init_summary) = benchmark_init(
                 &config,
                 n,
-                m,
                 &srs,
-                &base_state,
-                &deltas,
-                &new_state_root,
-                delta_load,
+                &fixture.state_root,
+                &fixture.witnesses,
+                &fixture.verkle_proof,
+                reserve_load,
                 srs_load,
                 &mut samples,
-            )?);
+            )?;
+            summaries.push(init_summary);
+            state
+        } else {
+            let state_load_start = Instant::now();
+            let state = read_state(&initialized_state_path)?;
+            validate_mock_initialized_state_shape(&srs, &state)?;
+            let state_load = state_load_start.elapsed();
+            loads.push(LoadRecord {
+                n,
+                m: 0,
+                phase: "mock_initialized_state_load_and_validation",
+                elapsed: state_load,
+                bytes: file_len(&initialized_state_path)?,
+                reused: true,
+            });
+            println!(
+                "-- using persisted mock initialized polynomial n={n}: load+validation={} bytes={}",
+                human_duration(state_load),
+                human_bytes(file_len(&initialized_state_path)? as usize),
+            );
+            state
+        };
+        ensure_initialized_state_matches_fixture(&base_state, &fixture)?;
+
+        if includes_operation(&config, BenchmarkOperation::Insert) {
+            let insert_summary = benchmark_insert(
+                &config,
+                n,
+                &srs,
+                &base_state,
+                &fixture.insert,
+                srs_load,
+                &mut samples,
+            )?;
+            summaries.push(insert_summary);
+        }
+
+        if includes_operation(&config, BenchmarkOperation::Update) {
+            for &m in &config.m_sizes {
+                if m > n {
+                    return Err(format!("m={m} cannot exceed n={n}"));
+                }
+                let delta_path = ethereum_fixture::delta_fixture_path(&master_dir, n, m);
+                if config.require_existing {
+                    require_existing(&delta_path, "Ethereum Verkle transition fixture")?;
+                }
+                let (deltas, new_state_root, fixture_time, delta_load, fixture_reused) =
+                    ethereum_fixture::ensure_delta_fixture(&delta_path, &fixture, m)?;
+                loads.push(LoadRecord {
+                    n,
+                    m,
+                    phase: "ethereum_transition_fixture_generation",
+                    elapsed: fixture_time,
+                    bytes: file_len(&delta_path)?,
+                    reused: fixture_reused,
+                });
+                if deltas.len() != m {
+                    return Err(format!(
+                        "fixture {} contains {} deltas, expected {m}",
+                        delta_path.display(),
+                        deltas.len()
+                    ));
+                }
+                loads.push(LoadRecord {
+                    n,
+                    m,
+                    phase: "ethereum_transition_fixture_load",
+                    elapsed: delta_load,
+                    bytes: file_len(&delta_path)?,
+                    reused: true,
+                });
+                summaries.push(benchmark_update(
+                    &config,
+                    n,
+                    m,
+                    &srs,
+                    &base_state,
+                    &deltas,
+                    &new_state_root,
+                    delta_load,
+                    srs_load,
+                    &mut samples,
+                )?);
+            }
         }
     }
 
@@ -297,13 +341,7 @@ fn prepare_benchmark_inputs(config: &Config) -> Result<(), String> {
         format!("m_sizes={:?}", config.m_sizes),
     ];
     let (max_n, srs_degree, max_g2_degree) = benchmark_srs_spec(config)?;
-    let (srs, _, _) = prepare_srs(&config.srs_dir, max_n, srs_degree, max_g2_degree)?;
-    drop(srs);
     let prepared_srs_path = srs_path(&config.srs_dir, srs_degree, max_g2_degree);
-    manifest.push(format!("srs_path={}", prepared_srs_path.display()));
-    manifest.push(format!("srs_max_degree={srs_degree}"));
-    manifest.push(format!("srs_max_g2_degree={max_g2_degree}"));
-    manifest.push(format!("srs_bytes={}", file_len(&prepared_srs_path)?));
 
     let master_dir = master_fixture_dir(&config.fixture_dir, config.master_n);
     println!(
@@ -331,6 +369,13 @@ fn prepare_benchmark_inputs(config: &Config) -> Result<(), String> {
         "master.accounts_bytes={}",
         file_len(&ethereum_fixture::master_accounts_path(&master_dir))?
     ));
+
+    println!("\n== preparing shared update KZG SRS ==");
+    let (srs, _, _) = prepare_srs(&config.srs_dir, max_n, srs_degree, max_g2_degree)?;
+    manifest.push(format!("srs_path={}", prepared_srs_path.display()));
+    manifest.push(format!("srs_max_degree={srs_degree}"));
+    manifest.push(format!("srs_max_g2_degree={max_g2_degree}"));
+    manifest.push(format!("srs_bytes={}", file_len(&prepared_srs_path)?));
 
     let largest_n = config.n_sizes.iter().copied().max().unwrap_or_default();
     for &n in &config.n_sizes {
@@ -369,6 +414,41 @@ fn prepare_benchmark_inputs(config: &Config) -> Result<(), String> {
             fixture.insert.proof.len()
         ));
 
+        let initialized_state_path = mock_initialized_state_path(&master_dir, n);
+        let state_prepare_start = Instant::now();
+        let state_reused = initialized_state_path.is_file();
+        let initialized_state = if state_reused {
+            let state = read_state(&initialized_state_path)?;
+            verify_mock_initialized_state(&srs, &state)?;
+            state
+        } else {
+            let entries = fixture
+                .witnesses
+                .iter()
+                .map(|witness| ReserveEntry {
+                    address: witness.address.clone(),
+                    balance: witness.balance,
+                })
+                .collect::<Vec<_>>();
+            let state = build_mock_initialized_state(&entries, &fixture.state_root, &srs)?;
+            write_state(&initialized_state_path, &state)?;
+            state
+        };
+        ensure_initialized_state_matches_fixture(&initialized_state, &fixture)?;
+        println!(
+            "   mock initialized polynomial: preparation={} bytes={} reused={state_reused}",
+            human_duration(state_prepare_start.elapsed()),
+            human_bytes(file_len(&initialized_state_path)? as usize),
+        );
+        manifest.push(format!(
+            "n.{n}.mock_initialized_state_path={}",
+            initialized_state_path.display()
+        ));
+        manifest.push(format!(
+            "n.{n}.mock_initialized_state_bytes={}",
+            file_len(&initialized_state_path)?
+        ));
+
         for &m in &config.m_sizes {
             if m > n {
                 return Err(format!("m={m} cannot exceed n={n}"));
@@ -403,6 +483,10 @@ fn master_fixture_dir(fixture_dir: &Path, max_n: usize) -> PathBuf {
     fixture_dir
         .join(format!("master_n_{max_n}"))
         .join(FIXTURE_VERSION)
+}
+
+fn mock_initialized_state_path(master_dir: &Path, n: usize) -> PathBuf {
+    master_dir.join(format!("mock-initialized-state-n-{n}.txt"))
 }
 
 fn benchmark_srs_spec(config: &Config) -> Result<(usize, usize, usize), String> {
@@ -1004,9 +1088,10 @@ fn write_summary_markdown(
     let mut body = String::new();
     body.push_str("# Dynamic PoA benchmark report\n\n");
     body.push_str(&format!(
-        "- n sizes: `{:?}`\n- m sizes: `{:?}`\n- measured samples: `{}`\n- warmup samples: `{}`\n- SP1 proof mode: `{}`\n\n",
+        "- n sizes: `{:?}`\n- m sizes: `{:?}`\n- operations: `{}`\n- measured samples: `{}`\n- warmup samples: `{}`\n- SP1 proof mode: `{}`\n\n",
         config.n_sizes,
         config.m_sizes,
+        operations_label(&config.operations),
         config.samples,
         config.warmup,
         std::env::var("POA_SP1_PROOF_MODE").unwrap_or_else(|_| "groth16".to_string())
@@ -1059,6 +1144,7 @@ fn write_summary_markdown(
     body.push_str("- Initialization verification uses a development policy because the benchmark SRS is deterministic.\n");
     body.push_str("- Insert authenticates an additional EOA against the same Verkle root with a self-contained Verkle proof.\n");
     body.push_str("- Update verification uses the debug verifier and excludes canonical Sync/finality verification.\n");
+    body.push_str("- Update-only mode loads a persisted, structurally valid initialized root polynomial and KZG/balance commitments; it skips only the initialization proof and excludes that state loading/validation from prover time.\n");
     body.push_str(
         "- Proof size is measured after the timer using the labeled artifact encoding.\n",
     );
@@ -1103,6 +1189,7 @@ fn write_environment(config: &Config) -> Result<(), String> {
     values.insert("uname", command_output("uname", &["-a"]));
     values.insert("n_sizes", format!("{:?}", config.n_sizes));
     values.insert("m_sizes", format!("{:?}", config.m_sizes));
+    values.insert("operations", operations_label(&config.operations));
     values.insert("master_n", config.master_n.to_string());
     values.insert("samples", config.samples.to_string());
     values.insert("warmup", config.warmup.to_string());
@@ -1213,6 +1300,12 @@ fn parse_config() -> Result<Config, String> {
     let fixture_dir = PathBuf::from(required(&values, "--fixture-dir")?);
     let n_sizes = parse_sizes(required(&values, "--n")?, "n")?;
     let m_sizes = parse_sizes(required(&values, "--m")?, "m")?;
+    let operations = parse_operations(
+        values
+            .get("--operations")
+            .map(String::as_str)
+            .unwrap_or("initialization,insert,update"),
+    )?;
     let master_n = values
         .get("--master-n")
         .map(|value| {
@@ -1246,9 +1339,58 @@ fn parse_config() -> Result<Config, String> {
         master_n,
         n_sizes,
         m_sizes,
+        operations,
         samples,
         warmup,
     })
+}
+
+fn parse_operations(raw: &str) -> Result<Vec<BenchmarkOperation>, String> {
+    let expanded = if raw == "all" {
+        "initialization,insert,update"
+    } else {
+        raw
+    };
+    let mut operations = Vec::new();
+    for name in expanded
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    {
+        let operation = match name {
+            "initialization" | "init" => BenchmarkOperation::Initialization,
+            "insert" => BenchmarkOperation::Insert,
+            "update" => BenchmarkOperation::Update,
+            _ => {
+                return Err(format!(
+                    "unsupported benchmark operation {name}; use initialization, insert, update, or all"
+                ))
+            }
+        };
+        if !operations.contains(&operation) {
+            operations.push(operation);
+        }
+    }
+    if operations.is_empty() {
+        return Err("benchmark operations must not be empty".to_string());
+    }
+    Ok(operations)
+}
+
+fn includes_operation(config: &Config, operation: BenchmarkOperation) -> bool {
+    config.operations.contains(&operation)
+}
+
+fn operations_label(operations: &[BenchmarkOperation]) -> String {
+    operations
+        .iter()
+        .map(|operation| match operation {
+            BenchmarkOperation::Initialization => "initialization",
+            BenchmarkOperation::Insert => "insert",
+            BenchmarkOperation::Update => "update",
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn parse_bool(value: &str, name: &str) -> Result<bool, String> {

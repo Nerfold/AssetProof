@@ -481,6 +481,19 @@ params/srs/bench/
 ./scripts/benchmark_protocol.sh
 ```
 
+如果只需要隔离测试 update，不运行耗费资源的 initialization/insert SP1 proof，可复用准备
+阶段持久化的初始化后状态。该状态包含由 Mock 地址集合构造的真实根多项式、KZG
+accumulator、余额向量和 Pedersen balance commitment；只省略 initialization proof：
+
+```bash
+BENCHMARK_OPERATIONS=update SAMPLES=3 WARMUP=1 \
+  ./scripts/benchmark_protocol.sh
+```
+
+update-only 模式会跳过 `poa sp1-setup`。初始化后状态的加载和一致性校验记录在
+`loading.csv`，不计入 update prover/verifier time；MultiZKOpen、BP/IPA、range proof 和
+update verifier 仍完整运行。
+
 benchmark 脚本只加载并验证持久化数据；缺少任一指定规模的 SRS、初始化 fixture 或
 delta fixture 都会立即退出，不会在 benchmark 过程中自动生成。默认运行
 `3` 个 measured samples 和 `1` 个 warmup。可通过环境变量覆盖，例如：

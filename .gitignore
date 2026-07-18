@@ -21,6 +21,7 @@
 /inputs/
 /outputs/
 /params/
+/data/
 /vendor/bulletproofs-bls/.cargo-ok
 /vendor/bulletproofs-bls/.cargo_vcs_info.json
 /vendor/bulletproofs-bls/.github/

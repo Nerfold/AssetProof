@@ -49,6 +49,21 @@ POA_SP1_PROOF_MODE=compressed ./poa bootstrap
 Docker **不参与 guest 编译和 `sp1-setup`**；当前 SP1 依赖配置只在最终
 Groth16/Plonk gnark wrapping/verification 时调用 Docker。compressed 模式不需要 Docker。
 
+SP1 v6.2.4 使用的官方 gnark wrapper 镜像
+`ghcr.io/succinctlabs/sp1-gnark:v6.1.0` 目前只提供 `linux/amd64`。仓库入口和
+benchmark 脚本会在 Apple Silicon（M1/M2/M3/M4）上自动设置
+`DOCKER_DEFAULT_PLATFORM=linux/amd64`，由 Docker Desktop 模拟运行；第一次执行会先拉取
+该镜像，时间不计入 benchmark。若绕过脚本直接运行 Rust binary，需要在同一个 shell 中先执行：
+
+```bash
+export DOCKER_DEFAULT_PLATFORM=linux/amd64
+```
+
+如果 Docker Desktop 报 x86_64/Rosetta 相关错误，请在 Docker Desktop 设置中启用
+Rosetta 的 amd64 模拟；追求 wrapper 阶段的最高性能则应在 Linux x86_64 机器上运行。
+日志末尾在 Docker panic 后出现的 `artifact not found` 只是上游证明线程失败的连带错误，
+不表示 mock fixture、KZG SRS 或 `params/sp1` 丢失。
+
 手动安装时要求 Rust stable，并确保 `~/.cargo/bin` 与 `~/.sp1/bin` 在 `PATH` 中。
 
 ```bash
@@ -536,6 +551,37 @@ delta fixture 都会立即退出，不会在 benchmark 过程中自动生成。�
 SAMPLES=5 WARMUP=1 POA_SP1_PROOF_MODE=groth16 \
   ./scripts/benchmark_protocol.sh
 ```
+
+### SP1 阶段分析
+
+要分析 initialization 和 insert 的 guest 规模及每阶段耗时，使用独立的 profile 入口。
+它会为 `init-ownership`、`init-merkle` 和 `kzg-insert` 各额外执行一次 guest，采集
+instructions、SP1 gas、内存地址数、precompile syscall 次数和 guest 内部阶段 cycles，
+随后照常生成真实 proof 并记录 host/SP1 wall time。额外 execution probe 会单独报告，
+并从普通 benchmark 的 prover time 中扣除：
+
+```bash
+MASTER_N=16 N_SIZES=16 M_SIZES=16 \
+  OUTPUT_DIR=artifacts/benchmarks/sp1-profile-n16 \
+  ./poa profile-sp1
+```
+
+默认使用 `compressed`，不需要 Docker/Groth16 artifacts。若需要分析最终 wrapper，可显式
+使用 `POA_SP1_PROOF_MODE=groth16`，但仍需满足其 Docker 和内存要求。输出包括：
+
+```text
+profile/profile.md              易读阶段汇总
+profile/phase-times.csv         host、execute、SP1 prove、verifier wall time
+profile/guest-metrics.csv       instructions、gas、syscalls、各 guest 阶段 cycles
+profile/sp1-prover-spans.log    SP1 core shard、recursion、shrink/wrap tracing spans
+```
+
+guest 内部阶段使用 cycles 而不是墙钟时间，因为 zkVM 内部没有稳定的 wall clock，而且
+cycles 才是可跨机器比较的电路工作量。`sp1-prover-spans.log` 中并行 task 的 busy time
+可能重叠，不能直接相加当作总 prover time；总 wall time 以 `phase-times.csv` 为准。
+profile 模式会增加一次不生成 proof 的 guest execution，因此它是诊断模式；cycle marker
+只在这个 execution probe 中启用，真实 proof 中关闭。probe 已从报告中的 benchmark prover
+总时间扣除，正式发表总耗时仍应使用不带 `POA_SP1_PROFILE=1` 的普通 benchmark。
 
 KZG ceremony、subgroup 和 power-sequence 检查属于 `setup/import-srs` 参数认证阶段；
 `.meta` 文件中的 BLAKE3 digest 绑定认证后的完整 SRS artifact。proof verifier 不重新

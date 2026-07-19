@@ -1,14 +1,22 @@
 #!/usr/bin/env sh
 set -eu
 
+ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+cd "$ROOT_DIR"
+. "$ROOT_DIR/scripts/sp1-docker-env.sh"
+
 case "${1:-}" in
     bootstrap)
         shift
-        exec ./scripts/bootstrap.sh "$@"
+        exec "$ROOT_DIR/scripts/bootstrap.sh" "$@"
         ;;
     doctor)
         shift
-        exec ./scripts/doctor.sh "$@"
+        exec "$ROOT_DIR/scripts/doctor.sh" "$@"
+        ;;
+    profile-sp1)
+        shift
+        exec "$ROOT_DIR/scripts/profile_sp1_phases.sh" "$@"
         ;;
     sp1-setup)
         shift

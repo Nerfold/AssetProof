@@ -3,10 +3,13 @@ set -uo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$ROOT_DIR/scripts/sp1-version.env"
+source "$ROOT_DIR/scripts/sp1-docker-env.sh"
 cd "$ROOT_DIR"
 export PATH="$HOME/.cargo/bin:$HOME/.sp1/bin:$PATH"
 
 MODE="${POA_SP1_PROOF_MODE:-groth16}"
+SP1_GNARK_IMAGE="${SP1_GNARK_IMAGE:-ghcr.io/succinctlabs/sp1-gnark:$SP1_CIRCUIT_VERSION}"
+export SP1_GNARK_IMAGE
 errors=0
 
 ok() { printf '  [ok] %s\n' "$1"; }
@@ -16,6 +19,10 @@ printf 'Dynamic PoA environment doctor\n'
 printf '  proof mode: %s\n' "$MODE"
 printf '  SP1 toolchain pin: %s\n' "$SP1_TOOLCHAIN_VERSION"
 printf '  SP1 circuit pin: %s\n\n' "$SP1_CIRCUIT_VERSION"
+if [[ "$MODE" == "groth16" || "$MODE" == "plonk" ]]; then
+  printf '  gnark image: %s\n' "$SP1_GNARK_IMAGE"
+  printf '  Docker platform: %s\n\n' "${DOCKER_DEFAULT_PLATFORM:-native}"
+fi
 
 command -v cargo >/dev/null 2>&1 && ok "Rust/Cargo: $(cargo --version)" \
   || bad "Rust/Cargo (run ./poa bootstrap)"
@@ -52,6 +59,16 @@ case "$MODE" in
   groth16|plonk)
     if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
       ok "Docker daemon"
+      if docker image inspect "$SP1_GNARK_IMAGE" >/dev/null 2>&1; then
+        image_arch="$(docker image inspect --format '{{.Architecture}}' "$SP1_GNARK_IMAGE" 2>/dev/null || true)"
+        if [[ "${DOCKER_DEFAULT_PLATFORM:-}" == "linux/amd64" && "$image_arch" != "amd64" ]]; then
+          bad "SP1 gnark image has architecture ${image_arch:-unknown}, expected amd64 (run ./poa bootstrap)"
+        else
+          ok "SP1 gnark image: $SP1_GNARK_IMAGE (${image_arch:-architecture unknown})"
+        fi
+      else
+        bad "SP1 gnark image: $SP1_GNARK_IMAGE (run ./poa bootstrap)"
+      fi
     elif command -v docker >/dev/null 2>&1; then
       bad "Docker is installed but the daemon/socket is unavailable; start Docker Desktop or fix docker-group access"
     else

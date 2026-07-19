@@ -20,13 +20,34 @@ use sp1_zkvm::entrypoint;
 
 entrypoint!(main);
 
-fn main() {
-    let input: Sp1KzgInsertStdin = sp1_zkvm::io::read();
-    let public = verify_insert(input);
-    sp1_zkvm::io::commit(&public);
+macro_rules! cycle_start {
+    ($enabled:expr, $name:literal) => {
+        if $enabled {
+            println!(concat!("cycle-tracker-report-start: ", $name));
+        }
+    };
 }
 
-fn verify_insert(input: Sp1KzgInsertStdin) -> Sp1KzgInsertPublicValues {
+macro_rules! cycle_end {
+    ($enabled:expr, $name:literal) => {
+        if $enabled {
+            println!(concat!("cycle-tracker-report-end: ", $name));
+        }
+    };
+}
+
+fn main() {
+    let profile: bool = sp1_zkvm::io::read();
+    cycle_start!(profile, "input_decode");
+    let input: Sp1KzgInsertStdin = sp1_zkvm::io::read();
+    cycle_end!(profile, "input_decode");
+    let public = verify_insert(input, profile);
+    cycle_start!(profile, "public_values_commit");
+    sp1_zkvm::io::commit(&public);
+    cycle_end!(profile, "public_values_commit");
+}
+
+fn verify_insert(input: Sp1KzgInsertStdin, profile: bool) -> Sp1KzgInsertPublicValues {
     assert!(input.balance >= 0, "negative inserted balance");
     let expected_reserve_count_after = input
         .reserve_count_before
@@ -36,6 +57,7 @@ fn verify_insert(input: Sp1KzgInsertStdin) -> Sp1KzgInsertPublicValues {
         input.reserve_count_after, expected_reserve_count_after,
         "insert reserve count mismatch"
     );
+    cycle_start!(profile, "ownership_context_hash");
     let ownership_context = matches!(
         &input.ownership,
         Sp1OwnershipWitness::EthereumEoaSignature { .. }
@@ -47,12 +69,16 @@ fn verify_insert(input: Sp1KzgInsertStdin) -> Sp1KzgInsertPublicValues {
             &input.state_root,
         )
     });
+    cycle_end!(profile, "ownership_context_hash");
+    cycle_start!(profile, "ownership_verify");
     verify_ownership(
         &input.chain_id,
         ownership_context.as_ref(),
         &input.address,
         &input.ownership,
     );
+    cycle_end!(profile, "ownership_verify");
+    cycle_start!(profile, "merkle_balance_verify");
     verify_chain_balance(
         &input.chain_id,
         &input.state_root,
@@ -60,7 +86,9 @@ fn verify_insert(input: Sp1KzgInsertStdin) -> Sp1KzgInsertPublicValues {
         input.balance,
         &input.chain_balance_proof,
     );
+    cycle_end!(profile, "merkle_balance_verify");
 
+    cycle_start!(profile, "address_and_balance_commitments");
     let encoded = encode_address(&input.address);
     assert_eq!(
         scalar_bytes(&encoded),
@@ -81,7 +109,9 @@ fn verify_insert(input: Sp1KzgInsertStdin) -> Sp1KzgInsertPublicValues {
         &BigUint::from_bytes_le(&input.balance_blind_delta_le),
     );
     assert_eq!(point_to_io(&c_x), input.c_x, "C_x opening mismatch");
+    cycle_end!(profile, "address_and_balance_commitments");
 
+    cycle_start!(profile, "quotient_commitment_hash");
     assert_eq!(
         input.quotient_coefficients_le.len(),
         input.reserve_count_before,
@@ -96,6 +126,8 @@ fn verify_insert(input: Sp1KzgInsertStdin) -> Sp1KzgInsertPublicValues {
         input.quotient_commitment,
         "insert salted quotient commitment mismatch"
     );
+    cycle_end!(profile, "quotient_commitment_hash");
+    cycle_start!(profile, "quotient_horner_evaluation");
     let zeta = from_le_bytes(input.zeta_le);
     let zeta_montgomery = to_montgomery(zeta);
     let quotient_eval =
@@ -114,6 +146,8 @@ fn verify_insert(input: Sp1KzgInsertStdin) -> Sp1KzgInsertPublicValues {
         input.quotient_eval_le,
         "insert quotient evaluation mismatch"
     );
+    cycle_end!(profile, "quotient_horner_evaluation");
+    cycle_start!(profile, "quotient_commitment_opening");
     let c_quotient_eval = commit_two(
         &input.eval_value_base,
         &BigUint::from_bytes_le(&input.quotient_eval_le),
@@ -130,6 +164,7 @@ fn verify_insert(input: Sp1KzgInsertStdin) -> Sp1KzgInsertPublicValues {
         input.c_balance_delta,
         "balance-delta commitment opening mismatch"
     );
+    cycle_end!(profile, "quotient_commitment_opening");
 
     let uses_mock_inputs = matches!(input.ownership, Sp1OwnershipWitness::MockPrivateKey { .. })
         || matches!(
@@ -137,16 +172,18 @@ fn verify_insert(input: Sp1KzgInsertStdin) -> Sp1KzgInsertPublicValues {
             Sp1ChainBalanceProof::MockBinding { .. }
         );
 
-    Sp1KzgInsertPublicValues {
+    cycle_start!(profile, "public_values_build");
+    let commitment_params_digest_hex = commitment_params_digest(
+        &input.eval_value_base,
+        &input.eval_blind_base,
+        &input.balance_value_base,
+        &input.balance_blind_base,
+    );
+    let public = Sp1KzgInsertPublicValues {
         chain_id: input.chain_id,
         state_root: input.state_root,
         zeta_le: input.zeta_le,
-        commitment_params_digest_hex: commitment_params_digest(
-            &input.eval_value_base,
-            &input.eval_blind_base,
-            &input.balance_value_base,
-            &input.balance_blind_base,
-        ),
+        commitment_params_digest_hex,
         uses_mock_inputs,
         c_x: input.c_x,
         quotient_commitment: input.quotient_commitment,
@@ -159,7 +196,9 @@ fn verify_insert(input: Sp1KzgInsertStdin) -> Sp1KzgInsertPublicValues {
         reserve_count_before: input.reserve_count_before,
         reserve_count_after: input.reserve_count_after,
         transcript_hex: input.transcript_hex,
-    }
+    };
+    cycle_end!(profile, "public_values_build");
+    public
 }
 
 fn commit_two(

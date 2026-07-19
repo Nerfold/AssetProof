@@ -1,5 +1,6 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
 
 use ark_bls12_381::{Fr, G1Projective};
 use ark_ff::{BigInteger, PrimeField};
@@ -71,7 +72,12 @@ pub fn prove_init_ownership(
     ownership_stdin: Sp1InitOwnershipStdin,
 ) -> Result<ProvedInitOwnership, String> {
     let ownership_ctx = sp1_ownership_context()?;
-    let ownership_bundle = run_sp1_proof(&ownership_ctx, ownership_stdin, "init ownership")?;
+    let ownership_bundle = run_sp1_proof(
+        &ownership_ctx,
+        INIT_OWNERSHIP_ELF,
+        ownership_stdin,
+        "init-ownership",
+    )?;
     Ok(ProvedInitOwnership {
         proof_hex: serialize_sp1_proof(&ownership_bundle)?,
         vk_hex: serialize_sp1_vk(&ownership_ctx)?,
@@ -82,7 +88,7 @@ pub fn prove_init_ownership(
 
 pub fn prove_init_merkle(merkle_stdin: Sp1InitStdin) -> Result<ProvedInitMerkle, String> {
     let merkle_ctx = sp1_context()?;
-    let merkle_bundle = run_sp1_proof(&merkle_ctx, merkle_stdin, "init Merkle")?;
+    let merkle_bundle = run_sp1_proof(&merkle_ctx, INIT_ELF, merkle_stdin, "init-merkle")?;
     Ok(ProvedInitMerkle {
         proof_hex: serialize_sp1_proof(&merkle_bundle)?,
         vk_hex: serialize_sp1_vk(&merkle_ctx)?,
@@ -387,6 +393,7 @@ fn sp1_context() -> Result<Sp1InitContext, String> {
     if let Some(ctx) = guard.as_ref() {
         return Ok(ctx.clone());
     }
+    let start = Instant::now();
     let setup_dir = default_setup_dir();
     let prover = ProverClient::builder().cpu().build();
     let vk = load_init_vk(&setup_dir, INIT_ELF)?;
@@ -396,6 +403,7 @@ fn sp1_context() -> Result<Sp1InitContext, String> {
         pk: Arc::new(pk),
     };
     *guard = Some(ctx.clone());
+    common::profiling::record_phase("sp1-context", "init-merkle", start.elapsed());
     Ok(ctx)
 }
 
@@ -407,6 +415,7 @@ fn sp1_ownership_context() -> Result<Sp1InitContext, String> {
     if let Some(ctx) = guard.as_ref() {
         return Ok(ctx.clone());
     }
+    let start = Instant::now();
     let setup_dir = default_setup_dir();
     let prover = ProverClient::builder().cpu().build();
     let vk = load_init_ownership_vk(&setup_dir, INIT_OWNERSHIP_ELF)?;
@@ -416,24 +425,46 @@ fn sp1_ownership_context() -> Result<Sp1InitContext, String> {
         pk: Arc::new(pk),
     };
     *guard = Some(ctx.clone());
+    common::profiling::record_phase("sp1-context", "init-ownership", start.elapsed());
     Ok(ctx)
 }
 
 fn run_sp1_proof<T: serde::Serialize>(
     ctx: &Sp1InitContext,
+    elf: sp1_sdk::Elf,
     stdin_value: T,
-    label: &str,
+    guest: &str,
 ) -> Result<SP1ProofWithPublicValues, String> {
+    if common::profiling::enabled() {
+        let execution_span = tracing::info_span!("poa_sp1_execute", guest = guest);
+        let _execution_span_guard = execution_span.enter();
+        let mut execution_stdin = SP1Stdin::new();
+        execution_stdin.write(&true);
+        execution_stdin.write(&stdin_value);
+        let start = Instant::now();
+        let (_, report) = ctx
+            .prover
+            .execute(elf, execution_stdin)
+            .calculate_gas(true)
+            .run()
+            .map_err(|err| format!("sp1 {guest} profile execute failed: {err}"))?;
+        crate::profiling::record_execution(guest, start.elapsed(), &report);
+    }
     let mut stdin = SP1Stdin::new();
+    stdin.write(&false);
     stdin.write(&stdin_value);
     drop(stdin_value);
     let request = ctx.prover.prove(&ctx.pk, stdin);
+    let proof_span = tracing::info_span!("poa_sp1_proof", guest = guest);
+    let _proof_span_guard = proof_span.enter();
+    let prove_start = Instant::now();
     let result = match configured_proof_mode()? {
         ConfiguredProofMode::Groth16 => request.groth16().run(),
         ConfiguredProofMode::Plonk => request.plonk().run(),
         ConfiguredProofMode::Compressed => request.compressed().run(),
     };
-    result.map_err(|err| format!("sp1 {label} prove failed: {err}"))
+    common::profiling::record_phase("sp1-prove", guest, prove_start.elapsed());
+    result.map_err(|err| format!("sp1 {guest} prove failed: {err}"))
 }
 
 fn decode_public_values(bundle: &SP1ProofWithPublicValues) -> Sp1InitPublicValues {

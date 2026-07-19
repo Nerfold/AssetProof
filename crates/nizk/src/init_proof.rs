@@ -178,6 +178,7 @@ pub fn initialize_from_witnesses_with_adapter(
     srs: &Srs,
     external: &impl ExternalProofAdapter,
 ) -> Result<InitProofResult, String> {
+    let validation_timer = common::profiling::PhaseTimer::start("init-host", "witness_validation");
     if reserve_witnesses.is_empty() {
         return Err("reserve set must not be empty".to_string());
     }
@@ -195,6 +196,7 @@ pub fn initialize_from_witnesses_with_adapter(
             balance: witness.balance,
         })
         .collect::<Vec<_>>();
+    validation_timer.finish();
     initialize_core(ctx, &reserve_entries, reserve_witnesses, srs)
 }
 
@@ -243,6 +245,8 @@ fn initialize_core(
     reserve_witnesses: &[InitReserveWitness],
     srs: &Srs,
 ) -> Result<InitProofResult, String> {
+    let total_timer =
+        common::profiling::PhaseTimer::start("init-host", "total_including_profile_probe");
     if reserve_entries.is_empty() {
         return Err("reserve set must not be empty".to_string());
     }
@@ -260,6 +264,8 @@ fn initialize_core(
         return Err("reserve entries and init witnesses length mismatch".to_string());
     }
 
+    let canonical_timer =
+        common::profiling::PhaseTimer::start("init-host", "canonicalize_addresses");
     let mut canonical_entries = Vec::with_capacity(reserve_entries.len());
     for (index, (entry, _witness)) in reserve_entries
         .iter()
@@ -284,7 +290,10 @@ fn initialize_core(
     if !is_strictly_ordered(&roots) {
         return Err("reserve addresses must be canonical and duplicate-free".to_string());
     }
+    canonical_timer.finish();
 
+    let polynomial_timer =
+        common::profiling::PhaseTimer::start("init-host", "polynomial_construction");
     let mut rng = rand::rngs::OsRng;
     let mut alpha = Fr::rand(&mut rng);
     while alpha.is_zero() {
@@ -297,7 +306,12 @@ fn initialize_core(
     let f_s = product_from_roots(&roots);
     let p_s = f_s.mul_scalar(alpha);
     drop(f_s);
+    polynomial_timer.finish();
+    let accumulator_timer =
+        common::profiling::PhaseTimer::start("init-host", "kzg_accumulator_commit");
     let accumulator = commit_g1(srs, &p_s)?;
+    accumulator_timer.finish();
+    let balance_timer = common::profiling::PhaseTimer::start("init-host", "balance_commitment");
     let balance_total = reserve_balances.iter().try_fold(0i128, |sum, balance| {
         sum.checked_add(*balance)
             .ok_or_else(|| "reserve balance total overflow".to_string())
@@ -307,7 +321,10 @@ fn initialize_core(
     let mut shape_salt = [0u8; 32];
     rng.fill_bytes(&mut shape_salt);
     let c_shape = sp1_host::init::shape_commitment(alpha, &roots, &shape_salt);
+    balance_timer.finish();
 
+    let opening_timer =
+        common::profiling::PhaseTimer::start("init-host", "challenge_kzg_open_zkopen");
     let zeta = derive_zeta(
         &ctx.chain_id,
         &ctx.state_root,
@@ -332,6 +349,9 @@ fn initialize_core(
         &kzg_opening_proof,
         "dynamic-poa-init-eval-zkopen",
     )?;
+    opening_timer.finish();
+    let transcript_timer =
+        common::profiling::PhaseTimer::start("init-host", "transcript_and_generators");
     let transcript_hex = build_transcript_hex(
         &ctx.chain_id,
         &ctx.state_root,
@@ -348,9 +368,12 @@ fn initialize_core(
     let balance_blind_base = derive_generator("balance-h", 0);
     let eval_value_base = derive_generator("eval-v", 0);
     let eval_blind_base = derive_generator("eval-h", 0);
+    transcript_timer.finish();
     // Prove ownership first and release its linear-size stdin before building
     // the Merkle/protocol stdin. This keeps the two SP1 executions genuinely
     // sequential instead of retaining both witness encodings at peak memory.
+    let ownership_stdin_timer =
+        common::profiling::PhaseTimer::start("init-host", "ownership_stdin_encode");
     let ownership_stdin = sp1_host::init::build_init_ownership_stdin(
         &ctx.chain_id,
         &ctx.state_root,
@@ -359,8 +382,14 @@ fn initialize_core(
         &reserve_balances,
         &canonical_witnesses,
     )?;
+    ownership_stdin_timer.finish();
+    let ownership_prove_timer =
+        common::profiling::PhaseTimer::start("init-host", "ownership_sp1_with_profile_probe");
     let ownership_sp1 = sp1_host::init::prove_init_ownership(ownership_stdin)?;
+    ownership_prove_timer.finish();
 
+    let merkle_stdin_timer =
+        common::profiling::PhaseTimer::start("init-host", "merkle_stdin_encode");
     let merkle_stdin = sp1_host::init::build_init_merkle_stdin(
         &ctx.chain_id,
         &ctx.state_root,
@@ -386,7 +415,11 @@ fn initialize_core(
         &canonical_witnesses,
         ctx.chain_batch_proof.as_ref(),
     )?;
+    merkle_stdin_timer.finish();
+    let merkle_prove_timer =
+        common::profiling::PhaseTimer::start("init-host", "merkle_sp1_with_profile_probe");
     let merkle_sp1 = sp1_host::init::prove_init_merkle(merkle_stdin)?;
+    merkle_prove_timer.finish();
     if merkle_sp1.public.chain_id != ownership_sp1.public.chain_id
         || merkle_sp1.public.state_root != ownership_sp1.public.state_root
         || merkle_sp1.public.session_id != ownership_sp1.public.session_id
@@ -398,6 +431,8 @@ fn initialize_core(
         );
     }
 
+    let assembly_timer =
+        common::profiling::PhaseTimer::start("init-host", "proof_and_state_assembly");
     let proof = StoredInitProof {
         scheme: "kzg-nizk-init-v8-zkopen-keccak-merkle-prefix-split".to_string(),
         mode: "sp1".to_string(),
@@ -434,6 +469,8 @@ fn initialize_core(
         balance_commitment_hex: proof.balance_commitment_hex.clone(),
     };
 
+    assembly_timer.finish();
+    total_timer.finish();
     Ok(InitProofResult { state, proof })
 }
 

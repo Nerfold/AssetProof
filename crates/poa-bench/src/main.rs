@@ -4,6 +4,8 @@ use std::hint::black_box;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
+use tracing_subscriber::fmt::format::FmtSpan;
+use tracing_subscriber::EnvFilter;
 
 use common::crypto::scalar_to_hex;
 use common::io::{encode_proof_binary, read_srs, read_state, write_init, write_srs, write_state};
@@ -117,6 +119,7 @@ fn run() -> Result<(), String> {
         .map_err(|err| format!("create {}: {err}", config.srs_dir.display()))?;
     fs::create_dir_all(&config.fixture_dir)
         .map_err(|err| format!("create {}: {err}", config.fixture_dir.display()))?;
+    let _tracing_guard = init_sp1_profile_tracing(&config.output_dir)?;
 
     if config.mode == RunMode::Prepare {
         return prepare_benchmark_inputs(&config);
@@ -355,6 +358,7 @@ fn run() -> Result<(), String> {
     write_load_csv(&config.output_dir.join("loading.csv"), &loads)?;
     write_summary_csv(&config.output_dir.join("summary.csv"), &summaries)?;
     write_summary_markdown(&config, &loads, &summaries)?;
+    common::profiling::write_reports(&config.output_dir.join("profile"))?;
 
     println!("\nbenchmark complete");
     println!(
@@ -370,7 +374,41 @@ fn run() -> Result<(), String> {
         "  loading times:   {}/loading.csv",
         config.output_dir.display()
     );
+    if common::profiling::enabled() {
+        println!(
+            "  phase profile:   {}/profile/profile.md",
+            config.output_dir.display()
+        );
+        println!(
+            "  SP1 span log:     {}/profile/sp1-prover-spans.log",
+            config.output_dir.display()
+        );
+    }
     Ok(())
+}
+
+fn init_sp1_profile_tracing(
+    output_dir: &Path,
+) -> Result<Option<tracing_appender::non_blocking::WorkerGuard>, String> {
+    if !common::profiling::enabled() {
+        return Ok(None);
+    }
+    let profile_dir = output_dir.join("profile");
+    fs::create_dir_all(&profile_dir)
+        .map_err(|err| format!("create {}: {err}", profile_dir.display()))?;
+    let appender = tracing_appender::rolling::never(&profile_dir, "sp1-prover-spans.log");
+    let (writer, guard) = tracing_appender::non_blocking(appender);
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        EnvFilter::new("sp1_prover=debug,sp1_core_executor=info,sp1_recursion_gnark_ffi=info")
+    });
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(writer)
+        .with_ansi(false)
+        .with_span_events(FmtSpan::CLOSE)
+        .try_init()
+        .map_err(|err| format!("initialize SP1 profile tracing: {err}"))?;
+    Ok(Some(guard))
 }
 
 fn prepare_benchmark_inputs(config: &Config) -> Result<(), String> {
@@ -606,6 +644,14 @@ fn benchmark_init(
     )?;
     for warmup in 0..config.warmup {
         println!("   warmup {}/{}", warmup + 1, config.warmup);
+        let _profile_context =
+            common::profiling::enter_context(common::profiling::ProfileContext {
+                operation: "initialization".to_string(),
+                n,
+                m: 0,
+                sample: warmup + 1,
+                run_kind: "warmup".to_string(),
+            });
         let ctx = InitProvingContext {
             chain_id: ethereum_fixture::CHAIN_ID.to_string(),
             state_root: state_root.to_string(),
@@ -623,6 +669,15 @@ fn benchmark_init(
     let mut proof_sizes = Vec::with_capacity(config.samples);
     let mut last_result: Option<InitProofResult> = None;
     for sample in 0..config.samples {
+        let _profile_context =
+            common::profiling::enter_context(common::profiling::ProfileContext {
+                operation: "initialization".to_string(),
+                n,
+                m: 0,
+                sample: sample + 1,
+                run_kind: "measured".to_string(),
+            });
+        let probe_before = common::profiling::probe_overhead();
         let prove_start = Instant::now();
         let ctx = InitProvingContext {
             chain_id: ethereum_fixture::CHAIN_ID.to_string(),
@@ -632,11 +687,16 @@ fn benchmark_init(
         };
         let result =
             initialize_from_witnesses_with_adapter(&ctx, witnesses, srs, &Sp1NativeProofAdapter)?;
-        let prover = prove_start.elapsed();
+        let prover_with_probe = prove_start.elapsed();
+        let probe_elapsed = common::profiling::probe_overhead().saturating_sub(probe_before);
+        let prover = prover_with_probe.saturating_sub(probe_elapsed);
+        common::profiling::record_phase("benchmark", "prover_excluding_profile_probe", prover);
+        common::profiling::record_phase("profiling", "excluded_guest_execute_probe", probe_elapsed);
 
         let verify_start = Instant::now();
         verify_init_with_policy(srs, &result.state.public_state(), &result.proof, &policy)?;
         let verifier = verify_start.elapsed();
+        common::profiling::record_phase("init-verifier", "total", verifier);
 
         let proof_path = config
             .output_dir
@@ -710,6 +770,14 @@ fn benchmark_insert(
     )?;
     for warmup in 0..config.warmup {
         println!("   warmup {}/{}", warmup + 1, config.warmup);
+        let _profile_context =
+            common::profiling::enter_context(common::profiling::ProfileContext {
+                operation: "insert".to_string(),
+                n,
+                m: 0,
+                sample: warmup + 1,
+                run_kind: "warmup".to_string(),
+            });
         let result = apply_insert(srs, state, &witness)?;
         verify_insert_with_srs_and_policy(
             srs,
@@ -725,9 +793,22 @@ fn benchmark_insert(
     let mut verifier_samples = Vec::with_capacity(config.samples);
     let mut proof_sizes = Vec::with_capacity(config.samples);
     for sample in 0..config.samples {
+        let _profile_context =
+            common::profiling::enter_context(common::profiling::ProfileContext {
+                operation: "insert".to_string(),
+                n,
+                m: 0,
+                sample: sample + 1,
+                run_kind: "measured".to_string(),
+            });
+        let probe_before = common::profiling::probe_overhead();
         let prove_start = Instant::now();
         let result = apply_insert(srs, state, &witness)?;
-        let prover = prove_start.elapsed();
+        let prover_with_probe = prove_start.elapsed();
+        let probe_elapsed = common::profiling::probe_overhead().saturating_sub(probe_before);
+        let prover = prover_with_probe.saturating_sub(probe_elapsed);
+        common::profiling::record_phase("benchmark", "prover_excluding_profile_probe", prover);
+        common::profiling::record_phase("profiling", "excluded_guest_execute_probe", probe_elapsed);
 
         let verify_start = Instant::now();
         verify_insert_with_srs_and_policy(
@@ -738,6 +819,7 @@ fn benchmark_insert(
             &policy,
         )?;
         let verifier = verify_start.elapsed();
+        common::profiling::record_phase("insert-verifier", "total", verifier);
 
         let encoded = encode_insert_proof_text(&result.proof)?;
         let proof_bytes = encoded.len();

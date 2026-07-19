@@ -1,5 +1,6 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
 
 use ark_bls12_381::{Fr, G1Projective};
 use ark_ec::CurveGroup;
@@ -122,16 +123,36 @@ pub fn prove(
     stdin_value: Sp1KzgInsertStdin,
 ) -> Result<(String, String, String, Sp1KzgInsertPublicValues), String> {
     let ctx = context()?;
+    if common::profiling::enabled() {
+        let execution_span = tracing::info_span!("poa_sp1_execute", guest = "kzg-insert");
+        let _execution_span_guard = execution_span.enter();
+        let mut execution_stdin = SP1Stdin::new();
+        execution_stdin.write(&true);
+        execution_stdin.write(&stdin_value);
+        let start = Instant::now();
+        let (_, report) = ctx
+            .prover
+            .execute(KZG_INSERT_ELF, execution_stdin)
+            .calculate_gas(true)
+            .run()
+            .map_err(|err| format!("SP1 KZG insert profile execute failed: {err}"))?;
+        crate::profiling::record_execution("kzg-insert", start.elapsed(), &report);
+    }
     let mut stdin = SP1Stdin::new();
+    stdin.write(&false);
     stdin.write(&stdin_value);
     drop(stdin_value);
     let request = ctx.prover.prove(&ctx.pk, stdin);
-    let bundle = match configured_proof_mode()? {
+    let proof_span = tracing::info_span!("poa_sp1_proof", guest = "kzg-insert");
+    let _proof_span_guard = proof_span.enter();
+    let prove_start = Instant::now();
+    let bundle_result = match configured_proof_mode()? {
         ConfiguredProofMode::Groth16 => request.groth16().run(),
         ConfiguredProofMode::Plonk => request.plonk().run(),
         ConfiguredProofMode::Compressed => request.compressed().run(),
-    }
-    .map_err(|err| format!("SP1 KZG insert prove failed: {err}"))?;
+    };
+    common::profiling::record_phase("sp1-prove", "kzg-insert", prove_start.elapsed());
+    let bundle = bundle_result.map_err(|err| format!("SP1 KZG insert prove failed: {err}"))?;
     let public_values = decode_public_values(&bundle);
     Ok((
         serialize_proof(&bundle)?,
@@ -176,6 +197,7 @@ fn context_with_setup_dir(setup_dir: &Path) -> Result<Context, String> {
     if let Some(ctx) = guard.as_ref() {
         return Ok(ctx.clone());
     }
+    let start = Instant::now();
     let prover = ProverClient::builder().cpu().build();
     let vk = load_kzg_insert_vk(setup_dir, KZG_INSERT_ELF)?;
     let pk = sp1_sdk::SP1ProvingKey::new(vk, KZG_INSERT_ELF);
@@ -184,6 +206,7 @@ fn context_with_setup_dir(setup_dir: &Path) -> Result<Context, String> {
         pk: Arc::new(pk),
     };
     *guard = Some(ctx.clone());
+    common::profiling::record_phase("sp1-context", "kzg-insert", start.elapsed());
     Ok(ctx)
 }
 

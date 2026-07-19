@@ -213,6 +213,10 @@ pub fn apply_insert_with_adapter(
     witness: &KzgInsertWitness,
     external: &impl ExternalProofAdapter,
 ) -> Result<KzgInsertResult, String> {
+    let total_timer =
+        common::profiling::PhaseTimer::start("insert-host", "total_including_profile_probe");
+    let validation_timer =
+        common::profiling::PhaseTimer::start("insert-host", "input_and_external_validation");
     if state.srs_max_degree != srs.max_degree {
         return Err("state SRS degree does not match provided SRS".to_string());
     }
@@ -244,7 +248,10 @@ pub fn apply_insert_with_adapter(
         witness.balance,
         &witness.chain_balance_artifact,
     )?;
+    validation_timer.finish();
 
+    let polynomial_timer =
+        common::profiling::PhaseTimer::start("insert-host", "polynomial_and_state_update");
     let old_p = Polynomial::from_coeffs(state.masked_polynomial_coeffs.clone());
     if old_p.degree() != state.reserve_addresses.len() {
         return Err(
@@ -292,7 +299,10 @@ pub fn apply_insert_with_adapter(
         .balance_total
         .checked_add(witness.balance)
         .ok_or_else(|| "inserted balance total overflow".to_string())?;
+    polynomial_timer.finish();
 
+    let quotient_timer =
+        common::profiling::PhaseTimer::start("insert-host", "quotient_and_commitments");
     let q_poly = old_p.quotient_at(x, y_x)?;
     if q_poly.coeffs.len() != state.reserve_addresses.len() {
         return Err("insert quotient must have exactly n coefficients".to_string());
@@ -332,7 +342,9 @@ pub fn apply_insert_with_adapter(
     let c_y = eval_commit(y, r_y);
     let c_y_prime = eval_commit(y_prime, r_y_prime);
     let c_q = eval_commit(q_zeta, r_q);
+    quotient_timer.finish();
 
+    let openings_timer = common::profiling::PhaseTimer::start("insert-host", "kzg_zkopens");
     let c_y_hex = point_g1_to_hex(&c_y)?;
     let c_y_prime_hex = point_g1_to_hex(&c_y_prime)?;
     let c_q_hex = point_g1_to_hex(&c_q)?;
@@ -362,6 +374,9 @@ pub fn apply_insert_with_adapter(
         &new_eval_opening,
         "dynamic-poa-insert-new-eval-zkopen",
     )?;
+    openings_timer.finish();
+    let relation_timer =
+        common::profiling::PhaseTimer::start("insert-host", "relation_bulletproof");
     let relation_proof = prove_insert_relation_logic(
         x,
         beta,
@@ -389,6 +404,8 @@ pub fn apply_insert_with_adapter(
         &old_balance_commitment_hex,
         &new_balance_commitment_hex,
     )?;
+    relation_timer.finish();
+    let range_timer = common::profiling::PhaseTimer::start("insert-host", "range_proof");
     let next_public_state = PublicState {
         state_root: state.state_root.clone(),
         srs_max_degree: state.srs_max_degree,
@@ -407,7 +424,10 @@ pub fn apply_insert_with_adapter(
         },
     )?
     .proof_hex;
+    range_timer.finish();
 
+    let stdin_timer =
+        common::profiling::PhaseTimer::start("insert-host", "transcript_and_sp1_stdin");
     let transcript_hex = build_transcript_hex(
         &state.state_root,
         &old_accumulator_hex,
@@ -458,12 +478,16 @@ pub fn apply_insert_with_adapter(
         next_reserve_count,
         &transcript_hex,
     )?;
+    stdin_timer.finish();
     // `sp1_stdin` now owns the coefficient encoding.  Keep only `new_p` for
     // the returned state while the zkVM prover allocates its trace.
     drop(q_poly);
     drop(old_p);
+    let sp1_timer =
+        common::profiling::PhaseTimer::start("insert-host", "insert_sp1_with_profile_probe");
     let (sp1_proof_hex, sp1_vk_hex, sp1_public_values_hex, sp1_public) =
         sp1_host::kzg_insert::prove(sp1_stdin)?;
+    sp1_timer.finish();
     if sp1_public.chain_id != witness.chain_id
         || sp1_public.state_root != state.state_root
         || sp1_public.zeta_le != fr_to_le_bytes(zeta)
@@ -476,6 +500,8 @@ pub fn apply_insert_with_adapter(
         return Err("SP1 KZG insert public values do not bind the insertion".to_string());
     }
 
+    let assembly_timer =
+        common::profiling::PhaseTimer::start("insert-host", "proof_and_state_assembly");
     let mut reserve_addresses = Vec::with_capacity(next_reserve_count);
     reserve_addresses.extend_from_slice(&state.reserve_addresses[..insertion_index]);
     reserve_addresses.push(witness.address.clone());
@@ -530,6 +556,8 @@ pub fn apply_insert_with_adapter(
         sp1_public_values_hex,
     };
 
+    assembly_timer.finish();
+    total_timer.finish();
     Ok(KzgInsertResult { next_state, proof })
 }
 

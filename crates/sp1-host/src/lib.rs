@@ -1,3 +1,4 @@
+mod profiling;
 mod proof_mode;
 
 pub mod init;

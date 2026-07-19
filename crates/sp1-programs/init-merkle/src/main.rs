@@ -20,13 +20,34 @@ use sp1_zkvm::entrypoint;
 
 entrypoint!(main);
 
-fn main() {
-    let input: Sp1InitStdin = sp1_zkvm::io::read();
-    let pv = verify_init(input);
-    sp1_zkvm::io::commit(&pv);
+macro_rules! cycle_start {
+    ($enabled:expr, $name:literal) => {
+        if $enabled {
+            println!(concat!("cycle-tracker-report-start: ", $name));
+        }
+    };
 }
 
-fn verify_init(input: Sp1InitStdin) -> Sp1InitPublicValues {
+macro_rules! cycle_end {
+    ($enabled:expr, $name:literal) => {
+        if $enabled {
+            println!(concat!("cycle-tracker-report-end: ", $name));
+        }
+    };
+}
+
+fn main() {
+    let profile: bool = sp1_zkvm::io::read();
+    cycle_start!(profile, "input_decode");
+    let input: Sp1InitStdin = sp1_zkvm::io::read();
+    cycle_end!(profile, "input_decode");
+    let pv = verify_init(input, profile);
+    cycle_start!(profile, "public_values_commit");
+    sp1_zkvm::io::commit(&pv);
+    cycle_end!(profile, "public_values_commit");
+}
+
+fn verify_init(input: Sp1InitStdin, profile: bool) -> Sp1InitPublicValues {
     assert_eq!(
         input.reserve_count,
         input.reserves.len(),
@@ -45,8 +66,11 @@ fn verify_init(input: Sp1InitStdin) -> Sp1InitPublicValues {
     let mut uses_mock_inputs = false;
     let expected_root = decode_hash(&input.state_root);
     if let Some(prefix_proof) = input.merkle_prefix_proof.as_ref() {
+        cycle_start!(profile, "merkle_prefix_verify");
         verify_merkle_prefix(&expected_root, &input.reserves, prefix_proof);
+        cycle_end!(profile, "merkle_prefix_verify");
     }
+    cycle_start!(profile, "reserve_scan_and_product");
     for reserve in &input.reserves {
         assert!(reserve.balance >= 0, "negative reserve balance");
         uses_mock_inputs |= matches!(
@@ -74,6 +98,7 @@ fn verify_init(input: Sp1InitStdin) -> Sp1InitPublicValues {
             .checked_add(reserve.balance)
             .expect("balance total overflow");
     }
+    cycle_end!(profile, "reserve_scan_and_product");
     assert_eq!(balance_total, input.balance_total, "balance total mismatch");
     assert_eq!(
         scalar_to_le_bytes(product),
@@ -84,27 +109,33 @@ fn verify_init(input: Sp1InitStdin) -> Sp1InitPublicValues {
         input.p_zeta_le, input.product_zeta_le,
         "p(zeta) and product(zeta) mismatch"
     );
+    cycle_start!(profile, "private_commitment_openings");
     verify_private_commitment_openings(&input);
+    cycle_end!(profile, "private_commitment_openings");
 
-    Sp1InitPublicValues {
+    cycle_start!(profile, "public_values_build");
+    let reserve_commitment = init_reserve_commitment(
+        input.reserves.len(),
+        input
+            .reserves
+            .iter()
+            .map(|reserve| (reserve.address.as_str(), reserve.balance)),
+    );
+    let public = Sp1InitPublicValues {
         chain_id: input.chain_id,
         state_root: input.state_root,
         session_id: input.session_id,
         reserve_count: input.reserve_count,
-        reserve_commitment: init_reserve_commitment(
-            input.reserves.len(),
-            input
-                .reserves
-                .iter()
-                .map(|reserve| (reserve.address.as_str(), reserve.balance)),
-        ),
+        reserve_commitment,
         zeta_le: input.zeta_le,
         balance_commitment: input.balance_commitment,
         shape_commitment: input.shape_commitment,
         eval_commitment: input.eval_commitment,
         commitment_params_digest_hex: input.commitment_params_digest_hex,
         uses_mock_inputs,
-    }
+    };
+    cycle_end!(profile, "public_values_build");
+    public
 }
 
 fn verify_private_commitment_openings(input: &Sp1InitStdin) {

@@ -3,12 +3,15 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$ROOT_DIR/scripts/sp1-version.env"
+source "$ROOT_DIR/scripts/sp1-docker-env.sh"
 cd "$ROOT_DIR"
 export PATH="$HOME/.cargo/bin:$HOME/.sp1/bin:$PATH"
 
 MODE="${POA_SP1_PROOF_MODE:-groth16}"
 SETUP_DEGREE="${POA_SETUP_DEGREE:-256}"
 INSTALL_DOCKER="${POA_INSTALL_DOCKER:-1}"
+SP1_GNARK_IMAGE="${SP1_GNARK_IMAGE:-ghcr.io/succinctlabs/sp1-gnark:$SP1_CIRCUIT_VERSION}"
+export SP1_GNARK_IMAGE
 
 say() { printf '\n==> %s\n' "$1"; }
 die() { printf 'bootstrap error: %s\n' "$1" >&2; exit 1; }
@@ -95,6 +98,16 @@ ensure_docker() {
   die "Docker is installed but unavailable. Start Docker Desktop; on Linux re-login after joining the docker group. Alternatively use compressed mode."
 }
 
+ensure_gnark_image() {
+  say "Preparing SP1 gnark image $SP1_GNARK_IMAGE"
+  if [[ -n "${DOCKER_DEFAULT_PLATFORM:-}" ]]; then
+    printf '    Docker platform: %s\n' "$DOCKER_DEFAULT_PLATFORM"
+    docker pull --platform "$DOCKER_DEFAULT_PLATFORM" "$SP1_GNARK_IMAGE"
+  else
+    docker pull "$SP1_GNARK_IMAGE"
+  fi
+}
+
 install_circuit_artifacts() {
   local kind="$1"
   local destination="$HOME/.sp1/circuits/$kind/$SP1_CIRCUIT_VERSION"
@@ -144,6 +157,7 @@ install_circuit_artifacts() {
 case "$MODE" in
   groth16|plonk)
     ensure_docker
+    ensure_gnark_image
     install_circuit_artifacts "$MODE"
     ;;
   compressed)

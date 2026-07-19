@@ -2,6 +2,8 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "$ROOT_DIR/scripts/sp1-version.env"
+source "$ROOT_DIR/scripts/sp1-docker-env.sh"
 cd "$ROOT_DIR"
 
 N_SIZES="${N_SIZES:-10000,100000,1000000}"
@@ -10,6 +12,7 @@ MASTER_N="${MASTER_N:-1000000}"
 SAMPLES="${SAMPLES:-3}"
 WARMUP="${WARMUP:-1}"
 POA_SP1_PROOF_MODE="${POA_SP1_PROOF_MODE:-groth16}"
+POA_SP1_PROFILE="${POA_SP1_PROFILE:-0}"
 BENCHMARK_OPERATIONS="${BENCHMARK_OPERATIONS:-initialization,insert,update}"
 # SP1's defaults target large proving machines (2^24-cycle shards and very
 # large trace buffers). Keep protocol benchmarks bounded on workstation-class
@@ -23,8 +26,11 @@ RUN_ID="${RUN_ID:-$(date +%Y%m%d-%H%M%S)}"
 OUTPUT_DIR="${OUTPUT_DIR:-artifacts/benchmarks/protocol-$RUN_ID}"
 SRS_DIR="${SRS_DIR:-params/srs/bench}"
 FIXTURE_DIR="${FIXTURE_DIR:-data/mock/bench/generated}"
+SP1_GNARK_IMAGE="${SP1_GNARK_IMAGE:-ghcr.io/succinctlabs/sp1-gnark:$SP1_CIRCUIT_VERSION}"
 
 export POA_SP1_PROOF_MODE
+export POA_SP1_PROFILE
+export SP1_GNARK_IMAGE
 export SHARD_SIZE MINIMAL_TRACE_CHUNK_THRESHOLD TRACE_CHUNK_SLOTS
 export GAS_TRACE_CHUNK_THRESHOLD GAS_TRACE_CHUNK_SLOTS
 
@@ -35,6 +41,11 @@ echo "  master n:   $MASTER_N"
 echo "  samples:    $SAMPLES"
 echo "  warmup:     $WARMUP"
 echo "  SP1 mode:   $POA_SP1_PROOF_MODE"
+echo "  SP1 profile: $POA_SP1_PROFILE"
+if [[ "$POA_SP1_PROOF_MODE" == "groth16" || "$POA_SP1_PROOF_MODE" == "plonk" ]]; then
+  echo "  gnark image: $SP1_GNARK_IMAGE"
+  echo "  Docker arch: ${DOCKER_DEFAULT_PLATFORM:-native}"
+fi
 echo "  operations: $BENCHMARK_OPERATIONS"
 echo "  SP1 shard:  $SHARD_SIZE cycles"
 echo "  trace:      chunk=$MINIMAL_TRACE_CHUNK_THRESHOLD slots=$TRACE_CHUNK_SLOTS"
@@ -54,6 +65,39 @@ if ! grep -Fxq "fixture_version=ethereum-keccak-merkle-prefix-v2-ecdsa" "$FIXTUR
   echo "Run scripts/initialize_benchmark_data.sh again." >&2
   exit 1
 fi
+
+case "$POA_SP1_PROOF_MODE" in
+  groth16|plonk)
+    if ! command -v docker >/dev/null 2>&1; then
+      echo "Docker is required for SP1 $POA_SP1_PROOF_MODE wrapping. Run ./poa bootstrap." >&2
+      exit 1
+    fi
+    if ! docker info >/dev/null 2>&1; then
+      echo "Docker is installed but its daemon is unavailable. Start Docker Desktop, then rerun." >&2
+      exit 1
+    fi
+    image_arch="$(docker image inspect --format '{{.Architecture}}' "$SP1_GNARK_IMAGE" 2>/dev/null || true)"
+    expected_arch=""
+    case "${DOCKER_DEFAULT_PLATFORM:-}" in
+      linux/amd64) expected_arch="amd64" ;;
+      linux/arm64|linux/arm64/v8) expected_arch="arm64" ;;
+    esac
+    if [[ -z "$image_arch" || ( -n "$expected_arch" && "$image_arch" != "$expected_arch" ) ]]; then
+      echo
+      echo "Preparing SP1 gnark wrapper image before benchmark timers..."
+      if [[ -n "${DOCKER_DEFAULT_PLATFORM:-}" ]]; then
+        docker pull --platform "$DOCKER_DEFAULT_PLATFORM" "$SP1_GNARK_IMAGE"
+      else
+        docker pull "$SP1_GNARK_IMAGE"
+      fi
+    fi
+    ;;
+  compressed) ;;
+  *)
+    echo "POA_SP1_PROOF_MODE must be compressed, groth16, or plonk" >&2
+    exit 1
+    ;;
+esac
 
 SETUP_COMPONENTS=""
 case ",$BENCHMARK_OPERATIONS," in

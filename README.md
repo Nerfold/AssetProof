@@ -136,6 +136,9 @@ cargo run -p poa-cli --
 │   ├── reports/               报告
 │   ├── benchmarks/            性能测试结果
 │   └── legacy/                从旧目录迁移的历史产物
+├── docs/                      架构与 SP1 Network 接入说明
+├── tools/
+│   └── kzg-msm-bench/         独立的 KZG/MSM 微基准，不参与 protocol benchmark
 ├── paper/                     协议论文（本地目录）
 └── vendor/                    本地 patched dependency
 ```
@@ -143,6 +146,10 @@ cargo run -p poa-cli --
 `data/mock/generated/`、`data/mock/bench/`、`params/srs/*.bin` 和
 `artifacts/` 下的运行产物默认不进入 Git。`artifacts/states/` 中的 prover
 state 含余额和 blinding，应按敏感数据处理。
+
+`crates/smt/`、`crates/smt-bench/`、`sp1-programs/smt-*` 和 `sp1-host` 中对应的
+SMT host 入口是一套独立实验实现。高级 CLI 的 SMT 命令仍在使用它们，因此暂时保留，
+但 initialization/insert/update 的 KZG protocol benchmark 不会调用它们。
 
 ## Mock 数据
 
@@ -225,8 +232,9 @@ state diff，并且区块已最终确认。Geth `prestateTracer` diff mode 可�
 
 三类参数物理隔离，不能混用：
 
-1. `params/srs/` 保存普通 KZG powers-of-tau G1/G2 powers。insert quotient 已改用
-   salted hash + SP1 evaluation，因此默认 SRS 不再生成百万级 hiding G1 powers。
+1. `params/srs/` 保存普通 KZG powers-of-tau G1/G2 powers。hidden insert 只需要普通
+   G1 powers 来承诺 quotient witness，以及 `[1]_2,[tau]_2` 来构造隐藏点对象；默认
+   SRS 不再生成百万级 hiding G1 powers。
 2. `params/crs/` 保存 Pedersen commitment 和 Sigma ZKOpen 所用透明 CRS 的派生约定。
    基点使用标准 BLS12-381 G1 `XMD:SHA-256_SSWU_RO` hash-to-curve、独立 domain
    label 和 index 派生，不再使用已知离散对数的 `hash_to_scalar * G`。
@@ -269,7 +277,7 @@ initialization 和 KZG insert 生成 SP1 setup：
 commitment、旧 initialization/update/insert proof 都必须从 initialization 开始重新生成；
 不能在旧 state 上继续 update。Merkle 分支的初始化 scheme 为
 `kzg-nizk-init-v8-zkopen-keccak-merkle-prefix-split`，insert scheme 为
-`kzg-nizk-insert-v8-salted-quotient-hash-keccak-merkle-bound`。修改过 SP1 guest 后也必须重新运行 `./poa sp1-setup`；
+`kzg-strong-zkopen-insert-v1-sp1-committed-input`。修改过 SP1 guest 后也必须重新运行 `./poa sp1-setup`；
 loader 会比较 artifact 中记录的 ELF digest，旧 artifact 会 fail-closed 并提示重新 setup。
 本轮只修改代码、未重新生成 SP1 artifact，因此首次运行前必须执行一次该命令。
 
@@ -284,7 +292,7 @@ powers-of-tau 后仍必须重新生成依赖它的 state 和 proof。
 ./poa gen-srs 10000 params/srs/custom-10000.bin
 ```
 
-## 初始化、ZKOpen 与 salted witness commitment
+## 初始化、ZKOpen 与 hidden-point insert
 
 初始化会生成 private prover state、public state companion 和 init proof。当前
 初始化的 KZG evaluation 使用 Fiat–Shamir 非交互化的 Sigma ZKOpen，因此不会
@@ -300,12 +308,19 @@ variable-base multiplication，也不再需要 initialization shape 的百万级
 余额 commitment、evaluation commitment 和 KZG ZKOpen 不受此替换影响，仍分别
 使用透明 Pedersen CRS 与普通 KZG SRS。
 
-论文中的 insert 使用 `HPolyCom(Q)` 与 `HZKOpen` 绑定 quotient。当前 SP1 后端改为
-先用独立 32-byte 私有 salt 提交 quotient 的有序系数，再派生 `zeta`。SP1 内检查系数
-数量/degree bound、重算 hash、用 Horner 计算 `Q(zeta)`，并验证其 Pedersen commitment
-`C_q` 的 opening；现有 Bulletproof 再用同一个 `C_q` 检查 insertion relation。这样仍然
-在挑战前绑定唯一的 degree-bounded `Q`，但删除了多次线性规模 HPolyCom MSM 和整套
-hiding-G1 SRS。旧/新 accumulator 的 evaluation 仍使用 KZG Sigma ZKOpen。
+Insert 已切换到论文中的 `StrongZKOpen + ComNonZero` 协议。prover 在隐藏地址点
+`u` 计算 `y=P(u)`，构造私有 quotient witness
+`W_tilde=[beta^-1 Q_u(tau)]_1` 与公开 handle `D=[beta(tau-u)]_2`。
+`StrongZKOpen(d,C_u,C_y;D)` 同时证明隐藏点、隐藏 evaluation 和 KZG opening；
+`W_tilde` 不再公开，只通过一次性随机掩码响应 `Z_W` 出现在证明中。独立的
+`ComNonZero(C_y)` 证明同一 committed evaluation 满足 `y*nu=1`。verifier 顶层只看到
+`C_u,C_y,C_B,D` 及三个子证明，并额外检查 `e(d',G2)=e(d,D)`。
+
+SP1 insert guest 现在对应论文的 committed-input SNARK 部分：私有验证 ECDSA ownership、
+Merkle/account proof、地址编码和非负余额，并公开绑定 `C_u` 与 `C_B`。KZG pairing、
+`StrongZKOpen` 和 `ComNonZero` 全部在 SP1 外验证，因此 SP1 输入和电路规模不再随旧
+集合的 quotient 长度增长。由于 guest ELF 和公开值格式均已变化，升级后必须重新执行
+`./poa sp1-setup`。
 
 快捷初始化默认读取 `data/mock/reserves.csv`：
 
@@ -551,6 +566,15 @@ delta fixture 都会立即退出，不会在 benchmark 过程中自动生成。�
 SAMPLES=5 WARMUP=1 POA_SP1_PROOF_MODE=groth16 \
   ./scripts/benchmark_protocol.sh
 ```
+
+### SP1 Network
+
+SP1 proof generation 已集中经过 `crates/sp1-host/src/prover_backend.rs`，setup 与 proof
+verification 仍绑定本地可信 VK。当前锁定依赖中，`sp1-sdk/network` 与 Bulletproof 使用的
+两个 `blst` 原生版本存在 Cargo `links` 冲突，因此不能把 Network client 直接编进主
+协议进程。后续应使用独立 Network worker；接口、安全要求和三个 guest 的映射见
+[`docs/SP1_NETWORK.md`](docs/SP1_NETWORK.md)。特别是 Network 请求必须使用 private stdin，
+不能公开上传 initialization/insert witness。
 
 ### SP1 阶段分析
 

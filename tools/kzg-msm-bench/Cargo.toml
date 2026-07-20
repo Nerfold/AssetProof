@@ -1,0 +1,11 @@
+[package]
+name = "kzg-msm-bench"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ark-bls12-381 = "0.6"
+ark-ec = { version = "0.6", features = ["parallel"] }
+ark-ff = { version = "0.6", features = ["parallel"] }
+rand = "0.8"
+rayon = "1.12"

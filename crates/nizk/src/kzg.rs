@@ -1,13 +1,8 @@
-use ark_bls12_381::{g1, Bls12_381, Fr, G1Affine, G1Projective, G2Affine, G2Projective};
+use ark_bls12_381::{Bls12_381, Fr, G1Affine, G1Projective, G2Affine, G2Projective};
 use ark_ec::{
-    hashing::{curve_maps::wb::WBMap, map_to_curve_hasher::MapToCurveBasedHasher, HashToCurve},
-    pairing::Pairing,
-    scalar_mul::ScalarMul,
-    AffineRepr, CurveGroup, PrimeGroup, VariableBaseMSM,
+    pairing::Pairing, scalar_mul::ScalarMul, AffineRepr, CurveGroup, PrimeGroup, VariableBaseMSM,
 };
-use ark_ff::field_hashers::DefaultFieldHasher;
 use ark_ff::{PrimeField, UniformRand, Zero};
-use sha2::Sha256;
 
 use common::crypto::hash_to_scalar;
 
@@ -41,8 +36,9 @@ impl Srs {
     }
 
     /// Builds a development SRS with ordinary G1 powers and only the G2 prefix
-    /// required by the largest verifier-side polynomial. Insert quotient
-    /// binding uses a salted hash, so the default SRS has no hiding-G1 powers.
+    /// required by the largest verifier-side polynomial. StrongZKOpen uses an
+    /// ordinary KZG quotient witness, so no independent hiding-G1 powers are
+    /// needed.
     ///
     /// A KZG commitment to a degree-`max_degree` polynomial needs all G1
     /// powers, while an opening check needs only `[1]G2` and `[tau]G2`. This
@@ -98,29 +94,6 @@ impl Srs {
             hiding_tau_g1_powers: Vec::new(),
             provenance: SrsProvenance::Development,
         }
-    }
-
-    /// Legacy helper retained for isolated HPolyCom compatibility tests. New
-    /// protocol proofs and normal setup must use `setup_development` instead.
-    pub fn setup_development_with_hiding(max_degree: usize, seed: &[u8]) -> Self {
-        let mut srs = Self::setup_development(max_degree, seed);
-        let mut tau = hash_to_scalar("srs-tau", seed);
-        if tau.is_zero() {
-            tau = Fr::from(7u64);
-        }
-        let mut tau_power = Fr::from(1u64);
-        let scalar_powers = (0..=max_degree)
-            .map(|_| {
-                let current = tau_power;
-                tau_power *= tau;
-                current
-            })
-            .collect::<Vec<_>>();
-        srs.hiding_tau_g1_powers = parallel_g1_powers(
-            hiding_base().expect("hash-to-curve for legacy hiding KZG base"),
-            &scalar_powers,
-        );
-        srs
     }
 
     pub fn from_external_ceremony(
@@ -300,19 +273,6 @@ fn validate_g2_power_sequence(
         return Err("inconsistent G2 KZG powers".to_string());
     }
     Ok(())
-}
-
-fn hiding_base() -> Result<G1Projective, String> {
-    let hasher = MapToCurveBasedHasher::<
-        G1Projective,
-        DefaultFieldHasher<Sha256, 128>,
-        WBMap<g1::Config>,
-    >::new(b"DPOA_HPOLYCOM_BLS12381G1_XMD:SHA-256_SSWU_RO_V1")
-    .map_err(|err| format!("initialize hiding base hash-to-curve: {err}"))?;
-    Ok(hasher
-        .hash(b"dynamic-poa-hpolycom-independent-base-v1")
-        .map_err(|err| format!("derive hiding base: {err}"))?
-        .into_group())
 }
 
 pub fn commit_g1(srs: &Srs, poly: &Polynomial) -> Result<G1Projective, String> {

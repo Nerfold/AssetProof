@@ -8,13 +8,10 @@ use sp1_curves::params::FieldParameters;
 use sp1_curves::weierstrass::bls12_381::Bls12381BaseField;
 use sp1_lib::bls12381::Bls12381Point;
 use sp1_lib::utils::AffinePoint as Sp1AffinePoint;
-use sp1_programs_common::bls12_381_scalar::{
-    add_mod, from_le_bytes, mul_by_montgomery, to_le_bytes, to_montgomery,
-};
 use sp1_programs_common::ethereum_binary_merkle::{leaf_hash, node_hash};
 use sp1_programs_common::io::{
-    insert_quotient_commitment, Hash, Sp1ChainBalanceProof, Sp1G1Affine, Sp1KzgInsertPublicValues,
-    Sp1KzgInsertStdin, Sp1OwnershipWitness,
+    Hash, Sp1ChainBalanceProof, Sp1G1Affine, Sp1KzgInsertPublicValues, Sp1KzgInsertStdin,
+    Sp1OwnershipWitness,
 };
 use sp1_zkvm::entrypoint;
 
@@ -49,14 +46,6 @@ fn main() {
 
 fn verify_insert(input: Sp1KzgInsertStdin, profile: bool) -> Sp1KzgInsertPublicValues {
     assert!(input.balance >= 0, "negative inserted balance");
-    let expected_reserve_count_after = input
-        .reserve_count_before
-        .checked_add(1)
-        .expect("insert reserve count overflow");
-    assert_eq!(
-        input.reserve_count_after, expected_reserve_count_after,
-        "insert reserve count mismatch"
-    );
     cycle_start!(profile, "ownership_context_hash");
     let ownership_context = matches!(
         &input.ownership,
@@ -96,75 +85,25 @@ fn verify_insert(input: Sp1KzgInsertStdin, profile: bool) -> Sp1KzgInsertPublicV
         "inserted address encoding mismatch"
     );
     let balance_scalar = BigUint::from(input.balance as u128);
-    let c_x = commit_two(
+    let c_u = commit_two(
         &input.eval_value_base,
         &encoded,
         &input.eval_blind_base,
         &BigUint::from_bytes_le(&input.encoded_address_blind_le),
     );
-    let c_balance_delta = commit_two(
+    let c_balance = commit_two(
         &input.balance_value_base,
         &balance_scalar,
         &input.balance_blind_base,
-        &BigUint::from_bytes_le(&input.balance_blind_delta_le),
+        &BigUint::from_bytes_le(&input.balance_blind_le),
     );
-    assert_eq!(point_to_io(&c_x), input.c_x, "C_x opening mismatch");
+    assert_eq!(point_to_io(&c_u), input.c_u, "C_u opening mismatch");
+    assert_eq!(
+        point_to_io(&c_balance),
+        input.c_balance,
+        "C_B opening mismatch"
+    );
     cycle_end!(profile, "address_and_balance_commitments");
-
-    cycle_start!(profile, "quotient_commitment_hash");
-    assert_eq!(
-        input.quotient_coefficients_le.len(),
-        input.reserve_count_before,
-        "insert quotient must have exactly n coefficients"
-    );
-    assert_eq!(
-        insert_quotient_commitment(
-            &input.quotient_salt,
-            input.quotient_coefficients_le.len(),
-            input.quotient_coefficients_le.iter().copied(),
-        ),
-        input.quotient_commitment,
-        "insert salted quotient commitment mismatch"
-    );
-    cycle_end!(profile, "quotient_commitment_hash");
-    cycle_start!(profile, "quotient_horner_evaluation");
-    let zeta = from_le_bytes(input.zeta_le);
-    let zeta_montgomery = to_montgomery(zeta);
-    let quotient_eval =
-        input
-            .quotient_coefficients_le
-            .iter()
-            .rev()
-            .fold([0u64; 4], |acc, coefficient| {
-                add_mod(
-                    mul_by_montgomery(acc, zeta_montgomery),
-                    from_le_bytes(*coefficient),
-                )
-            });
-    assert_eq!(
-        to_le_bytes(quotient_eval),
-        input.quotient_eval_le,
-        "insert quotient evaluation mismatch"
-    );
-    cycle_end!(profile, "quotient_horner_evaluation");
-    cycle_start!(profile, "quotient_commitment_opening");
-    let c_quotient_eval = commit_two(
-        &input.eval_value_base,
-        &BigUint::from_bytes_le(&input.quotient_eval_le),
-        &input.eval_blind_base,
-        &BigUint::from_bytes_le(&input.quotient_eval_blind_le),
-    );
-    assert_eq!(
-        point_to_io(&c_quotient_eval),
-        input.c_quotient_eval,
-        "insert quotient evaluation commitment opening mismatch"
-    );
-    assert_eq!(
-        point_to_io(&c_balance_delta),
-        input.c_balance_delta,
-        "balance-delta commitment opening mismatch"
-    );
-    cycle_end!(profile, "quotient_commitment_opening");
 
     let uses_mock_inputs = matches!(input.ownership, Sp1OwnershipWitness::MockPrivateKey { .. })
         || matches!(
@@ -182,20 +121,10 @@ fn verify_insert(input: Sp1KzgInsertStdin, profile: bool) -> Sp1KzgInsertPublicV
     let public = Sp1KzgInsertPublicValues {
         chain_id: input.chain_id,
         state_root: input.state_root,
-        zeta_le: input.zeta_le,
         commitment_params_digest_hex,
         uses_mock_inputs,
-        c_x: input.c_x,
-        quotient_commitment: input.quotient_commitment,
-        c_quotient_eval: input.c_quotient_eval,
-        c_balance_delta: input.c_balance_delta,
-        old_accumulator_hex: input.old_accumulator_hex,
-        new_accumulator_hex: input.new_accumulator_hex,
-        old_balance_commitment_hex: input.old_balance_commitment_hex,
-        new_balance_commitment_hex: input.new_balance_commitment_hex,
-        reserve_count_before: input.reserve_count_before,
-        reserve_count_after: input.reserve_count_after,
-        transcript_hex: input.transcript_hex,
+        c_u: input.c_u,
+        c_balance: input.c_balance,
     };
     cycle_end!(profile, "public_values_build");
     public
@@ -245,7 +174,7 @@ fn commitment_params_digest(
     balance_blind: &Sp1G1Affine,
 ) -> alloc::string::String {
     let mut hasher = sp1_programs_common::ethereum_eoa::Keccak256Stream::new();
-    hasher.update(b"dynamic-poa-insert-commitment-params-keccak-v2");
+    hasher.update(b"dynamic-poa-hidden-insert-commitment-params-keccak-v1");
     for point in [eval_value, eval_blind, balance_value, balance_blind] {
         hasher.update(&point.x_be);
         hasher.update(&point.y_be);

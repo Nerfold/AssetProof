@@ -1,5 +1,6 @@
 mod profiling;
 mod proof_mode;
+mod prover_backend;
 
 pub mod init;
 #[cfg(feature = "smt-sp1")]

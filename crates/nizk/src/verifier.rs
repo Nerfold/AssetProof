@@ -923,7 +923,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_tampered_insert_external_artifact_digest() {
+    fn rejects_tampered_strong_zkopen_insert_proof() {
         let srs = Srs::setup_development(16, b"test-srs-insert-artifact");
         let entries = vec![ReserveEntry {
             address: "0x1111111111111111111111111111111111111111".to_string(),
@@ -941,7 +941,7 @@ mod tests {
             ),
         )
         .unwrap();
-        insert.proof.ownership_artifact_digest_hex.push('0');
+        insert.proof.strong_zkopen_proof_hex.push('0');
         let policy = ChainPolicy::development(
             "mock-chain",
             ["root-0".to_string()],

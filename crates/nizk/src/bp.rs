@@ -15,7 +15,7 @@ use bulletproofs_bls::r1cs::{
     Verifier,
 };
 use bulletproofs_bls::{BulletproofGens, LinearProof, PedersenGens};
-use common::crypto::{hex_decode, hex_encode, point_g1_from_hex, point_g1_to_hex, scalar_to_hex};
+use common::crypto::{hex_decode, hex_encode, point_g1_from_hex, point_g1_to_hex};
 use common::types::Delta;
 use merlin::Transcript;
 use std::collections::HashMap;
@@ -37,13 +37,6 @@ pub struct DirectZeroTestProof {
 }
 
 #[derive(Clone, Debug)]
-pub struct InsertRelationProof {
-    pub bp_proof_hex: String,
-    pub bp_commitments_hex: String,
-    pub link_proof_hex: String,
-}
-
-#[derive(Clone, Debug)]
 enum LinkLayout {
     Full { m: usize },
     ZeroTest { m: usize },
@@ -62,15 +55,6 @@ struct LinkProof {
     s_r_d: Fr,
 }
 
-#[derive(Clone, Debug)]
-struct InsertLinkProof {
-    r_bp: Vec<BpG1>,
-    r_ext: Vec<ArkG1>,
-    s_values: Vec<Fr>,
-    s_bp_blinds: Vec<BpScalar>,
-    s_ext_blinds: Vec<Fr>,
-}
-
 #[derive(Clone, Copy, Debug)]
 struct UpdateR1csShape {
     witness_len: usize,
@@ -81,7 +65,6 @@ static PEDERSEN_GENS: OnceLock<PedersenGens> = OnceLock::new();
 static BULLETPROOF_GENS: OnceLock<Mutex<HashMap<usize, Arc<BulletproofGens>>>> = OnceLock::new();
 static PROJECTION_IPA_GENS: OnceLock<Mutex<HashMap<usize, Arc<Vec<BpG1>>>>> = OnceLock::new();
 static ZERO_TEST_SHAPES: OnceLock<Mutex<HashMap<usize, UpdateR1csShape>>> = OnceLock::new();
-static INSERT_SHAPE: OnceLock<UpdateR1csShape> = OnceLock::new();
 
 fn pedersen_gens() -> &'static PedersenGens {
     PEDERSEN_GENS.get_or_init(|| {
@@ -150,13 +133,6 @@ fn zero_test_shape(m: usize) -> UpdateR1csShape {
     cached_shape(&ZERO_TEST_SHAPES, m, || UpdateR1csShape {
         witness_len: 3 * m,
         bp_capacity: zero_test_relation_capacity(m),
-    })
-}
-
-fn insert_shape() -> UpdateR1csShape {
-    *INSERT_SHAPE.get_or_init(|| UpdateR1csShape {
-        witness_len: 9,
-        bp_capacity: 16,
     })
 }
 
@@ -684,174 +660,6 @@ pub fn verify_projection_ipa(
     result
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn prove_insert_relation_logic(
-    x: Fr,
-    beta: Fr,
-    y_x: Fr,
-    y: Fr,
-    y_prime: Fr,
-    q_zeta: Fr,
-    z_x: Fr,
-    z_beta: Fr,
-    inserted_balance: i128,
-    zeta: Fr,
-    r_x: Fr,
-    r_beta: Fr,
-    r_y_x: Fr,
-    r_y: Fr,
-    r_y_prime: Fr,
-    r_q: Fr,
-    r_ins: Fr,
-    c_x_hex: &str,
-    c_beta_hex: &str,
-    c_y_x_hex: &str,
-    c_y_hex: &str,
-    c_y_prime_hex: &str,
-    c_q_hex: &str,
-    old_balance_commitment_hex: &str,
-    new_balance_commitment_hex: &str,
-) -> Result<InsertRelationProof, String> {
-    let shape = insert_shape();
-    let values = vec![
-        x,
-        beta,
-        y_x,
-        y,
-        y_prime,
-        q_zeta,
-        z_x,
-        z_beta,
-        common::crypto::scalar_from_i128(inserted_balance),
-    ];
-    if values.len() != shape.witness_len {
-        return Err("insert relation witness length mismatch".to_string());
-    }
-    let bp_values = values
-        .iter()
-        .map(fr_to_bp_scalar)
-        .collect::<Result<Vec<_>, _>>()?;
-    let bp_blinds = derive_bp_blinds(&values)?;
-    let pc_gens = pedersen_gens();
-    let bp_gens = bulletproof_gens(shape.bp_capacity);
-    let mut transcript = Transcript::new(b"dynamic-poa-insert-r1cs");
-    append_insert_public_to_transcript(
-        &mut transcript,
-        zeta,
-        c_x_hex,
-        c_beta_hex,
-        c_y_x_hex,
-        c_y_hex,
-        c_y_prime_hex,
-        c_q_hex,
-        old_balance_commitment_hex,
-        new_balance_commitment_hex,
-    )?;
-    let mut prover = Prover::new(pc_gens, &mut transcript);
-    let mut commitments = Vec::with_capacity(values.len());
-    let mut vars = Vec::with_capacity(values.len());
-    for (value, blind) in bp_values.iter().zip(bp_blinds.iter()) {
-        let (commitment, var) = prover.commit(*value, *blind);
-        commitments.push(commitment);
-        vars.push(var);
-    }
-    insert_relation(&mut prover, &vars, zeta)?;
-    let bp_proof = prover
-        .prove(bp_gens.as_ref())
-        .map_err(|err| format!("insert bulletproof prove: {err}"))?;
-    let link_proof = prove_insert_link(
-        &commitments,
-        &values,
-        &bp_blinds,
-        c_x_hex,
-        c_beta_hex,
-        c_y_x_hex,
-        c_y_hex,
-        c_y_prime_hex,
-        c_q_hex,
-        old_balance_commitment_hex,
-        new_balance_commitment_hex,
-        r_x,
-        r_beta,
-        r_y_x,
-        r_y,
-        r_y_prime,
-        r_q,
-        r_ins,
-    )?;
-
-    Ok(InsertRelationProof {
-        bp_proof_hex: hex_encode(&bp_proof.to_bytes()),
-        bp_commitments_hex: encode_bp_points(&commitments),
-        link_proof_hex: link_proof,
-    })
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn verify_insert_relation_logic(
-    zeta: Fr,
-    c_x_hex: &str,
-    c_beta_hex: &str,
-    c_y_x_hex: &str,
-    c_y_hex: &str,
-    c_y_prime_hex: &str,
-    c_q_hex: &str,
-    old_balance_commitment_hex: &str,
-    new_balance_commitment_hex: &str,
-    bp_proof_hex: &str,
-    bp_commitments_hex: &str,
-    link_proof_hex: &str,
-) -> Result<(), String> {
-    let shape = insert_shape();
-    let commitments = decode_bp_points(bp_commitments_hex)?;
-    if commitments.len() != shape.witness_len {
-        return Err(format!(
-            "insert Bulletproof commitment length mismatch: got {}, expected {}",
-            commitments.len(),
-            shape.witness_len
-        ));
-    }
-    let pc_gens = pedersen_gens();
-    let bp_gens = bulletproof_gens(shape.bp_capacity);
-    let mut transcript = Transcript::new(b"dynamic-poa-insert-r1cs");
-    append_insert_public_to_transcript(
-        &mut transcript,
-        zeta,
-        c_x_hex,
-        c_beta_hex,
-        c_y_x_hex,
-        c_y_hex,
-        c_y_prime_hex,
-        c_q_hex,
-        old_balance_commitment_hex,
-        new_balance_commitment_hex,
-    )?;
-    let mut verifier = Verifier::new(&mut transcript);
-    let vars = commitments
-        .iter()
-        .map(|commitment| verifier.commit(*commitment))
-        .collect::<Vec<_>>();
-    insert_relation(&mut verifier, &vars, zeta)?;
-    let bp_bytes = hex_decode(bp_proof_hex)?;
-    let bp_proof = R1CSProof::from_bytes(&bp_bytes)
-        .map_err(|err| format!("insert bulletproof parse: {err}"))?;
-    verifier
-        .verify(&bp_proof, pc_gens, bp_gens.as_ref())
-        .map_err(|err| format!("insert bulletproof verify: {err}"))?;
-    verify_insert_link(
-        &commitments,
-        c_x_hex,
-        c_beta_hex,
-        c_y_x_hex,
-        c_y_hex,
-        c_y_prime_hex,
-        c_q_hex,
-        old_balance_commitment_hex,
-        new_balance_commitment_hex,
-        link_proof_hex,
-    )
-}
-
 fn update_relation<CS: ConstraintSystem>(
     cs: &mut CS,
     vars: &[bulletproofs_bls::r1cs::Variable],
@@ -943,42 +751,6 @@ fn direct_vector_zero_test_relation<CS: ConstraintSystem>(
         cs.constrain(y_left - y_right);
         cs.constrain(yz - bp_one() + u);
     }
-    Ok(())
-}
-
-fn insert_relation<CS: ConstraintSystem>(
-    cs: &mut CS,
-    vars: &[bulletproofs_bls::r1cs::Variable],
-    zeta: Fr,
-) -> Result<(), String> {
-    if vars.len() != insert_shape().witness_len {
-        return Err("insert relation variable length mismatch".to_string());
-    }
-    let x = vars[0];
-    let beta = vars[1];
-    let y_x = vars[2];
-    let y = vars[3];
-    let y_prime = vars[4];
-    let q = vars[5];
-    let z_x = vars[6];
-    let z_beta = vars[7];
-    let zeta = fr_to_bp_scalar(&zeta)?;
-
-    let (_, _, beta_y) = cs.multiply(beta.into(), y.into());
-    let (_, _, beta_y_zeta) = cs.multiply(beta_y.into(), (zeta * bp_one()).into());
-    let (_, _, beta_y_x) = cs.multiply(beta_y.into(), x.into());
-    cs.constrain(beta_y_zeta - beta_y_x - y_prime);
-
-    let (_, _, q_zeta) = cs.multiply(q.into(), (zeta * bp_one()).into());
-    let (_, _, q_x) = cs.multiply(q.into(), x.into());
-    cs.constrain(y - y_x - q_zeta + q_x);
-
-    let (_, _, y_x_inv) = cs.multiply(y_x.into(), z_x.into());
-    cs.constrain(y_x_inv - bp_one());
-
-    let (_, _, beta_inv) = cs.multiply(beta.into(), z_beta.into());
-    cs.constrain(beta_inv - bp_one());
-
     Ok(())
 }
 
@@ -1424,11 +1196,6 @@ fn external_d_commit(value: Fr, blind: Fr) -> ArkG1 {
         + crate::commitment::derive_generator("balance-h", 0).mul_bigint(blind.into_bigint())
 }
 
-fn external_eval_commit(value: Fr, blind: Fr) -> ArkG1 {
-    derive_generator("eval-v", 0).mul_bigint(value.into_bigint())
-        + derive_generator("eval-h", 0).mul_bigint(blind.into_bigint())
-}
-
 fn external_y_commit(
     srs: &Srs,
     x_values: &[Fr],
@@ -1462,31 +1229,6 @@ fn link_y_values<'a>(values: &'a [Fr], layout: &LinkLayout) -> &'a [Fr] {
         LinkLayout::Full { m } => &values[*m..2 * *m],
         LinkLayout::ZeroTest { m } => &values[*m..2 * *m],
     }
-}
-
-fn append_insert_public_to_transcript(
-    transcript: &mut Transcript,
-    zeta: Fr,
-    c_x: &str,
-    c_beta: &str,
-    c_y_x: &str,
-    c_y: &str,
-    c_y_prime: &str,
-    c_q: &str,
-    old_balance_commitment: &str,
-    new_balance_commitment: &str,
-) -> Result<(), String> {
-    transcript.append_message(b"dom-sep", b"dynamic-poa-insert-relation");
-    transcript.append_message(b"zeta", scalar_to_hex(&zeta)?.as_bytes());
-    transcript.append_message(b"C_x", c_x.as_bytes());
-    transcript.append_message(b"C_beta", c_beta.as_bytes());
-    transcript.append_message(b"C_y_x", c_y_x.as_bytes());
-    transcript.append_message(b"C_y", c_y.as_bytes());
-    transcript.append_message(b"C_y_prime", c_y_prime.as_bytes());
-    transcript.append_message(b"C_q", c_q.as_bytes());
-    transcript.append_message(b"C_old_balance", old_balance_commitment.as_bytes());
-    transcript.append_message(b"C_new_balance", new_balance_commitment.as_bytes());
-    Ok(())
 }
 
 fn append_zero_test_public_to_transcript(
@@ -1678,199 +1420,6 @@ fn bp_commitment_batch_challenge(
     }
 }
 
-fn prove_insert_link(
-    bp_commitments: &[BpG1],
-    values: &[Fr],
-    bp_blinds: &[BpScalar],
-    c_x_hex: &str,
-    c_beta_hex: &str,
-    c_y_x_hex: &str,
-    c_y_hex: &str,
-    c_y_prime_hex: &str,
-    c_q_hex: &str,
-    old_balance_commitment_hex: &str,
-    new_balance_commitment_hex: &str,
-    r_x: Fr,
-    r_beta: Fr,
-    r_y_x: Fr,
-    r_y: Fr,
-    r_y_prime: Fr,
-    r_q: Fr,
-    r_ins: Fr,
-) -> Result<String, String> {
-    if values.len() != insert_shape().witness_len || bp_commitments.len() != values.len() {
-        return Err("insert link witness length mismatch".to_string());
-    }
-    let mut r_bp = Vec::with_capacity(values.len());
-    let mut r_ext = Vec::with_capacity(7);
-    let mut a_values = Vec::with_capacity(values.len());
-    let mut a_bp_blinds = Vec::with_capacity(values.len());
-    let mut a_ext_blinds = Vec::with_capacity(7);
-    let pc_gens = pedersen_gens();
-    let mut rng = rand::rngs::OsRng;
-    for _ in 0..values.len() {
-        let a_value = Fr::rand(&mut rng);
-        let a_bp_blind = BpScalar::random(&mut rng);
-        r_bp.push(pc_gens.commit(fr_to_bp_scalar(&a_value)?, a_bp_blind));
-        a_values.push(a_value);
-        a_bp_blinds.push(a_bp_blind);
-    }
-    for _ in 0..7 {
-        a_ext_blinds.push(Fr::rand(&mut rng));
-    }
-    for index in 0..6 {
-        r_ext.push(external_eval_commit(a_values[index], a_ext_blinds[index]));
-    }
-    r_ext.push(external_d_commit(a_values[8], a_ext_blinds[6]));
-    let challenge = insert_link_challenge(
-        bp_commitments,
-        c_x_hex,
-        c_beta_hex,
-        c_y_x_hex,
-        c_y_hex,
-        c_y_prime_hex,
-        c_q_hex,
-        old_balance_commitment_hex,
-        new_balance_commitment_hex,
-        &r_bp,
-        &r_ext,
-    )?;
-    let challenge_bp = fr_to_bp_scalar(&challenge)?;
-    let ext_blinds = [r_x, r_beta, r_y_x, r_y, r_y_prime, r_q, r_ins];
-    let mut s_values = Vec::with_capacity(values.len());
-    let mut s_bp_blinds = Vec::with_capacity(values.len());
-    let mut s_ext_blinds = Vec::with_capacity(7);
-    for index in 0..values.len() {
-        s_values.push(a_values[index] + challenge * values[index]);
-        s_bp_blinds.push(a_bp_blinds[index] + bp_blinds[index] * challenge_bp);
-    }
-    for index in 0..7 {
-        s_ext_blinds.push(a_ext_blinds[index] + challenge * ext_blinds[index]);
-    }
-    encode_insert_link_proof(&InsertLinkProof {
-        r_bp,
-        r_ext,
-        s_values,
-        s_bp_blinds,
-        s_ext_blinds,
-    })
-}
-
-#[allow(clippy::too_many_arguments)]
-fn verify_insert_link(
-    bp_commitments: &[BpG1],
-    c_x_hex: &str,
-    c_beta_hex: &str,
-    c_y_x_hex: &str,
-    c_y_hex: &str,
-    c_y_prime_hex: &str,
-    c_q_hex: &str,
-    old_balance_commitment_hex: &str,
-    new_balance_commitment_hex: &str,
-    proof_hex: &str,
-) -> Result<(), String> {
-    let proof = decode_insert_link_proof(proof_hex)?;
-    let expected_len = insert_shape().witness_len;
-    if bp_commitments.len() != expected_len
-        || proof.r_bp.len() != expected_len
-        || proof.s_values.len() != expected_len
-        || proof.s_bp_blinds.len() != expected_len
-        || proof.r_ext.len() != 7
-        || proof.s_ext_blinds.len() != 7
-    {
-        return Err("insert link proof vector length mismatch".to_string());
-    }
-    let challenge = insert_link_challenge(
-        bp_commitments,
-        c_x_hex,
-        c_beta_hex,
-        c_y_x_hex,
-        c_y_hex,
-        c_y_prime_hex,
-        c_q_hex,
-        old_balance_commitment_hex,
-        new_balance_commitment_hex,
-        &proof.r_bp,
-        &proof.r_ext,
-    )?;
-    let challenge_bp = fr_to_bp_scalar(&challenge)?;
-    verify_bp_commitment_equations_batched(
-        bp_commitments,
-        &proof.r_bp,
-        &proof.s_values,
-        &proof.s_bp_blinds,
-        challenge,
-        challenge_bp,
-        b"insert-link",
-    )?;
-    let external_commitments = [
-        point_g1_from_hex(c_x_hex)?,
-        point_g1_from_hex(c_beta_hex)?,
-        point_g1_from_hex(c_y_x_hex)?,
-        point_g1_from_hex(c_y_hex)?,
-        point_g1_from_hex(c_y_prime_hex)?,
-        point_g1_from_hex(c_q_hex)?,
-        point_g1_from_hex(new_balance_commitment_hex)?
-            - point_g1_from_hex(old_balance_commitment_hex)?,
-    ];
-    for index in 0..6 {
-        let lhs = external_eval_commit(proof.s_values[index], proof.s_ext_blinds[index]);
-        let rhs =
-            proof.r_ext[index] + external_commitments[index].mul_bigint(challenge.into_bigint());
-        if lhs != rhs {
-            return Err(format!(
-                "insert link eval commitment equation failed at index {index}"
-            ));
-        }
-    }
-    let lhs = external_d_commit(proof.s_values[8], proof.s_ext_blinds[6]);
-    let rhs = proof.r_ext[6] + external_commitments[6].mul_bigint(challenge.into_bigint());
-    if lhs != rhs {
-        return Err("insert link balance commitment equation failed".to_string());
-    }
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn insert_link_challenge(
-    bp_commitments: &[BpG1],
-    c_x_hex: &str,
-    c_beta_hex: &str,
-    c_y_x_hex: &str,
-    c_y_hex: &str,
-    c_y_prime_hex: &str,
-    c_q_hex: &str,
-    old_balance_commitment_hex: &str,
-    new_balance_commitment_hex: &str,
-    r_bp: &[BpG1],
-    r_ext: &[ArkG1],
-) -> Result<Fr, String> {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"dynamic-poa-insert-link-proof");
-    for item in [
-        c_x_hex,
-        c_beta_hex,
-        c_y_x_hex,
-        c_y_hex,
-        c_y_prime_hex,
-        c_q_hex,
-        old_balance_commitment_hex,
-        new_balance_commitment_hex,
-    ] {
-        hasher.update(item.as_bytes());
-    }
-    for point in bp_commitments {
-        hasher.update(&point.to_affine().to_compressed());
-    }
-    for point in r_bp {
-        hasher.update(&point.to_affine().to_compressed());
-    }
-    for point in r_ext {
-        append_ark_g1_bytes(&mut hasher, point)?;
-    }
-    Ok(Fr::from_le_bytes_mod_order(hasher.finalize().as_bytes()))
-}
-
 fn append_ark_g1_bytes(hasher: &mut blake3::Hasher, point: &ArkG1) -> Result<(), String> {
     let mut bytes = Vec::new();
     point
@@ -1901,94 +1450,6 @@ pub(crate) fn fr_to_bp_scalar(value: &Fr) -> Result<BpScalar, String> {
 
 pub(crate) fn ark_g1_to_bp(point: &ArkG1) -> Result<BpG1, String> {
     ark_g1_affine_to_bp(&point.into_affine())
-}
-
-#[cfg(test)]
-mod insert_link_security_tests {
-    use ark_bls12_381::Fr;
-    use ark_ff::{Field, One};
-    use common::crypto::point_g1_to_hex;
-
-    use super::{prove_insert_relation_logic, verify_insert_relation_logic};
-    use crate::commitment::commit_balance;
-    use crate::zkopen::eval_commit;
-
-    #[test]
-    fn insert_link_uses_fresh_sigma_randomness() {
-        let x = Fr::from(2u64);
-        let beta = Fr::from(3u64);
-        let y = Fr::from(5u64);
-        let zeta = Fr::from(7u64);
-        let q = Fr::from(4u64);
-        let y_x = y - q * (zeta - x);
-        let y_prime = beta * y * (zeta - x);
-        let z_x = y_x.inverse().unwrap();
-        let z_beta = beta.inverse().unwrap();
-        let inserted_balance = 4i128;
-        let blinds = (11u64..18).map(Fr::from).collect::<Vec<_>>();
-        let commitments = [x, beta, y_x, y, y_prime, q]
-            .iter()
-            .zip(blinds.iter())
-            .map(|(value, blind)| point_g1_to_hex(&eval_commit(*value, *blind)).unwrap())
-            .collect::<Vec<_>>();
-        let old_balance = commit_balance(10, Fr::from(19u64));
-        let new_balance = old_balance + commit_balance(inserted_balance, blinds[6]);
-        let old_balance_hex = point_g1_to_hex(&old_balance).unwrap();
-        let new_balance_hex = point_g1_to_hex(&new_balance).unwrap();
-
-        let prove = || {
-            prove_insert_relation_logic(
-                x,
-                beta,
-                y_x,
-                y,
-                y_prime,
-                q,
-                z_x,
-                z_beta,
-                inserted_balance,
-                zeta,
-                blinds[0],
-                blinds[1],
-                blinds[2],
-                blinds[3],
-                blinds[4],
-                blinds[5],
-                blinds[6],
-                &commitments[0],
-                &commitments[1],
-                &commitments[2],
-                &commitments[3],
-                &commitments[4],
-                &commitments[5],
-                &old_balance_hex,
-                &new_balance_hex,
-            )
-            .unwrap()
-        };
-        let first = prove();
-        let second = prove();
-        assert_ne!(first.link_proof_hex, second.link_proof_hex);
-        assert_ne!(first.bp_commitments_hex, second.bp_commitments_hex);
-        for proof in [&first, &second] {
-            verify_insert_relation_logic(
-                zeta,
-                &commitments[0],
-                &commitments[1],
-                &commitments[2],
-                &commitments[3],
-                &commitments[4],
-                &commitments[5],
-                &old_balance_hex,
-                &new_balance_hex,
-                &proof.bp_proof_hex,
-                &proof.bp_commitments_hex,
-                &proof.link_proof_hex,
-            )
-            .unwrap();
-        }
-        assert_eq!(y_x * z_x, Fr::one());
-    }
 }
 
 fn ark_g1_affine_to_bp(point: &ArkG1Affine) -> Result<BpG1, String> {
@@ -2156,90 +1617,4 @@ fn decode_link_proof(raw: &str, expected_len: usize) -> Result<LinkProof, String
         s_rho_y: common::crypto::scalar_from_hex(parts[7])?,
         s_r_d: common::crypto::scalar_from_hex(parts[8])?,
     })
-}
-
-fn encode_insert_link_proof(proof: &InsertLinkProof) -> Result<String, String> {
-    let mut parts = Vec::new();
-    parts.push("insertlink:v1".to_string());
-    parts.push(encode_bp_points(&proof.r_bp));
-    parts.push(
-        proof
-            .r_ext
-            .iter()
-            .map(point_g1_to_hex)
-            .collect::<Result<Vec<_>, _>>()?
-            .join(","),
-    );
-    parts.push(
-        proof
-            .s_values
-            .iter()
-            .map(scalar_to_hex)
-            .collect::<Result<Vec<_>, _>>()?
-            .join(","),
-    );
-    parts.push(
-        proof
-            .s_bp_blinds
-            .iter()
-            .map(|blind| hex_encode(blind.to_repr().as_ref()))
-            .collect::<Vec<_>>()
-            .join(","),
-    );
-    parts.push(
-        proof
-            .s_ext_blinds
-            .iter()
-            .map(scalar_to_hex)
-            .collect::<Result<Vec<_>, _>>()?
-            .join(","),
-    );
-    Ok(parts.join(":"))
-}
-
-fn decode_insert_link_proof(raw: &str) -> Result<InsertLinkProof, String> {
-    let parts = raw.split(':').collect::<Vec<_>>();
-    if parts.len() != 7 || parts[0] != "insertlink" || parts[1] != "v1" {
-        return Err("invalid insert link proof encoding".to_string());
-    }
-    Ok(InsertLinkProof {
-        r_bp: decode_bp_points(parts[2])?,
-        r_ext: decode_ark_g1_points(parts[3])?,
-        s_values: decode_fr_csv(parts[4])?,
-        s_bp_blinds: decode_bp_scalar_csv(parts[5])?,
-        s_ext_blinds: decode_fr_csv(parts[6])?,
-    })
-}
-
-fn decode_ark_g1_points(raw: &str) -> Result<Vec<ArkG1>, String> {
-    if raw.trim().is_empty() {
-        return Ok(Vec::new());
-    }
-    raw.split(',').map(point_g1_from_hex).collect()
-}
-
-fn decode_fr_csv(raw: &str) -> Result<Vec<Fr>, String> {
-    if raw.trim().is_empty() {
-        return Ok(Vec::new());
-    }
-    raw.split(',')
-        .map(common::crypto::scalar_from_hex)
-        .collect()
-}
-
-fn decode_bp_scalar_csv(raw: &str) -> Result<Vec<BpScalar>, String> {
-    if raw.trim().is_empty() {
-        return Ok(Vec::new());
-    }
-    raw.split(',')
-        .map(|item| {
-            let bytes = hex_decode(item)?;
-            if bytes.len() != 32 {
-                return Err("invalid BP scalar length".to_string());
-            }
-            let mut array = [0u8; 32];
-            array.copy_from_slice(&bytes);
-            bp_scalar_from_32(&array)
-        })
-        .collect()
 }

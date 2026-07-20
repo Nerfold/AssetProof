@@ -8,12 +8,13 @@ use ark_ff::{BigInteger, PrimeField};
 use common::crypto::{hex_decode, hex_encode};
 use common::types::{ChainBalanceProofInput, OwnershipWitnessInput};
 use sp1_programs_common::io::{Sp1G1Affine, Sp1KzgInsertPublicValues, Sp1KzgInsertStdin};
-use sp1_sdk::blocking::{ProveRequest, Prover as BlockingProver, ProverClient};
+use sp1_sdk::blocking::{Prover as BlockingProver, ProverClient};
 use sp1_sdk::include_elf;
 use sp1_sdk::{ProvingKey, SP1ProofWithPublicValues, SP1Stdin};
 
 use crate::init::{convert_chain_proof, convert_ownership};
-use crate::proof_mode::{configured_proof_mode, ensure_trusted_vk, ConfiguredProofMode};
+use crate::proof_mode::{configured_proof_mode, ensure_trusted_vk};
+use crate::prover_backend::ProofGenerator;
 use crate::setup::{default_setup_dir, load_kzg_insert_vk};
 
 const KZG_INSERT_ELF: sp1_sdk::Elf = include_elf!("sp1-kzg-insert");
@@ -21,6 +22,7 @@ const KZG_INSERT_ELF: sp1_sdk::Elf = include_elf!("sp1-kzg-insert");
 #[derive(Clone)]
 struct Context {
     prover: sp1_sdk::blocking::CpuProver,
+    generator: ProofGenerator,
     pk: Arc<sp1_sdk::SP1ProvingKey>,
 }
 
@@ -36,27 +38,13 @@ pub fn build_stdin(
     chain_balance_proof: &ChainBalanceProofInput,
     encoded_address: Fr,
     encoded_address_blind: Fr,
-    balance_blind_delta: Fr,
-    zeta: Fr,
-    quotient_salt: [u8; 32],
-    quotient_coefficients: &[Fr],
-    quotient_commitment: [u8; 32],
-    quotient_eval: Fr,
-    quotient_eval_blind: Fr,
+    balance_blind: Fr,
     eval_value_base: &G1Projective,
     eval_blind_base: &G1Projective,
     balance_value_base: &G1Projective,
     balance_blind_base: &G1Projective,
-    c_x: &G1Projective,
-    c_quotient_eval: &G1Projective,
-    c_balance_delta: &G1Projective,
-    old_accumulator_hex: &str,
-    new_accumulator_hex: &str,
-    old_balance_commitment_hex: &str,
-    new_balance_commitment_hex: &str,
-    reserve_count_before: usize,
-    reserve_count_after: usize,
-    transcript_hex: &str,
+    c_u: &G1Projective,
+    c_balance: &G1Projective,
 ) -> Result<Sp1KzgInsertStdin, String> {
     Ok(Sp1KzgInsertStdin {
         chain_id: chain_id.to_string(),
@@ -67,40 +55,14 @@ pub fn build_stdin(
         chain_balance_proof: convert_chain_proof(chain_balance_proof)?,
         encoded_address_le: fr_to_le_bytes(encoded_address),
         encoded_address_blind_le: fr_to_le_bytes(encoded_address_blind),
-        balance_blind_delta_le: fr_to_le_bytes(balance_blind_delta),
-        zeta_le: fr_to_le_bytes(zeta),
-        quotient_salt,
-        quotient_coefficients_le: quotient_coefficients
-            .iter()
-            .copied()
-            .map(fr_to_le_bytes)
-            .collect(),
-        quotient_commitment,
-        quotient_eval_le: fr_to_le_bytes(quotient_eval),
-        quotient_eval_blind_le: fr_to_le_bytes(quotient_eval_blind),
+        balance_blind_le: fr_to_le_bytes(balance_blind),
         eval_value_base: point_to_io(eval_value_base),
         eval_blind_base: point_to_io(eval_blind_base),
         balance_value_base: point_to_io(balance_value_base),
         balance_blind_base: point_to_io(balance_blind_base),
-        c_x: point_to_io(c_x),
-        c_quotient_eval: point_to_io(c_quotient_eval),
-        c_balance_delta: point_to_io(c_balance_delta),
-        old_accumulator_hex: old_accumulator_hex.to_string(),
-        new_accumulator_hex: new_accumulator_hex.to_string(),
-        old_balance_commitment_hex: old_balance_commitment_hex.to_string(),
-        new_balance_commitment_hex: new_balance_commitment_hex.to_string(),
-        reserve_count_before,
-        reserve_count_after,
-        transcript_hex: transcript_hex.to_string(),
+        c_u: point_to_io(c_u),
+        c_balance: point_to_io(c_balance),
     })
-}
-
-pub fn quotient_commitment(coefficients: &[Fr], salt: &[u8; 32]) -> [u8; 32] {
-    sp1_programs_common::io::insert_quotient_commitment(
-        salt,
-        coefficients.len(),
-        coefficients.iter().copied().map(fr_to_le_bytes),
-    )
 }
 
 pub fn commitment_params_digest(
@@ -110,7 +72,7 @@ pub fn commitment_params_digest(
     balance_blind: &G1Projective,
 ) -> String {
     let mut hasher = sp1_programs_common::ethereum_eoa::Keccak256Stream::new();
-    hasher.update(b"dynamic-poa-insert-commitment-params-keccak-v2");
+    hasher.update(b"dynamic-poa-hidden-insert-commitment-params-keccak-v1");
     for point in [eval_value, eval_blind, balance_value, balance_blind] {
         let point = point_to_io(point);
         hasher.update(&point.x_be);
@@ -142,15 +104,16 @@ pub fn prove(
     stdin.write(&false);
     stdin.write(&stdin_value);
     drop(stdin_value);
-    let request = ctx.prover.prove(&ctx.pk, stdin);
     let proof_span = tracing::info_span!("poa_sp1_proof", guest = "kzg-insert");
     let _proof_span_guard = proof_span.enter();
     let prove_start = Instant::now();
-    let bundle_result = match configured_proof_mode()? {
-        ConfiguredProofMode::Groth16 => request.groth16().run(),
-        ConfiguredProofMode::Plonk => request.plonk().run(),
-        ConfiguredProofMode::Compressed => request.compressed().run(),
-    };
+    let bundle_result = ctx.generator.prove(
+        &ctx.prover,
+        &ctx.pk,
+        stdin,
+        configured_proof_mode()?,
+        "kzg-insert",
+    );
     common::profiling::record_phase("sp1-prove", "kzg-insert", prove_start.elapsed());
     let bundle = bundle_result.map_err(|err| format!("SP1 KZG insert prove failed: {err}"))?;
     let public_values = decode_public_values(&bundle);
@@ -199,10 +162,12 @@ fn context_with_setup_dir(setup_dir: &Path) -> Result<Context, String> {
     }
     let start = Instant::now();
     let prover = ProverClient::builder().cpu().build();
+    let generator = ProofGenerator::from_env()?;
     let vk = load_kzg_insert_vk(setup_dir, KZG_INSERT_ELF)?;
     let pk = sp1_sdk::SP1ProvingKey::new(vk, KZG_INSERT_ELF);
     let ctx = Context {
         prover,
+        generator,
         pk: Arc::new(pk),
     };
     *guard = Some(ctx.clone());

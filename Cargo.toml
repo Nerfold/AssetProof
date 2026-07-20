@@ -15,6 +15,7 @@ members = [
     "crates/sp1-host",
     "crates/poa-cli",
     "crates/poa-bench",
+    "tools/kzg-msm-bench",
 ]
 resolver = "2"
 

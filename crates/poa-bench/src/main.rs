@@ -7,7 +7,6 @@ use std::time::{Duration, Instant};
 use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::EnvFilter;
 
-use common::crypto::scalar_to_hex;
 use common::io::{encode_proof_binary, read_srs, read_state, write_init, write_srs, write_state};
 use common::types::{
     Delta, InitProvingContext, InitReserveWitness, StoredInitProof, StoredProof, StoredState,
@@ -1342,37 +1341,12 @@ fn encode_insert_proof_text(proof: &KzgInsertProof) -> Result<String, String> {
         ),
         format!("reserve_count_before={}", proof.reserve_count_before),
         format!("reserve_count_after={}", proof.reserve_count_after),
-        format!("quotient_commitment_hex={}", proof.quotient_commitment_hex),
-        format!("c_x_hex={}", proof.c_x_hex),
-        format!("c_beta_hex={}", proof.c_beta_hex),
-        format!("c_y_x_hex={}", proof.c_y_x_hex),
+        format!("c_u_hex={}", proof.c_u_hex),
         format!("c_y_hex={}", proof.c_y_hex),
-        format!("c_y_prime_hex={}", proof.c_y_prime_hex),
-        format!("c_q_hex={}", proof.c_q_hex),
-        format!("zeta={}", scalar_to_hex(&proof.zeta)?),
-        format!(
-            "old_eval_opening_proof_hex={}",
-            proof.old_eval_opening_proof_hex
-        ),
-        format!(
-            "new_eval_opening_proof_hex={}",
-            proof.new_eval_opening_proof_hex
-        ),
-        format!("balance_range_proof_hex={}", proof.balance_range_proof_hex),
-        format!("relation_bp_proof_hex={}", proof.relation_bp_proof_hex),
-        format!(
-            "relation_bp_commitments_hex={}",
-            proof.relation_bp_commitments_hex
-        ),
-        format!("relation_link_proof_hex={}", proof.relation_link_proof_hex),
-        format!(
-            "ownership_artifact_digest_hex={}",
-            proof.ownership_artifact_digest_hex
-        ),
-        format!(
-            "chain_balance_artifact_digest_hex={}",
-            proof.chain_balance_artifact_digest_hex
-        ),
+        format!("c_balance_hex={}", proof.c_balance_hex),
+        format!("d_hex={}", proof.d_hex),
+        format!("strong_zkopen_proof_hex={}", proof.strong_zkopen_proof_hex),
+        format!("nonzero_proof_hex={}", proof.nonzero_proof_hex),
         format!("transcript_hex={}", proof.transcript_hex),
         format!("sp1_proof_hex={}", proof.sp1_proof_hex),
         format!("sp1_vk_hex={}", proof.sp1_vk_hex),

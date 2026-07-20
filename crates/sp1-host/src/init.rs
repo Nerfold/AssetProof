@@ -14,11 +14,12 @@ use sp1_programs_common::io::{
     Sp1InitOwnershipPublicValues, Sp1InitOwnershipStdin, Sp1MerkleSubtree, Sp1OwnershipWitness,
 };
 use sp1_programs_common::io::{Sp1InitPublicValues, Sp1InitReserveEntry, Sp1InitStdin};
-use sp1_sdk::blocking::{ProveRequest, Prover as BlockingProver, ProverClient};
+use sp1_sdk::blocking::{Prover as BlockingProver, ProverClient};
 use sp1_sdk::include_elf;
 use sp1_sdk::{ProvingKey, SP1ProofWithPublicValues, SP1Stdin};
 
-use crate::proof_mode::{configured_proof_mode, ensure_trusted_vk, ConfiguredProofMode};
+use crate::proof_mode::{configured_proof_mode, ensure_trusted_vk};
+use crate::prover_backend::ProofGenerator;
 use crate::setup::{
     default_setup_dir, ensure_protocol_setup_components, ensure_protocol_setups,
     load_init_ownership_vk, load_init_vk,
@@ -31,6 +32,7 @@ const KZG_INSERT_ELF: sp1_sdk::Elf = include_elf!("sp1-kzg-insert");
 #[derive(Clone)]
 struct Sp1InitContext {
     prover: sp1_sdk::blocking::CpuProver,
+    generator: ProofGenerator,
     pk: Arc<sp1_sdk::SP1ProvingKey>,
 }
 
@@ -396,10 +398,12 @@ fn sp1_context() -> Result<Sp1InitContext, String> {
     let start = Instant::now();
     let setup_dir = default_setup_dir();
     let prover = ProverClient::builder().cpu().build();
+    let generator = ProofGenerator::from_env()?;
     let vk = load_init_vk(&setup_dir, INIT_ELF)?;
     let pk = sp1_sdk::SP1ProvingKey::new(vk, INIT_ELF);
     let ctx = Sp1InitContext {
         prover,
+        generator,
         pk: Arc::new(pk),
     };
     *guard = Some(ctx.clone());
@@ -418,10 +422,12 @@ fn sp1_ownership_context() -> Result<Sp1InitContext, String> {
     let start = Instant::now();
     let setup_dir = default_setup_dir();
     let prover = ProverClient::builder().cpu().build();
+    let generator = ProofGenerator::from_env()?;
     let vk = load_init_ownership_vk(&setup_dir, INIT_OWNERSHIP_ELF)?;
     let pk = sp1_sdk::SP1ProvingKey::new(vk, INIT_OWNERSHIP_ELF);
     let ctx = Sp1InitContext {
         prover,
+        generator,
         pk: Arc::new(pk),
     };
     *guard = Some(ctx.clone());
@@ -454,17 +460,14 @@ fn run_sp1_proof<T: serde::Serialize>(
     stdin.write(&false);
     stdin.write(&stdin_value);
     drop(stdin_value);
-    let request = ctx.prover.prove(&ctx.pk, stdin);
     let proof_span = tracing::info_span!("poa_sp1_proof", guest = guest);
     let _proof_span_guard = proof_span.enter();
     let prove_start = Instant::now();
-    let result = match configured_proof_mode()? {
-        ConfiguredProofMode::Groth16 => request.groth16().run(),
-        ConfiguredProofMode::Plonk => request.plonk().run(),
-        ConfiguredProofMode::Compressed => request.compressed().run(),
-    };
+    let result = ctx
+        .generator
+        .prove(&ctx.prover, &ctx.pk, stdin, configured_proof_mode()?, guest);
     common::profiling::record_phase("sp1-prove", guest, prove_start.elapsed());
-    result.map_err(|err| format!("sp1 {guest} prove failed: {err}"))
+    result
 }
 
 fn decode_public_values(bundle: &SP1ProofWithPublicValues) -> Sp1InitPublicValues {

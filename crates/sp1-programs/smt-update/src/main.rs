@@ -3,19 +3,17 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
-use slop_algebra::{AbstractField, PrimeField32};
-use sp1_primitives::{poseidon2_hash, SP1Field};
 use sp1_programs_common::io::{
     Hash, Sp1AddressProof, Sp1CollisionNonMembershipProof, Sp1Leaf, Sp1MembershipProof,
     Sp1NonMembershipProof, Sp1SiblingRef, Sp1UpdatePublicValues, Sp1UpdateStdin,
 };
+use sp1_programs_common::smt::{
+    common_prefix_len, default_hashes, internal_hash, key_bit, key_hash, leaf_hash, prefix_index,
+    update_transition_commitment, valid_depth,
+};
 use sp1_zkvm::entrypoint;
 
 entrypoint!(main);
-
-const LEAF_TAG: u32 = 1;
-const NODE_TAG: u32 = 2;
-const EMPTY_TAG: u32 = 3;
 
 type HashPair = (Hash, Hash);
 type IndexedNodePair = (u128, HashPair);
@@ -28,13 +26,24 @@ fn main() {
 }
 
 fn verify_and_apply_update(input: Sp1UpdateStdin) -> Sp1UpdatePublicValues {
+    assert!(valid_depth(input.depth), "SMT depth must be in 1..=128");
+    assert!(!input.entries.is_empty(), "empty touch list");
     let defaults = default_hashes(input.depth);
     let mut aggregate_delta = 0i128;
-    let mut membership_flags = Vec::with_capacity(input.entries.len());
     let mut leaf_updates = Vec::<IndexedNodePair>::with_capacity(input.entries.len());
     let mut witness_siblings = vec![Vec::<IndexedHash>::new(); input.depth];
+    let mut transition_entries = Vec::with_capacity(input.entries.len());
+    let mut touched_keys = Vec::with_capacity(input.entries.len());
 
     for entry in &input.entries {
+        assert_ne!(entry.delta, 0, "zero delta in touch list");
+        assert_eq!(
+            key_hash(&entry.address).expect("invalid Ethereum touch address"),
+            entry.key,
+            "touch address/key mismatch"
+        );
+        transition_entries.push((entry.key, entry.delta));
+        touched_keys.push(entry.key);
         match &entry.proof {
             Sp1AddressProof::Membership(Sp1MembershipProof { siblings }) => {
                 let old_leaf = entry
@@ -42,10 +51,13 @@ fn verify_and_apply_update(input: Sp1UpdateStdin) -> Sp1UpdatePublicValues {
                     .as_ref()
                     .expect("member update requires old leaf");
                 assert_eq!(old_leaf.key, entry.key, "old leaf key mismatch");
+                assert_eq!(
+                    siblings.len(),
+                    input.depth,
+                    "membership path length mismatch"
+                );
                 let resolved =
                     resolve_membership_siblings(siblings, &input.frontier_hashes, &defaults);
-                let old_root = compute_membership_root(old_leaf, &resolved, input.depth);
-                assert_eq!(old_root, input.old_smt_root, "membership root mismatch");
 
                 let new_balance = old_leaf
                     .balance
@@ -71,9 +83,9 @@ fn verify_and_apply_update(input: Sp1UpdateStdin) -> Sp1UpdatePublicValues {
                 aggregate_delta = aggregate_delta
                     .checked_add(entry.delta)
                     .expect("aggregate delta overflow");
-                membership_flags.push(1);
             }
             Sp1AddressProof::NonMembership(Sp1NonMembershipProof::Default(proof)) => {
+                assert!(entry.old_leaf.is_none(), "non-member carries an old leaf");
                 let resolved = resolve_default_siblings(
                     proof.default_depth,
                     &proof.siblings,
@@ -88,9 +100,9 @@ fn verify_and_apply_update(input: Sp1UpdateStdin) -> Sp1UpdatePublicValues {
                     proof.default_depth,
                     &resolved,
                 );
-                membership_flags.push(0);
             }
             Sp1AddressProof::NonMembership(Sp1NonMembershipProof::Collision(proof)) => {
+                assert!(entry.old_leaf.is_none(), "non-member carries an old leaf");
                 let resolved =
                     resolve_membership_siblings(&proof.siblings, &input.frontier_hashes, &defaults);
                 verify_collision_non_membership_root(
@@ -100,9 +112,13 @@ fn verify_and_apply_update(input: Sp1UpdateStdin) -> Sp1UpdatePublicValues {
                     proof,
                     &resolved,
                 );
-                membership_flags.push(0);
             }
         }
+    }
+
+    touched_keys.sort_unstable();
+    for pair in touched_keys.windows(2) {
+        assert_ne!(pair[0], pair[1], "duplicate touch-list key");
     }
 
     sort_and_validate_leaf_updates(&mut leaf_updates);
@@ -122,16 +138,21 @@ fn verify_and_apply_update(input: Sp1UpdateStdin) -> Sp1UpdatePublicValues {
         .old_balance_total
         .checked_add(aggregate_delta)
         .expect("balance total overflow");
+    let transition_commitment =
+        update_transition_commitment(&input.transition_salt, &transition_entries);
 
     Sp1UpdatePublicValues {
         old_state_root: input.state_root,
         new_state_root: input.new_state_root,
+        depth: input.depth,
         old_smt_root: input.old_smt_root,
         new_smt_root: new_root,
         aggregate_delta,
         old_balance_total: input.old_balance_total,
         new_balance_total,
-        membership_flags,
+        old_leaf_count: input.old_leaf_count,
+        new_leaf_count: input.old_leaf_count,
+        transition_commitment,
     }
 }
 
@@ -372,87 +393,4 @@ fn sibling_index(index: u128) -> u128 {
     } else {
         index - 1
     }
-}
-
-fn leaf_hash(key: &Hash, balance: i128, salt: &Hash) -> Hash {
-    let mut inputs = Vec::with_capacity(21);
-    inputs.push(SP1Field::from_wrapped_u32(LEAF_TAG));
-    push_bytes_fields(&mut inputs, key);
-    push_i128_fields(&mut inputs, balance);
-    push_bytes_fields(&mut inputs, salt);
-    poseidon_digest(inputs)
-}
-
-fn internal_hash(depth: usize, left: &Hash, right: &Hash) -> Hash {
-    let mut inputs = Vec::with_capacity(18);
-    inputs.push(SP1Field::from_wrapped_u32(NODE_TAG));
-    inputs.push(SP1Field::from_wrapped_u32(depth as u32));
-    push_bytes_fields(&mut inputs, left);
-    push_bytes_fields(&mut inputs, right);
-    poseidon_digest(inputs)
-}
-
-fn default_hashes(depth: usize) -> Vec<Hash> {
-    let mut values = Vec::with_capacity(depth + 1);
-    values.push(poseidon_digest(vec![SP1Field::from_wrapped_u32(EMPTY_TAG)]));
-    for height in 1..=depth {
-        let child = values[height - 1];
-        values.push(internal_hash(depth - height, &child, &child));
-    }
-    values
-}
-
-fn poseidon_digest(inputs: Vec<SP1Field>) -> Hash {
-    let digest = poseidon2_hash(inputs);
-    fields_to_bytes(&digest)
-}
-
-fn push_bytes_fields(out: &mut Vec<SP1Field>, bytes: &[u8; 32]) {
-    for chunk in bytes.chunks(4) {
-        let mut word = [0u8; 4];
-        word.copy_from_slice(chunk);
-        out.push(SP1Field::from_wrapped_u32(u32::from_be_bytes(word)));
-    }
-}
-
-fn push_i128_fields(out: &mut Vec<SP1Field>, value: i128) {
-    for chunk in value.to_be_bytes().chunks(4) {
-        let mut word = [0u8; 4];
-        word.copy_from_slice(chunk);
-        out.push(SP1Field::from_wrapped_u32(u32::from_be_bytes(word)));
-    }
-}
-
-fn fields_to_bytes(fields: &[SP1Field; 8]) -> Hash {
-    let mut out = [0u8; 32];
-    for (index, field) in fields.iter().enumerate() {
-        out[index * 4..(index + 1) * 4].copy_from_slice(&field.as_canonical_u32().to_be_bytes());
-    }
-    out
-}
-
-fn key_bit(key: &Hash, depth: usize) -> bool {
-    let byte = key[depth / 8];
-    let offset = 7 - (depth % 8);
-    ((byte >> offset) & 1) == 1
-}
-
-fn prefix_index(key: &Hash, prefix_len: usize) -> u128 {
-    let mut index = 0u128;
-    for depth in 0..prefix_len {
-        index <<= 1;
-        if key_bit(key, depth) {
-            index |= 1;
-        }
-    }
-    index
-}
-
-fn common_prefix_len(a: &Hash, b: &Hash, max_depth: usize) -> usize {
-    for depth in 0..max_depth {
-        if key_bit(a, depth) != key_bit(b, depth) {
-            return depth;
-        }
-    }
-    max_depth
 }

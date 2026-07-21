@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
-use crate::hash::{default_hashes, internal_hash, Hash};
-use crate::key::{common_prefix_len, key_bit, key_for_address};
+use crate::hash::{default_hashes, internal_hash, valid_depth, Hash};
+use crate::key::{common_prefix_len, key_for_address};
 use crate::leaf::Leaf;
 use crate::proof::{
     AddressProof, CollisionNonMembershipProof, CompactAddressProof,
@@ -14,30 +14,43 @@ use crate::proof::{
 pub struct SparseMerkleTree {
     pub depth: usize,
     pub leaves: BTreeMap<String, Leaf>,
+    paths: BTreeMap<u128, String>,
     layers: Vec<BTreeMap<u128, Hash>>,
     root: Hash,
     defaults: Vec<Hash>,
 }
 
 impl SparseMerkleTree {
-    pub fn new(depth: usize) -> Self {
+    pub fn new(depth: usize) -> Result<Self, String> {
         Self::from_leaves(depth, Vec::new())
     }
 
-    pub fn from_leaves(depth: usize, leaves: Vec<Leaf>) -> Self {
+    pub fn from_leaves(depth: usize, leaves: Vec<Leaf>) -> Result<Self, String> {
+        validate_depth(depth)?;
         let mut map = BTreeMap::new();
+        let mut occupied_paths = BTreeMap::<u128, String>::new();
         for leaf in leaves {
-            map.insert(leaf.address.clone(), leaf);
+            let path = prefix_index(&leaf.key, depth);
+            if let Some(existing) = occupied_paths.insert(path, leaf.address.clone()) {
+                return Err(format!(
+                    "SMT path collision at depth {depth}: {existing} and {}",
+                    leaf.address
+                ));
+            }
+            if map.insert(leaf.address.clone(), leaf).is_some() {
+                return Err("duplicate SMT leaf address".to_string());
+            }
         }
         let defaults = default_hashes(depth);
         let (layers, root) = compute_layers(depth, &map, &defaults);
-        Self {
+        Ok(Self {
             depth,
             leaves: map,
+            paths: occupied_paths,
             layers,
             root,
             defaults,
-        }
+        })
     }
 
     pub fn from_leaves_and_layers(
@@ -45,6 +58,7 @@ impl SparseMerkleTree {
         leaves: Vec<Leaf>,
         layers: Vec<BTreeMap<u128, Hash>>,
     ) -> Result<Self, String> {
+        validate_depth(depth)?;
         if layers.len() != depth + 1 {
             return Err(format!(
                 "SMT layer count mismatch: expected {}, got {}",
@@ -53,19 +67,35 @@ impl SparseMerkleTree {
             ));
         }
         let mut map = BTreeMap::new();
+        let mut occupied_paths = BTreeMap::<u128, String>::new();
         for leaf in leaves {
+            let path = prefix_index(&leaf.key, depth);
+            if let Some(existing) = occupied_paths.insert(path, leaf.address.clone()) {
+                return Err(format!(
+                    "stored SMT path collision at depth {depth}: {existing} and {}",
+                    leaf.address
+                ));
+            }
             if map.insert(leaf.address.clone(), leaf).is_some() {
                 return Err("duplicate SMT leaf in stored state".to_string());
             }
         }
-        let defaults = default_hashes(depth);
-        let root = layers
+        let stored_root = layers
             .last()
             .and_then(|layer| layer.get(&0).copied())
-            .unwrap_or(defaults[depth]);
+            .unwrap_or_else(|| default_hashes(depth)[depth]);
+        // Nodes are a rebuildable cache. Normalize legacy full-layer snapshots
+        // into the compact branch-frontier representation and validate them by
+        // the root derived from the authenticated leaf records.
+        let defaults = default_hashes(depth);
+        let (layers, root) = compute_layers(depth, &map, &defaults);
+        if root != stored_root {
+            return Err("stored SMT nodes/root do not match stored leaves".to_string());
+        }
         let tree = Self {
             depth,
             leaves: map,
+            paths: occupied_paths,
             layers,
             root,
             defaults,
@@ -79,30 +109,58 @@ impl SparseMerkleTree {
     }
 
     pub fn get(&self, address: &str) -> Option<&Leaf> {
-        self.leaves.get(address)
+        let normalized = common::encoding::normalize_address(address).ok()?;
+        self.leaves.get(&normalized)
     }
 
     pub fn leaf_records(&self) -> Vec<Leaf> {
         self.leaves.values().cloned().collect()
     }
 
-    pub fn layer_records(&self) -> Vec<(usize, u128, Hash)> {
-        let mut records = Vec::new();
-        for (level, layer) in self.layers.iter().enumerate() {
-            for (index, hash) in layer {
-                records.push((level, *index, *hash));
-            }
-        }
-        records
+    pub fn leaves_iter(&self) -> impl Iterator<Item = &Leaf> {
+        self.leaves.values()
     }
 
-    pub fn upsert(&mut self, leaf: Leaf) {
+    pub fn node_count(&self) -> usize {
+        self.layers.iter().map(BTreeMap::len).sum()
+    }
+
+    pub fn nodes_iter(&self) -> impl Iterator<Item = (usize, u128, &Hash)> {
+        self.layers
+            .iter()
+            .enumerate()
+            .flat_map(|(level, layer)| layer.iter().map(move |(index, hash)| (level, *index, hash)))
+    }
+
+    pub fn upsert(&mut self, leaf: Leaf) -> Result<(), String> {
         let leaf_hash = leaf.hash();
         let leaf_key = leaf.key;
+        let path = prefix_index(&leaf_key, self.depth);
+        if let Some(existing) = self
+            .paths
+            .get(&path)
+            .filter(|existing| existing.as_str() != leaf.address)
+        {
+            return Err(format!(
+                "SMT path collision at depth {}: {} and {}",
+                self.depth, existing, leaf.address
+            ));
+        }
+        let structural_insert = !self.leaves.contains_key(&leaf.address);
+        self.paths.insert(path, leaf.address.clone());
         self.leaves.insert(leaf.address.clone(), leaf);
 
-        let mut index = prefix_index(&leaf_key, self.depth);
-        self.layers[0].insert(index, leaf_hash);
+        if structural_insert {
+            let (layers, root) = compute_layers(self.depth, &self.leaves, &self.defaults);
+            self.layers = layers;
+            self.root = root;
+            return Ok(());
+        }
+
+        let mut index = path;
+        if self.layers[0].contains_key(&index) {
+            self.layers[0].insert(index, leaf_hash);
+        }
 
         let mut current = leaf_hash;
         for level_from_leaf in 0..self.depth {
@@ -118,10 +176,15 @@ impl SparseMerkleTree {
                 internal_hash(node_depth, &sibling_hash, &current)
             };
             index /= 2;
-            self.layers[level_from_leaf + 1].insert(index, parent_hash);
+            if level_from_leaf + 1 == self.depth
+                || self.layers[level_from_leaf + 1].contains_key(&index)
+            {
+                self.layers[level_from_leaf + 1].insert(index, parent_hash);
+            }
             current = parent_hash;
         }
         self.root = current;
+        Ok(())
     }
 
     pub fn leaves_len(&self) -> usize {
@@ -129,8 +192,9 @@ impl SparseMerkleTree {
     }
 
     pub fn proof_for(&self, address: &str) -> Result<AddressProof, String> {
+        let normalized = common::encoding::normalize_address(address)?;
         let key = key_for_address(address)?;
-        if let Some(leaf) = self.get(address) {
+        if let Some(leaf) = self.leaves.get(&normalized) {
             Ok(AddressProof::Membership(MembershipProof {
                 siblings: self.membership_siblings(&leaf.key),
             }))
@@ -214,6 +278,7 @@ impl SparseMerkleTree {
                 self.layers[layer_index]
                     .get(&sibling_index)
                     .copied()
+                    .or_else(|| self.rebuild_subtree_hash(layer_index, sibling_index))
                     .unwrap_or(self.defaults[layer_index]),
             );
             index /= 2;
@@ -221,24 +286,83 @@ impl SparseMerkleTree {
         out
     }
 
-    fn collision_leaf(&self, key: &Hash) -> Option<&Leaf> {
-        self.leaves
-            .values()
-            .find(|leaf| common_prefix_len(&leaf.key, key, self.depth) == self.depth)
-    }
-
-    fn deepest_non_default_prefix(&self, key: &Hash) -> usize {
-        let mut longest = 0usize;
-        for leaf in self.leaves.values() {
-            let prefix_len = common_prefix_len(&leaf.key, key, self.depth);
-            if prefix_len > longest {
-                longest = prefix_len;
-                if longest == self.depth {
-                    break;
+    /// Reconstructs a pruned unary subtree only when a default
+    /// non-membership proof crosses into an empty sibling. Normal membership
+    /// and update paths are served by the O(n)-size branch frontier.
+    fn rebuild_subtree_hash(&self, layer: usize, index: u128) -> Option<Hash> {
+        if layer > self.depth {
+            return None;
+        }
+        let lower = if layer == 128 {
+            0
+        } else {
+            index.checked_shl(layer as u32)?
+        };
+        let upper = if layer == 128 {
+            None
+        } else {
+            index
+                .checked_add(1)
+                .and_then(|value| value.checked_shl(layer as u32))
+        };
+        let mut current = BTreeMap::<u128, Hash>::new();
+        match upper {
+            Some(upper) => {
+                for (path, address) in self.paths.range(lower..upper) {
+                    let leaf = self.leaves.get(address)?;
+                    current.insert(*path, leaf.hash());
+                }
+            }
+            None => {
+                for (path, address) in self.paths.range(lower..) {
+                    let leaf = self.leaves.get(address)?;
+                    current.insert(*path, leaf.hash());
                 }
             }
         }
-        longest
+        if current.is_empty() {
+            return None;
+        }
+        for level_from_leaf in 0..layer {
+            let mut parent = BTreeMap::<u128, Hash>::new();
+            for (&child_index, hash) in &current {
+                if child_index & 1 == 1 && current.contains_key(&(child_index - 1)) {
+                    continue;
+                }
+                let sibling = current
+                    .get(&(child_index ^ 1))
+                    .copied()
+                    .unwrap_or(self.defaults[level_from_leaf]);
+                let node_depth = self.depth - level_from_leaf - 1;
+                let hash = if child_index & 1 == 0 {
+                    internal_hash(node_depth, hash, &sibling)
+                } else {
+                    internal_hash(node_depth, &sibling, hash)
+                };
+                parent.insert(child_index / 2, hash);
+            }
+            current = parent;
+        }
+        current.get(&index).copied()
+    }
+
+    fn collision_leaf(&self, key: &Hash) -> Option<&Leaf> {
+        self.paths
+            .get(&prefix_index(key, self.depth))
+            .and_then(|address| self.leaves.get(address))
+    }
+
+    fn deepest_non_default_prefix(&self, key: &Hash) -> usize {
+        let target = prefix_index(key, self.depth);
+        let predecessor = self.paths.range(..=target).next_back();
+        let successor = self.paths.range(target..).next();
+        predecessor
+            .into_iter()
+            .chain(successor)
+            .filter_map(|(_, address)| self.leaves.get(address))
+            .map(|leaf| common_prefix_len(&leaf.key, key, self.depth))
+            .max()
+            .unwrap_or(0)
     }
 
     fn default_subtree_depth(&self, key: &Hash) -> usize {
@@ -261,16 +385,6 @@ impl SparseMerkleTree {
                         ));
                     }
                 }
-            }
-        }
-
-        for leaf in self.leaves.values() {
-            let index = prefix_index(&leaf.key, self.depth);
-            let stored = self.layers[0]
-                .get(&index)
-                .ok_or_else(|| format!("missing stored leaf node for {}", leaf.address))?;
-            if *stored != leaf.hash() {
-                return Err(format!("stored leaf hash mismatch for {}", leaf.address));
             }
         }
 
@@ -405,46 +519,60 @@ fn compute_layers(
     leaves: &BTreeMap<String, Leaf>,
     defaults: &[Hash],
 ) -> (Vec<BTreeMap<u128, Hash>>, Hash) {
-    let mut layers = Vec::with_capacity(depth + 1);
-    let mut current = BTreeMap::<u128, Hash>::new();
-    for leaf in leaves.values() {
-        current.insert(prefix_index(&leaf.key, depth), leaf.hash());
-    }
-    layers.push(current.clone());
+    let mut layers = (0..=depth)
+        .map(|_| BTreeMap::<u128, Hash>::new())
+        .collect::<Vec<_>>();
+    let mut current = leaves
+        .values()
+        .map(|leaf| (prefix_index(&leaf.key, depth), leaf.hash()))
+        .collect::<Vec<_>>();
+    // Address order is unrelated to the Poseidon key order. Sort once here;
+    // every parent layer produced below remains sorted automatically.
+    current.sort_unstable_by_key(|(index, _)| *index);
 
     for level_from_leaf in 0..depth {
         if current.is_empty() {
-            layers.push(BTreeMap::new());
             continue;
         }
 
-        let mut parent = BTreeMap::<u128, Hash>::new();
-        for (&index, hash) in &current {
-            if index % 2 == 1 && current.contains_key(&(index - 1)) {
-                continue;
-            }
-
-            let sibling_idx = sibling_index(index);
-            let sibling_hash = current
-                .get(&sibling_idx)
-                .copied()
-                .unwrap_or(defaults[level_from_leaf]);
-            let depth_tag = depth - level_from_leaf - 1;
-            let parent_hash = if index % 2 == 0 {
-                internal_hash(depth_tag, hash, &sibling_hash)
+        let mut parent = Vec::<(u128, Hash)>::with_capacity((current.len() + 1) / 2);
+        let mut cursor = 0usize;
+        while cursor < current.len() {
+            let (index, hash) = current[cursor];
+            let paired =
+                index & 1 == 0 && cursor + 1 < current.len() && current[cursor + 1].0 == index + 1;
+            let sibling_hash = if paired {
+                current[cursor + 1].1
             } else {
-                internal_hash(depth_tag, &sibling_hash, hash)
+                defaults[level_from_leaf]
             };
-            parent.insert(index / 2, parent_hash);
+            // Persist only children of actual branch nodes. Unary chains can be
+            // reconstructed by hashing with the public default values and were
+            // the source of the previous O(n * depth) memory footprint.
+            if paired {
+                layers[level_from_leaf].insert(index, hash);
+                layers[level_from_leaf].insert(index + 1, sibling_hash);
+            }
+            let depth_tag = depth - level_from_leaf - 1;
+            let parent_hash = if index & 1 == 0 {
+                internal_hash(depth_tag, &hash, &sibling_hash)
+            } else {
+                internal_hash(depth_tag, &sibling_hash, &hash)
+            };
+            parent.push((index / 2, parent_hash));
+            cursor += if paired { 2 } else { 1 };
         }
-        current = parent.clone();
-        layers.push(parent);
+        current = parent;
     }
 
-    let root = layers
-        .last()
-        .and_then(|layer| layer.get(&0).copied())
+    let root = current
+        .first()
+        .filter(|(index, _)| *index == 0)
+        .map(|(_, hash)| *hash)
         .unwrap_or(defaults[depth]);
+    if !leaves.is_empty() {
+        layers[depth].insert(0, root);
+    }
     (layers, root)
 }
 
@@ -457,12 +585,12 @@ fn sibling_index(index: u128) -> u128 {
 }
 
 pub fn prefix_index(key: &Hash, prefix_len: usize) -> u128 {
-    let mut index = 0u128;
-    for depth in 0..prefix_len {
-        index <<= 1;
-        if key_bit(key, depth) {
-            index |= 1;
-        }
+    crate::hash::prefix_index(key, prefix_len)
+}
+
+fn validate_depth(depth: usize) -> Result<(), String> {
+    if !valid_depth(depth) {
+        return Err(format!("SMT depth must be in 1..=128, got {depth}"));
     }
-    index
+    Ok(())
 }

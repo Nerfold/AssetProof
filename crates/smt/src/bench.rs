@@ -97,7 +97,7 @@ fn build_synthetic_smt_state(
     for index in 0..num_reserves {
         let address = format!("0x{:040x}", index + 1);
         let balance = 1000 + (index as i128 % 97);
-        let salt = SmtState::fresh_salt("smt-bench-init-salt", &address, balance);
+        let salt = SmtState::mock_salt("smt-bench-init-salt", &address, balance);
         leaves.push(Leaf::new(address, balance, salt)?);
     }
     let blind: Fr = hash_to_scalar("smt-bench-init-blind", state_root.as_bytes());

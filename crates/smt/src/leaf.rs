@@ -1,5 +1,6 @@
 use crate::hash::{leaf_hash, Hash};
 use crate::key::key_for_address;
+use common::encoding::normalize_address;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Leaf {
@@ -11,6 +12,7 @@ pub struct Leaf {
 
 impl Leaf {
     pub fn new(address: String, balance: i128, salt: Hash) -> Result<Self, String> {
+        let address = normalize_address(&address)?;
         let key = key_for_address(&address)?;
         Ok(Self {
             address,

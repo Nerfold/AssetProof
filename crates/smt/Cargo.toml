@@ -11,5 +11,5 @@ ark-bls12-381 = "0.6"
 ark-ec = "0.6"
 ark-ff = "0.6"
 common = { path = "../common" }
-slop-algebra = "6.2.4"
-sp1-primitives = "6.2.4"
+rand = "0.8"
+sp1-programs-common = { path = "../sp1-programs/common" }

@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
 use ark_bls12_381::{Fr, G1Affine, G2Affine};
@@ -14,9 +15,12 @@ use crate::encoding::normalize_address;
 use crate::types::{
     Delta, InitReserveWitness, PublicState, ReserveEntry, SmtLeafRecord, SmtNodeRecord,
     StoredInitProof, StoredParallelInitProof, StoredParallelProof, StoredParallelShardProof,
-    StoredParallelShardState, StoredParallelState, StoredProof, StoredSmtProof, StoredSmtState,
-    StoredState,
+    StoredParallelShardState, StoredParallelState, StoredProof, StoredSmtInitProof, StoredSmtProof,
+    StoredSmtState, StoredState,
 };
+
+const SMT_LEAF_MAGIC: &[u8; 8] = b"SMTLF001";
+const SMT_LEAF_RECORD_BYTES: u64 = 20 + 16 + 32;
 
 pub fn read_reserve_csv(path: &Path) -> Result<Vec<ReserveEntry>, String> {
     let input =
@@ -75,7 +79,12 @@ pub fn read_delta_csv(path: &Path) -> Result<Vec<Delta>, String> {
     let mut merged = BTreeMap::<String, i128>::new();
     for (line_no, raw_line) in input.lines().enumerate() {
         let line = raw_line.trim();
-        if line.is_empty() || line.starts_with('#') {
+        if line.is_empty()
+            || line.starts_with('#')
+            || line == "address,delta"
+            || line.starts_with("old_state_root=")
+            || line.starts_with("new_state_root=")
+        {
             continue;
         }
         let parts: Vec<_> = line.split(',').map(|part| part.trim()).collect();
@@ -725,27 +734,16 @@ pub fn write_smt_state(path: &Path, state: &StoredSmtState) -> Result<(), String
         "balance_commitment_hex={}",
         state.balance_commitment_hex
     ));
-    let leaf_addresses = state
-        .leaves
-        .iter()
-        .map(|leaf| leaf.address.clone())
-        .collect::<Vec<_>>();
-    let leaf_balances = state
-        .leaves
-        .iter()
-        .map(|leaf| leaf.balance.to_string())
-        .collect::<Vec<_>>();
-    let leaf_salts = state
-        .leaves
-        .iter()
-        .map(|leaf| leaf.salt_hex.clone())
-        .collect::<Vec<_>>();
+    let leaves_path = path.with_extension("leaves.bin");
+    write_smt_leaves_file(&leaves_path, &state.leaves)?;
+    lines.push(format!("leaf_count={}", state.leaves.len()));
     lines.push(format!(
-        "leaf_addresses={}",
-        write_string_vec_csv(&leaf_addresses)
+        "leaves_path={}",
+        leaves_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("state.leaves.bin")
     ));
-    lines.push(format!("leaf_balances={}", leaf_balances.join(",")));
-    lines.push(format!("leaf_salts={}", leaf_salts.join(",")));
     if !state.nodes.is_empty() {
         let nodes_path = path.with_extension("nodes.bin");
         write_smt_nodes_file(&nodes_path, &state.nodes)?;
@@ -761,26 +759,91 @@ pub fn write_smt_state(path: &Path, state: &StoredSmtState) -> Result<(), String
     fs::write(path, lines.join("\n")).map_err(|err| format!("write {}: {err}", path.display()))
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn write_smt_state_streaming<'a, L, N>(
+    path: &Path,
+    state_root: &str,
+    smt_root_hex: &str,
+    depth: usize,
+    balance_total: i128,
+    balance_blind: &Fr,
+    balance_commitment_hex: &str,
+    leaf_count: usize,
+    leaves: L,
+    node_count: usize,
+    nodes: N,
+) -> Result<(), String>
+where
+    L: IntoIterator<Item = (&'a str, i128, [u8; 32])>,
+    N: IntoIterator<Item = (usize, u128, &'a [u8; 32])>,
+{
+    let leaves_path = path.with_extension("leaves.bin");
+    write_smt_leaf_iter(&leaves_path, leaf_count, leaves)?;
+    let nodes_path = path.with_extension("nodes.bin");
+    write_smt_node_iter(&nodes_path, node_count, nodes)?;
+    let lines = [
+        format!("state_root={state_root}"),
+        format!("smt_root_hex={smt_root_hex}"),
+        format!("depth={depth}"),
+        format!("balance_total={balance_total}"),
+        format!("balance_blind={}", scalar_to_hex(balance_blind)?),
+        format!("balance_commitment_hex={balance_commitment_hex}"),
+        format!("leaf_count={leaf_count}"),
+        format!(
+            "leaves_path={}",
+            leaves_path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("state.leaves.bin")
+        ),
+        format!("node_count={node_count}"),
+        format!(
+            "nodes_path={}",
+            nodes_path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("state.nodes.bin")
+        ),
+    ];
+    fs::write(path, lines.join("\n")).map_err(|err| format!("write {}: {err}", path.display()))
+}
+
 pub fn read_smt_state(path: &Path) -> Result<StoredSmtState, String> {
     let kv = read_key_value_file(path)?;
-    let addresses = req_csv_strings(&kv, "leaf_addresses")?;
-    let balances = req_csv_i128(&kv, "leaf_balances")?;
-    let salts = req_csv_strings(&kv, "leaf_salts")?;
-    if addresses.len() != balances.len() || addresses.len() != salts.len() {
-        return Err("SMT leaf vectors length mismatch".to_string());
-    }
-
-    let mut leaves = Vec::with_capacity(addresses.len());
-    for ((address, balance), salt_hex) in addresses.into_iter().zip(balances).zip(salts) {
-        leaves.push(SmtLeafRecord {
-            address,
-            balance,
-            salt_hex,
-        });
-    }
+    let leaves = if let Some(raw_path) = kv.get("leaves_path") {
+        let leaves_path = resolve_sidecar_path(path, raw_path);
+        let leaves = read_smt_leaves_file(&leaves_path)?;
+        if let Some(expected) = kv.get("leaf_count") {
+            let expected = expected
+                .parse::<usize>()
+                .map_err(|err| format!("invalid leaf_count: {err}"))?;
+            if expected != leaves.len() {
+                return Err("SMT leaf_count does not match leaves_path".to_string());
+            }
+        }
+        leaves
+    } else {
+        // Backwards compatibility for the original text-only state format.
+        let addresses = req_csv_strings(&kv, "leaf_addresses")?;
+        let balances = req_csv_i128(&kv, "leaf_balances")?;
+        let salts = req_csv_strings(&kv, "leaf_salts")?;
+        if addresses.len() != balances.len() || addresses.len() != salts.len() {
+            return Err("SMT leaf vectors length mismatch".to_string());
+        }
+        addresses
+            .into_iter()
+            .zip(balances)
+            .zip(salts)
+            .map(|((address, balance), salt_hex)| SmtLeafRecord {
+                address,
+                balance,
+                salt_hex,
+            })
+            .collect()
+    };
     let (nodes, nodes_path) = if let Some(raw_path) = kv.get("nodes_path") {
-        let nodes_path = path.with_extension("nodes.bin");
-        let nodes = read_smt_nodes_file(&nodes_path)?;
+        let resolved_nodes_path = resolve_sidecar_path(path, raw_path);
+        let nodes = read_smt_nodes_file(&resolved_nodes_path)?;
         if let Some(expected) = kv.get("node_count") {
             let expected = expected
                 .parse::<usize>()
@@ -840,6 +903,10 @@ pub fn write_smt_proof(path: &Path, proof: &StoredSmtProof) -> Result<(), String
         proof.new_balance_commitment_hex
     ));
     lines.push(format!("proof_digest_hex={}", proof.proof_digest_hex));
+    lines.push(format!(
+        "transition_commitment_hex={}",
+        proof.transition_commitment_hex
+    ));
     lines.push(format!("witness_hex={}", proof.witness_hex));
     lines.push(format!(
         "touched_addresses={}",
@@ -858,6 +925,46 @@ pub fn write_smt_proof(path: &Path, proof: &StoredSmtProof) -> Result<(), String
     fs::write(path, lines.join("\n")).map_err(|err| format!("write {}: {err}", path.display()))
 }
 
+pub fn write_smt_init_proof(path: &Path, proof: &StoredSmtInitProof) -> Result<(), String> {
+    let lines = [
+        format!("scheme={}", proof.scheme),
+        format!("mode={}", proof.mode),
+        format!("chain_id={}", proof.chain_id),
+        format!("state_root={}", proof.state_root),
+        format!("session_id={}", proof.session_id),
+        format!("depth={}", proof.depth),
+        format!("smt_root_hex={}", proof.smt_root_hex),
+        format!("balance_total={}", proof.balance_total),
+        format!("reserve_count={}", proof.reserve_count),
+        format!("reserve_commitment_hex={}", proof.reserve_commitment_hex),
+        format!("uses_mock_inputs={}", proof.uses_mock_inputs),
+        format!("proof_digest_hex={}", proof.proof_digest_hex),
+        format!("sp1_proof_hex={}", proof.sp1_proof_hex),
+        format!("ownership_sp1_proof_hex={}", proof.ownership_sp1_proof_hex),
+    ];
+    fs::write(path, lines.join("\n")).map_err(|err| format!("write {}: {err}", path.display()))
+}
+
+pub fn read_smt_init_proof(path: &Path) -> Result<StoredSmtInitProof, String> {
+    let kv = read_key_value_file(path)?;
+    Ok(StoredSmtInitProof {
+        scheme: req_string(&kv, "scheme")?,
+        mode: req_string(&kv, "mode")?,
+        chain_id: req_string(&kv, "chain_id")?,
+        state_root: req_string(&kv, "state_root")?,
+        session_id: req_string(&kv, "session_id")?,
+        depth: req_usize(&kv, "depth")?,
+        smt_root_hex: req_string(&kv, "smt_root_hex")?,
+        balance_total: req_i128(&kv, "balance_total")?,
+        reserve_count: req_usize(&kv, "reserve_count")?,
+        reserve_commitment_hex: req_string(&kv, "reserve_commitment_hex")?,
+        uses_mock_inputs: req_bool(&kv, "uses_mock_inputs")?,
+        proof_digest_hex: req_string(&kv, "proof_digest_hex")?,
+        sp1_proof_hex: req_string(&kv, "sp1_proof_hex")?,
+        ownership_sp1_proof_hex: req_string(&kv, "ownership_sp1_proof_hex")?,
+    })
+}
+
 pub fn read_smt_proof(path: &Path) -> Result<StoredSmtProof, String> {
     let kv = read_key_value_file(path)?;
     Ok(StoredSmtProof {
@@ -872,6 +979,10 @@ pub fn read_smt_proof(path: &Path) -> Result<StoredSmtProof, String> {
         old_balance_commitment_hex: req_string(&kv, "old_balance_commitment_hex")?,
         new_balance_commitment_hex: req_string(&kv, "new_balance_commitment_hex")?,
         proof_digest_hex: req_string(&kv, "proof_digest_hex")?,
+        transition_commitment_hex: kv
+            .get("transition_commitment_hex")
+            .cloned()
+            .unwrap_or_default(),
         witness_hex: req_string(&kv, "witness_hex")?,
         touched_addresses: req_csv_strings(&kv, "touched_addresses")?,
         membership_flags: req_u8_vec(&kv, "membership_flags")?,
@@ -960,6 +1071,12 @@ fn req_i128(kv: &BTreeMap<String, String>, key: &str) -> Result<i128, String> {
     req_string(kv, key)?
         .parse::<i128>()
         .map_err(|err| format!("invalid i128 for {key}: {err}"))
+}
+
+fn req_bool(kv: &BTreeMap<String, String>, key: &str) -> Result<bool, String> {
+    req_string(kv, key)?
+        .parse::<bool>()
+        .map_err(|err| format!("invalid {key}: {err}"))
 }
 
 fn req_csv_strings(kv: &BTreeMap<String, String>, key: &str) -> Result<Vec<String>, String> {
@@ -1063,14 +1180,206 @@ fn decode_smt_nodes(raw: &str) -> Result<Vec<SmtNodeRecord>, String> {
     decode_smt_nodes_bytes(&bytes)
 }
 
+fn resolve_sidecar_path(state_path: &Path, raw_path: &str) -> std::path::PathBuf {
+    let sidecar = Path::new(raw_path);
+    if sidecar.is_absolute() {
+        sidecar.to_path_buf()
+    } else {
+        state_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(sidecar)
+    }
+}
+
+fn write_smt_leaves_file(path: &Path, leaves: &[SmtLeafRecord]) -> Result<(), String> {
+    let file = fs::File::create(path).map_err(|err| format!("create {}: {err}", path.display()))?;
+    let mut writer = BufWriter::new(file);
+    writer
+        .write_all(SMT_LEAF_MAGIC)
+        .and_then(|_| writer.write_all(&(leaves.len() as u64).to_le_bytes()))
+        .map_err(|err| format!("write {}: {err}", path.display()))?;
+    for leaf in leaves {
+        let address = normalize_address(&leaf.address)?;
+        let address_bytes = hex_decode(address.trim_start_matches("0x"))?;
+        let salt = hex_decode(leaf.salt_hex.trim_start_matches("0x"))?;
+        if address_bytes.len() != 20 || salt.len() != 32 {
+            return Err("invalid SMT leaf address or salt width".to_string());
+        }
+        writer
+            .write_all(&address_bytes)
+            .and_then(|_| writer.write_all(&leaf.balance.to_le_bytes()))
+            .and_then(|_| writer.write_all(&salt))
+            .map_err(|err| format!("write {}: {err}", path.display()))?;
+    }
+    writer
+        .flush()
+        .map_err(|err| format!("flush {}: {err}", path.display()))
+}
+
+fn write_smt_leaf_iter<'a, I>(path: &Path, count: usize, leaves: I) -> Result<(), String>
+where
+    I: IntoIterator<Item = (&'a str, i128, [u8; 32])>,
+{
+    let file = fs::File::create(path).map_err(|err| format!("create {}: {err}", path.display()))?;
+    let mut writer = BufWriter::new(file);
+    writer
+        .write_all(SMT_LEAF_MAGIC)
+        .map_err(|err| format!("write {}: {err}", path.display()))?;
+    writer
+        .write_all(&(count as u64).to_le_bytes())
+        .map_err(|err| format!("write {}: {err}", path.display()))?;
+    let mut written = 0usize;
+    for (address, balance, salt) in leaves {
+        let address = normalize_address(address)?;
+        let address_bytes = hex_decode(address.trim_start_matches("0x"))?;
+        if address_bytes.len() != 20 {
+            return Err("invalid SMT leaf address width".to_string());
+        }
+        writer
+            .write_all(&address_bytes)
+            .and_then(|_| writer.write_all(&balance.to_le_bytes()))
+            .and_then(|_| writer.write_all(&salt))
+            .map_err(|err| format!("write {}: {err}", path.display()))?;
+        written += 1;
+    }
+    if written != count {
+        return Err(format!(
+            "SMT leaf iterator count mismatch: expected {count}, got {written}"
+        ));
+    }
+    writer
+        .flush()
+        .map_err(|err| format!("flush {}: {err}", path.display()))
+}
+
+fn write_smt_node_iter<'a, I>(path: &Path, count: usize, nodes: I) -> Result<(), String>
+where
+    I: IntoIterator<Item = (usize, u128, &'a [u8; 32])>,
+{
+    let file = fs::File::create(path).map_err(|err| format!("create {}: {err}", path.display()))?;
+    let mut writer = BufWriter::new(file);
+    writer
+        .write_all(&(count as u64).to_le_bytes())
+        .map_err(|err| format!("write {}: {err}", path.display()))?;
+    let mut written = 0usize;
+    for (level, index, hash) in nodes {
+        let level = u16::try_from(level).map_err(|_| "SMT node level exceeds u16".to_string())?;
+        writer
+            .write_all(&level.to_le_bytes())
+            .and_then(|_| writer.write_all(&index.to_le_bytes()))
+            .and_then(|_| writer.write_all(hash))
+            .map_err(|err| format!("write {}: {err}", path.display()))?;
+        written += 1;
+    }
+    if written != count {
+        return Err(format!(
+            "SMT node iterator count mismatch: expected {count}, got {written}"
+        ));
+    }
+    writer
+        .flush()
+        .map_err(|err| format!("flush {}: {err}", path.display()))
+}
+
+fn read_smt_leaves_file(path: &Path) -> Result<Vec<SmtLeafRecord>, String> {
+    let file = fs::File::open(path).map_err(|err| format!("open {}: {err}", path.display()))?;
+    let file_len = file
+        .metadata()
+        .map_err(|err| format!("stat {}: {err}", path.display()))?
+        .len();
+    let mut reader = BufReader::new(file);
+    let mut magic = [0u8; 8];
+    let mut count_bytes = [0u8; 8];
+    reader
+        .read_exact(&mut magic)
+        .and_then(|_| reader.read_exact(&mut count_bytes))
+        .map_err(|err| format!("read {}: {err}", path.display()))?;
+    if &magic != SMT_LEAF_MAGIC {
+        return Err("unsupported SMT leaves sidecar format".to_string());
+    }
+    let count_u64 = u64::from_le_bytes(count_bytes);
+    let expected = 16u64
+        .checked_add(
+            count_u64
+                .checked_mul(SMT_LEAF_RECORD_BYTES)
+                .ok_or_else(|| "SMT leaf sidecar length overflow".to_string())?,
+        )
+        .ok_or_else(|| "SMT leaf sidecar length overflow".to_string())?;
+    if file_len != expected {
+        return Err(format!(
+            "SMT leaves payload length mismatch: expected {expected}, got {file_len}"
+        ));
+    }
+    let count = usize::try_from(count_u64)
+        .map_err(|_| "SMT leaf count does not fit this platform".to_string())?;
+    let mut leaves = Vec::with_capacity(count);
+    for _ in 0..count {
+        let mut address = [0u8; 20];
+        let mut balance = [0u8; 16];
+        let mut salt = [0u8; 32];
+        reader
+            .read_exact(&mut address)
+            .and_then(|_| reader.read_exact(&mut balance))
+            .and_then(|_| reader.read_exact(&mut salt))
+            .map_err(|err| format!("read {}: {err}", path.display()))?;
+        leaves.push(SmtLeafRecord {
+            address: format!("0x{}", hex_encode(&address)),
+            balance: i128::from_le_bytes(balance),
+            salt_hex: hex_encode(&salt),
+        });
+    }
+    Ok(leaves)
+}
+
 fn write_smt_nodes_file(path: &Path, nodes: &[SmtNodeRecord]) -> Result<(), String> {
     let bytes = encode_smt_nodes_bytes(nodes)?;
     fs::write(path, bytes).map_err(|err| format!("write {}: {err}", path.display()))
 }
 
 fn read_smt_nodes_file(path: &Path) -> Result<Vec<SmtNodeRecord>, String> {
-    let bytes = fs::read(path).map_err(|err| format!("read {}: {err}", path.display()))?;
-    decode_smt_nodes_bytes(&bytes)
+    let file = fs::File::open(path).map_err(|err| format!("open {}: {err}", path.display()))?;
+    let file_len = file
+        .metadata()
+        .map_err(|err| format!("stat {}: {err}", path.display()))?
+        .len();
+    let mut reader = BufReader::new(file);
+    let mut count_bytes = [0u8; 8];
+    reader
+        .read_exact(&mut count_bytes)
+        .map_err(|err| format!("read {}: {err}", path.display()))?;
+    let count_u64 = u64::from_le_bytes(count_bytes);
+    let expected = 8u64
+        .checked_add(
+            count_u64
+                .checked_mul(50)
+                .ok_or_else(|| "SMT node sidecar length overflow".to_string())?,
+        )
+        .ok_or_else(|| "SMT node sidecar length overflow".to_string())?;
+    if file_len != expected {
+        return Err(format!(
+            "SMT nodes payload length mismatch: expected {expected}, got {file_len}"
+        ));
+    }
+    let count = usize::try_from(count_u64)
+        .map_err(|_| "SMT node count does not fit this platform".to_string())?;
+    let mut nodes = Vec::with_capacity(count);
+    for _ in 0..count {
+        let mut level = [0u8; 2];
+        let mut index = [0u8; 16];
+        let mut hash = [0u8; 32];
+        reader
+            .read_exact(&mut level)
+            .and_then(|_| reader.read_exact(&mut index))
+            .and_then(|_| reader.read_exact(&mut hash))
+            .map_err(|err| format!("read {}: {err}", path.display()))?;
+        nodes.push(SmtNodeRecord {
+            level: u16::from_le_bytes(level) as usize,
+            index: u128::from_le_bytes(index),
+            hash_hex: hex_encode(&hash),
+        });
+    }
+    Ok(nodes)
 }
 
 fn encode_smt_nodes_bytes(nodes: &[SmtNodeRecord]) -> Result<Vec<u8>, String> {
@@ -1278,9 +1587,21 @@ fn req_u8_vec(kv: &BTreeMap<String, String>, key: &str) -> Result<Vec<u8>, Strin
 #[cfg(test)]
 mod init_privacy_tests {
     use ark_bls12_381::Fr;
+    use std::fs;
 
-    use super::{decode_proof_binary, encode_proof_binary, encode_stored_init_proof};
-    use crate::types::{StoredInitProof, StoredProof};
+    use super::{
+        decode_proof_binary, encode_proof_binary, encode_stored_init_proof, read_delta_csv,
+        read_smt_leaves_file, read_smt_state, write_smt_leaves_file, write_smt_state,
+    };
+    use crate::types::{SmtLeafRecord, StoredInitProof, StoredProof, StoredSmtState};
+
+    fn temp_path(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "poa-{label}-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ))
+    }
 
     #[test]
     fn public_init_proof_encoding_omits_private_openings() {
@@ -1342,5 +1663,71 @@ mod init_privacy_tests {
         let encoded = encode_proof_binary(&proof).unwrap();
         assert!(encoded.starts_with(b"DPOAUPD6"));
         assert_eq!(decode_proof_binary(&encoded).unwrap(), proof);
+    }
+
+    #[test]
+    fn smt_leaf_sidecar_round_trip() {
+        let path = temp_path("smt-leaves.bin");
+        let leaves = vec![
+            SmtLeafRecord {
+                address: "0x1111111111111111111111111111111111111111".to_string(),
+                balance: 123,
+                salt_hex: "22".repeat(32),
+            },
+            SmtLeafRecord {
+                address: "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd".to_string(),
+                balance: 456,
+                salt_hex: "33".repeat(32),
+            },
+        ];
+        write_smt_leaves_file(&path, &leaves).unwrap();
+        assert_eq!(read_smt_leaves_file(&path).unwrap(), leaves);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn delta_reader_accepts_persisted_fixture_headers() {
+        let path = temp_path("fixture-deltas.csv");
+        fs::write(
+            &path,
+            concat!(
+                "old_state_root=old\n",
+                "new_state_root=new\n",
+                "address,delta\n",
+                "0x1111111111111111111111111111111111111111,7\n"
+            ),
+        )
+        .unwrap();
+        let deltas = read_delta_csv(&path).unwrap();
+        assert_eq!(deltas.len(), 1);
+        assert_eq!(deltas[0].delta, 7);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn smt_state_uses_binary_leaf_sidecar_and_round_trips() {
+        let path = temp_path("smt-state.txt");
+        let state = StoredSmtState {
+            state_root: "root".to_string(),
+            smt_root_hex: "44".repeat(32),
+            depth: 128,
+            balance_total: 123,
+            balance_blind: Fr::from(9u64),
+            balance_commitment_hex: "commitment".to_string(),
+            leaves: vec![SmtLeafRecord {
+                address: "0x1111111111111111111111111111111111111111".to_string(),
+                balance: 123,
+                salt_hex: "55".repeat(32),
+            }],
+            nodes: Vec::new(),
+            nodes_path: String::new(),
+        };
+        write_smt_state(&path, &state).unwrap();
+        let metadata = fs::read_to_string(&path).unwrap();
+        assert!(metadata.contains("leaves_path="));
+        assert!(!metadata.contains("leaf_addresses="));
+        assert_eq!(read_smt_state(&path).unwrap(), state);
+        fs::remove_file(path.with_extension("leaves.bin")).unwrap();
+        fs::remove_file(path).unwrap();
     }
 }

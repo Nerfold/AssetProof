@@ -254,6 +254,88 @@ initialization 和 KZG insert 生成 SP1 setup：
 ./poa sp1-smt-setup
 ```
 
+### Poseidon SMT + SP1 方案
+
+这套实现把 genesis、地址集合维护与余额变化计算都放进 SP1。初始化使用两份通过同一个
+ordered reserve commitment 绑定的 proof：`smt-init` guest 验证链余额证明并构造 Poseidon
+SMT root，`init-ownership` guest 验证 ECDSA/密钥所有权。只有两份 proof 的 chain context、
+reserve count 和 commitment 全部一致，host/verifier 才接受 genesis。
+初始化输入必须按规范化后的 lowercase Ethereum address 严格升序排列；这样 host 不需要为
+百万级输入再复制、排序一份完整 witness。示例 CSV 是 mock 入口，真实 Ethereum 集成通过
+`prove_smt_initialization` 传入 ECDSA ownership signature 与 account/Merkle proof。
+
+本地 prover 保存固定深度的 Poseidon Sparse Merkle Tree；update 的私有输入是 touch list、
+旧叶子以及压缩后的 membership/non-membership paths。guest 验证地址到 Poseidon key 的
+编码、旧 root、余额非负性，并批量计算新 root 和 aggregate delta。外部 verifier 只验证
+可信本地 VK 对应的 SP1 proof，以及公开的旧/新链 state root、旧/新 SMT root、余额总量和
+salted touch-list commitment。
+
+SP1 proof 文件不会再保存 touch 地址、membership flags、Merkle paths、leaf salts、blind
+delta 或 prover 提供的 VK。touch-list commitment 用于和独立验证的 sync 输出绑定；本实现
+不负责证明 sync 数据确实来自 Ethereum 执行层。
+
+固定深度树当前支持 `1..=128`。如果两个不同地址在配置深度内落到同一路径，初始化和
+insert 会 fail closed，避免覆盖已有叶子；生产配置建议使用 128。初始 SMT root、balance
+total、reserve count 和链 state root 均由 initialization proof 公开绑定，后续更新从这些
+公开值递推。
+
+```bash
+./poa sp1-smt-setup
+./poa smt-init 128 data/mock/init-witness.csv mock-chain \
+  0x0000000000000000000000000000000000000000000000000000000000000000 \
+  smt-session-0 artifacts/states/smt-0.txt artifacts/proofs/smt-init.txt
+./poa smt-init-verify mock-chain \
+  0x0000000000000000000000000000000000000000000000000000000000000000 \
+  smt-session-0 artifacts/states/smt-0.txt artifacts/proofs/smt-init.txt
+./poa smt-update artifacts/states/smt-0.txt data/mock/deltas.csv state-root-1 \
+  artifacts/states/smt-1.txt artifacts/proofs/smt-update.txt
+./poa smt-verify artifacts/states/smt-0.txt artifacts/states/smt-1.txt \
+  artifacts/proofs/smt-update.txt update
+```
+
+要让 SMT 方案直接复用 protocol benchmark 已生成的 Ethereum 格式 mock 账户、ECDSA
+signature、共享 Merkle prefix proof、delta 和 insert candidate，先准备原始 fixture，再执行
+一次持久化 SMT initialization：
+
+```bash
+MASTER_N=1000 N_SIZES=1000 M_SIZES=100 \
+  FIXTURE_DIR=data/mock/bench/generated \
+  ./scripts/initialize_benchmark_data.sh
+
+MASTER_N=1000 N_SIZES=1000 M_SIZES=100 SMT_DEPTH=128 \
+  FIXTURE_DIR=data/mock/bench/generated \
+  SMT_OUTPUT_DIR=data/mock/bench/smt-persisted/master_n_1000/depth_128 \
+  POA_SP1_PROOF_MODE=compressed \
+  ./scripts/initialize_smt_benchmark_data.sh
+```
+
+第二个脚本会对每个 `n` 保存：
+
+- `state-0000.txt`：小型状态元数据；
+- `state-0000.leaves.bin` 和 `state-0000.nodes.bin`：可直接恢复的私有 SMT；
+- `initialization-proof.txt`：两份绑定后的 SP1 initialization proof；
+- `deltas-m-*.csv`、`insert.csv`：从同一份 NIZK mock fixture 导出的后续输入；
+- `manifest.txt`：state root、新 state root、路径和规模信息。
+
+重复运行会加载状态并验证 initialization proof，验证通过后直接复用，不重新建树或证明。
+guest 或持久化格式升级后，可设置 `SMT_FORCE=true` 强制覆盖生成这一输出目录中的状态。
+例如继续测试 `n=1000,m=100`：
+
+```bash
+RUN=data/mock/bench/smt-persisted/master_n_1000/depth_128/n_1000
+UPDATE_ROOT=$(sed -n 's/^m.100.new_state_root=//p' "$RUN/manifest.txt")
+INSERT_ROOT=$(sed -n 's/^insert_new_state_root=//p' "$RUN/manifest.txt")
+
+./poa smt-update "$RUN/state-0000.txt" "$RUN/deltas-m-100.csv" \
+  "$UPDATE_ROOT" "$RUN/state-update-m100.txt" "$RUN/update-m100-proof.txt"
+
+./poa smt-insert-file "$RUN/state-0000.txt" "$RUN/insert.csv" \
+  "$INSERT_ROOT" "$RUN/state-insert.txt" "$RUN/insert-proof.txt"
+```
+
+update 和 insert 都从同一个初始化状态分别开始，互不覆盖。新格式不再把百万个 leaf
+拼进超长文本行，因此加载时不会产生对应的大型临时字符串；旧的文本 SMT state 仍可读取。
+
 `scripts/benchmark_protocol.sh` 默认使用适合工作站的 SP1 分片与 trace-buffer
 上限（`SHARD_SIZE=1048576`、两个 trace slots），以控制 Groth16 峰值内存。这些值
 都会写入 benchmark 的 `environment.txt`，也可在命令前显式覆盖。
@@ -569,12 +651,45 @@ SAMPLES=5 WARMUP=1 POA_SP1_PROOF_MODE=groth16 \
 
 ### SP1 Network
 
-SP1 proof generation 已集中经过 `crates/sp1-host/src/prover_backend.rs`，setup 与 proof
-verification 仍绑定本地可信 VK。当前锁定依赖中，`sp1-sdk/network` 与 Bulletproof 使用的
-两个 `blst` 原生版本存在 Cargo `links` 冲突，因此不能把 Network client 直接编进主
-协议进程。后续应使用独立 Network worker；接口、安全要求和三个 guest 的映射见
-[`docs/SP1_NETWORK.md`](docs/SP1_NETWORK.md)。特别是 Network 请求必须使用 private stdin，
-不能公开上传 initialization/insert witness。
+SP1 Network client 位于独立 Cargo workspace，避免与主进程 Bulletproofs 的原生 `blst`
+冲突。先构建一次 worker：
+
+```bash
+./poa sp1-network-build
+```
+
+随后在当前 shell 中安全设置 `NETWORK_PRIVATE_KEY`，并选择 Network backend：
+
+```bash
+read -s NETWORK_PRIVATE_KEY
+export NETWORK_PRIVATE_KEY
+export SP1_PROVER=network
+```
+
+NIZK initialization：
+
+```bash
+MASTER_N=1000 N_SIZES=1000 M_SIZES=100 \
+FIXTURE_DIR=data/mock/bench/generated-merkle \
+SRS_DIR=params/srs/bench BENCHMARK_OPERATIONS=initialization \
+SAMPLES=1 WARMUP=0 POA_SP1_PROOF_MODE=compressed \
+OUTPUT_DIR=artifacts/benchmarks/nizk-init-network-n1000 \
+./scripts/benchmark_protocol.sh
+```
+
+SMT initialization：
+
+```bash
+MASTER_N=1000 N_SIZES=1000 M_SIZES=100 SMT_DEPTH=128 \
+FIXTURE_DIR=data/mock/bench/generated-merkle \
+SMT_OUTPUT_DIR=data/mock/bench/smt-persisted-network/master_n_1000/depth_128 \
+POA_SP1_PROOF_MODE=compressed \
+./scripts/initialize_smt_benchmark_data.sh
+```
+
+所有 Network stdin 都强制使用 private upload。返回 proof 会先由主进程使用本地可信 VK
+验证，再进入协议 proof。临时请求文件权限、worker 覆盖方式和安全边界见
+[`docs/SP1_NETWORK.md`](docs/SP1_NETWORK.md)。
 
 ### SP1 阶段分析
 

@@ -105,6 +105,7 @@ pub enum Sp1AddressProof {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Sp1UpdateEntryWitness {
+    pub address: String,
     pub key: Hash,
     pub delta: i128,
     pub old_leaf: Option<Sp1Leaf>,
@@ -118,6 +119,8 @@ pub struct Sp1UpdateStdin {
     pub depth: usize,
     pub old_smt_root: Hash,
     pub old_balance_total: i128,
+    pub old_leaf_count: usize,
+    pub transition_salt: Hash,
     pub frontier_hashes: Vec<Hash>,
     pub entries: Vec<Sp1UpdateEntryWitness>,
 }
@@ -126,12 +129,15 @@ pub struct Sp1UpdateStdin {
 pub struct Sp1UpdatePublicValues {
     pub old_state_root: String,
     pub new_state_root: String,
+    pub depth: usize,
     pub old_smt_root: Hash,
     pub new_smt_root: Hash,
     pub aggregate_delta: i128,
     pub old_balance_total: i128,
     pub new_balance_total: i128,
-    pub membership_flags: Vec<u8>,
+    pub old_leaf_count: usize,
+    pub new_leaf_count: usize,
+    pub transition_commitment: Hash,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -141,10 +147,13 @@ pub struct Sp1InsertStdin {
     pub depth: usize,
     pub old_smt_root: Hash,
     pub old_balance_total: i128,
+    pub old_leaf_count: usize,
     pub frontier_hashes: Vec<Hash>,
+    pub address: String,
     pub key: Hash,
     pub balance: i128,
     pub salt: Hash,
+    pub transition_salt: Hash,
     pub non_membership_proof: Sp1NonMembershipProof,
 }
 
@@ -152,17 +161,28 @@ pub struct Sp1InsertStdin {
 pub struct Sp1InsertPublicValues {
     pub old_state_root: String,
     pub new_state_root: String,
+    pub depth: usize,
     pub old_smt_root: Hash,
     pub new_smt_root: Hash,
     pub inserted_balance: i128,
     pub old_balance_total: i128,
     pub new_balance_total: i128,
+    pub old_leaf_count: usize,
+    pub new_leaf_count: usize,
+    pub transition_commitment: Hash,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Sp1InitReserveEntry {
     pub address: String,
     pub encoded_address_le: [u8; 32],
+    pub balance: i128,
+    pub chain_balance_proof: Sp1ChainBalanceProof,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Sp1SmtInitReserveEntry {
+    pub address: String,
     pub balance: i128,
     pub chain_balance_proof: Sp1ChainBalanceProof,
 }
@@ -283,6 +303,30 @@ pub struct Sp1InitPublicValues {
     pub shape_commitment: Hash,
     pub eval_commitment: Sp1G1Affine,
     pub commitment_params_digest_hex: String,
+    pub uses_mock_inputs: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Sp1SmtInitStdin {
+    pub chain_id: String,
+    pub state_root: String,
+    pub session_id: String,
+    pub depth: usize,
+    pub reserves: Vec<Sp1SmtInitReserveEntry>,
+    pub leaf_salts: Vec<Hash>,
+    pub merkle_prefix_proof: Option<Sp1BinaryMerklePrefixProof>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Sp1SmtInitPublicValues {
+    pub chain_id: String,
+    pub state_root: String,
+    pub session_id: String,
+    pub depth: usize,
+    pub smt_root: Hash,
+    pub balance_total: i128,
+    pub reserve_count: usize,
+    pub reserve_commitment: Hash,
     pub uses_mock_inputs: bool,
 }
 

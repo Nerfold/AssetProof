@@ -3,7 +3,9 @@
 extern crate alloc;
 
 pub mod bls12_381_scalar;
+pub mod chain_balance;
 pub mod ethereum_binary_merkle;
 pub mod ethereum_eoa;
 pub mod ethereum_mpt;
 pub mod io;
+pub mod smt;

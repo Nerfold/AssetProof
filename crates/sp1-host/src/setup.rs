@@ -10,6 +10,7 @@ use sp1_sdk::SP1VerifyingKey;
 
 const UPDATE_ELF_NAME: &str = "smt-update";
 const INSERT_ELF_NAME: &str = "smt-insert";
+const SMT_INIT_ELF_NAME: &str = "smt-init";
 const INIT_ELF_NAME: &str = "init";
 const INIT_OWNERSHIP_ELF_NAME: &str = "init-ownership";
 const KZG_INSERT_ELF_NAME: &str = "kzg-insert";
@@ -62,10 +63,32 @@ pub fn ensure_protocol_setup_components(
     Ok(())
 }
 
-pub fn ensure_smt_setups(setup_dir: &Path, update_elf: Elf, insert_elf: Elf) -> Result<(), String> {
+pub fn ensure_smt_setups(
+    setup_dir: &Path,
+    init_elf: Elf,
+    ownership_elf: Elf,
+    update_elf: Elf,
+    insert_elf: Elf,
+) -> Result<(), String> {
+    ensure_setup_file(setup_dir, SMT_INIT_ELF_NAME, init_elf)?;
+    ensure_setup_file(setup_dir, INIT_OWNERSHIP_ELF_NAME, ownership_elf)?;
     ensure_setup_file(setup_dir, UPDATE_ELF_NAME, update_elf)?;
     ensure_setup_file(setup_dir, INSERT_ELF_NAME, insert_elf)?;
     Ok(())
+}
+
+pub fn ensure_smt_init_setups(
+    setup_dir: &Path,
+    init_elf: Elf,
+    ownership_elf: Elf,
+) -> Result<(), String> {
+    ensure_setup_file(setup_dir, SMT_INIT_ELF_NAME, init_elf)?;
+    ensure_setup_file(setup_dir, INIT_OWNERSHIP_ELF_NAME, ownership_elf)?;
+    Ok(())
+}
+
+pub fn load_smt_init_vk(setup_dir: &Path, init_elf: Elf) -> Result<SP1VerifyingKey, String> {
+    load_setup_file(setup_dir, SMT_INIT_ELF_NAME, init_elf)
 }
 
 pub fn load_kzg_insert_vk(setup_dir: &Path, elf: Elf) -> Result<SP1VerifyingKey, String> {
@@ -124,9 +147,17 @@ fn ensure_setup_file(setup_dir: &Path, elf_name: &str, elf: Elf) -> Result<(), S
 
 fn load_setup_file(setup_dir: &Path, elf_name: &str, elf: Elf) -> Result<SP1VerifyingKey, String> {
     let path = setup_file_path(setup_dir, elf_name);
+    let setup_command = if matches!(
+        elf_name,
+        SMT_INIT_ELF_NAME | UPDATE_ELF_NAME | INSERT_ELF_NAME
+    ) {
+        "sp1-smt-setup"
+    } else {
+        "sp1-setup"
+    };
     if !path.exists() {
         return Err(format!(
-            "missing SP1 setup artifact {}. Run `./poa sp1-setup {}` first.",
+            "missing SP1 setup artifact {}. Run `./poa {setup_command} {}` first.",
             path.display(),
             setup_dir.display()
         ));
@@ -135,7 +166,7 @@ fn load_setup_file(setup_dir: &Path, elf_name: &str, elf: Elf) -> Result<SP1Veri
     let digest = elf_digest(&elf);
     if stored.elf_digest != digest {
         return Err(format!(
-            "stale SP1 setup artifact {} for {}. Re-run `./poa sp1-setup {}`.",
+            "stale SP1 setup artifact {} for {}. Re-run `./poa {setup_command} {}`.",
             path.display(),
             elf_name,
             setup_dir.display()

@@ -339,11 +339,14 @@ fn initialize_core(
     let kzg_opening_proof = kzg_open(srs, &p_s, zeta, p_zeta)?;
     let r_y = Fr::rand(&mut rng);
     let c_y = commit_eval(p_zeta, r_y);
+    let accumulator_hex = point_g1_to_hex(&accumulator)?;
+    let balance_commitment_hex = point_g1_to_hex(&balance_commitment)?;
+    let c_y_hex = point_g1_to_hex(&c_y)?;
     let kzg_opening_proof_hex = prove_committed_opening(
         srs,
-        &point_g1_to_hex(&accumulator)?,
+        &accumulator_hex,
         zeta,
-        &point_g1_to_hex(&c_y)?,
+        &c_y_hex,
         p_zeta,
         r_y,
         &kzg_opening_proof,
@@ -357,10 +360,10 @@ fn initialize_core(
         &ctx.state_root,
         &ctx.session_id,
         reserve_entries.len(),
-        &point_g1_to_hex(&accumulator)?,
-        &point_g1_to_hex(&balance_commitment)?,
+        &accumulator_hex,
+        &balance_commitment_hex,
         &common::crypto::hex_encode(&c_shape),
-        &point_g1_to_hex(&c_y)?,
+        &c_y_hex,
         zeta,
     );
     let srs_hash_hex = point_hash_srs(srs)?;
@@ -439,19 +442,19 @@ fn initialize_core(
         chain_id: ctx.chain_id.clone(),
         state_root: ctx.state_root.clone(),
         session_id: ctx.session_id.clone(),
-        accumulator_hex: point_g1_to_hex(&accumulator)?,
-        balance_commitment_hex: point_g1_to_hex(&balance_commitment)?,
+        accumulator_hex,
+        balance_commitment_hex,
         c_shape_hex: common::crypto::hex_encode(&c_shape),
-        c_y_hex: point_g1_to_hex(&c_y)?,
+        c_y_hex,
         reserve_count: reserve_entries.len(),
         zeta,
         kzg_opening_proof_hex,
         sp1_proof_hex: merkle_sp1.proof_hex,
-        sp1_vk_hex: merkle_sp1.vk_hex,
-        sp1_public_values_hex: merkle_sp1.public_values_hex,
+        sp1_vk_hex: String::new(),
+        sp1_public_values_hex: String::new(),
         ownership_sp1_proof_hex: ownership_sp1.proof_hex,
-        ownership_sp1_vk_hex: ownership_sp1.vk_hex,
-        ownership_sp1_public_values_hex: ownership_sp1.public_values_hex,
+        ownership_sp1_vk_hex: String::new(),
+        ownership_sp1_public_values_hex: String::new(),
         transcript_hex,
         srs_hash_hex,
     };
@@ -580,9 +583,7 @@ pub(crate) fn verify_init_public_proof(
     }
     if proof.kzg_opening_proof_hex.is_empty()
         || proof.sp1_proof_hex.is_empty()
-        || proof.sp1_vk_hex.is_empty()
         || proof.ownership_sp1_proof_hex.is_empty()
-        || proof.ownership_sp1_vk_hex.is_empty()
     {
         return Err("missing init proof-system artifact".to_string());
     }

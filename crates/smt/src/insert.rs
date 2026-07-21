@@ -14,10 +14,9 @@ pub struct InsertWitness {
     pub address: String,
     pub balance: i128,
     pub salt: [u8; 32],
-    pub ownership_proof: String,
-    pub chain_proof: String,
     pub non_membership_proof: NonMembershipProof,
     pub balance_blind_delta: Fr,
+    pub transition_salt: [u8; 32],
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -35,19 +34,35 @@ pub fn build_insert_witness(
     if balance < 0 {
         return Err("insert balance must be non-negative".to_string());
     }
-    let proof = state.tree().proof_for(address)?;
+    let address = common::encoding::normalize_address(address)?;
+    let proof = state.tree().proof_for(&address)?;
     let AddressProof::NonMembership(non_membership_proof) = proof else {
         return Err(format!("address {address} already exists in SMT"));
     };
+    if matches!(non_membership_proof, NonMembershipProof::Collision(_)) {
+        return Err(format!(
+            "cannot insert {address}: occupied SMT path at depth {}; use a deeper tree",
+            state.depth
+        ));
+    }
     Ok(InsertWitness {
-        address: address.to_string(),
+        address: address.clone(),
         balance,
-        salt: SmtState::fresh_salt("smt-insert-salt", address, balance),
-        ownership_proof: format!("dummy-ownership:{address}"),
-        chain_proof: format!("dummy-chain-balance:{address}:{balance}"),
+        salt: SmtState::random_salt(),
         non_membership_proof,
         balance_blind_delta,
+        transition_salt: SmtState::random_salt(),
     })
+}
+
+pub fn transition_commitment(witness: &InsertWitness) -> Result<[u8; 32], String> {
+    let key = key_for_address(&witness.address)?;
+    Ok(crate::hash::insert_transition_commitment(
+        &witness.transition_salt,
+        &key,
+        witness.balance,
+        &witness.salt,
+    ))
 }
 
 pub fn apply_insert_with_witness(
@@ -72,16 +87,6 @@ pub fn apply_insert_in_place(
     if witness.balance < 0 {
         return Err("negative inserted balance".to_string());
     }
-    if !witness.ownership_proof.starts_with("dummy-ownership:") {
-        return Err("ownership proof rejected".to_string());
-    }
-    if !witness
-        .chain_proof
-        .ends_with(&format!(":{}", witness.balance))
-    {
-        return Err("chain proof rejected".to_string());
-    }
-
     let old_state_root = state.state_root.clone();
     let old_root = state.smt_root();
     let old_commitment = state.balance_commitment();
@@ -92,8 +97,10 @@ pub fn apply_insert_in_place(
         witness.address.clone(),
         witness.balance,
         witness.salt,
-    )?);
-    state.balance_total = old_balance_total + witness.balance;
+    )?)?;
+    state.balance_total = old_balance_total
+        .checked_add(witness.balance)
+        .ok_or_else(|| "insert balance total overflow".to_string())?;
     state.balance_blind = old_blind + witness.balance_blind_delta;
     state.state_root = new_state_root.to_string();
 
@@ -127,6 +134,7 @@ pub fn apply_insert_in_place(
         old_balance_commitment_hex: point_g1_to_hex(&old_commitment)?,
         new_balance_commitment_hex: point_g1_to_hex(&new_commitment)?,
         proof_digest_hex: common::crypto::hex_encode(&proof_digest),
+        transition_commitment_hex: hex_string(&transition_commitment(witness)?),
         witness_hex,
         touched_addresses: vec![witness.address.clone()],
         membership_flags: vec![0],
@@ -148,6 +156,9 @@ pub fn verify_insert(
     }
     if replay.proof.proof_digest_hex != proof.proof_digest_hex {
         return Err("insert proof digest mismatch".to_string());
+    }
+    if replay.proof.transition_commitment_hex != proof.transition_commitment_hex {
+        return Err("insert transition commitment mismatch".to_string());
     }
     Ok(())
 }
@@ -206,13 +217,12 @@ pub fn serialize_insert_witness(witness: &InsertWitness) -> Result<String, Strin
         }
     };
     let body = format!(
-        "address={}\nbalance={}\nsalt={}\nownership={}\nchain={}\nblind={}\n{}",
+        "address={}\nbalance={}\nsalt={}\nblind={}\ntransition_salt={}\n{}",
         witness.address,
         witness.balance,
         hex_string(&witness.salt),
-        witness.ownership_proof,
-        witness.chain_proof,
         common::crypto::scalar_to_hex(&witness.balance_blind_delta)?,
+        hex_string(&witness.transition_salt),
         siblings
     );
     Ok(common::crypto::hex_encode(body.as_bytes()))
@@ -225,9 +235,8 @@ pub fn deserialize_insert_witness(encoded: &str) -> Result<InsertWitness, String
     let mut address = None;
     let mut balance = None;
     let mut salt = None;
-    let mut ownership = None;
-    let mut chain = None;
     let mut blind = None;
+    let mut transition_salt = None;
     let mut kind = None;
     let mut default_depth = None;
     let mut collision_address = None;
@@ -246,12 +255,10 @@ pub fn deserialize_insert_witness(encoded: &str) -> Result<InsertWitness, String
             );
         } else if let Some(value) = line.strip_prefix("salt=") {
             salt = Some(parse_hash_hex(value)?);
-        } else if let Some(value) = line.strip_prefix("ownership=") {
-            ownership = Some(value.to_string());
-        } else if let Some(value) = line.strip_prefix("chain=") {
-            chain = Some(value.to_string());
         } else if let Some(value) = line.strip_prefix("blind=") {
             blind = Some(common::crypto::scalar_from_hex(value)?);
+        } else if let Some(value) = line.strip_prefix("transition_salt=") {
+            transition_salt = Some(parse_hash_hex(value)?);
         } else if let Some(value) = line.strip_prefix("kind=") {
             kind = Some(value.to_string());
         } else if let Some(value) = line.strip_prefix("default_depth=") {
@@ -306,9 +313,8 @@ pub fn deserialize_insert_witness(encoded: &str) -> Result<InsertWitness, String
         address: address.ok_or_else(|| "missing address".to_string())?,
         balance: balance.ok_or_else(|| "missing balance".to_string())?,
         salt: salt.ok_or_else(|| "missing salt".to_string())?,
-        ownership_proof: ownership.ok_or_else(|| "missing ownership proof".to_string())?,
-        chain_proof: chain.ok_or_else(|| "missing chain proof".to_string())?,
         non_membership_proof,
         balance_blind_delta: blind.ok_or_else(|| "missing blind".to_string())?,
+        transition_salt: transition_salt.ok_or_else(|| "missing transition salt".to_string())?,
     })
 }

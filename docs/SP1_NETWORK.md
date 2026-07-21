@@ -1,42 +1,42 @@
-# SP1 Network integration boundary
+# SP1 Network worker
 
-The protocol currently generates SP1 proofs in-process with the CPU backend. Proof generation is
-routed through `crates/sp1-host/src/prover_backend.rs`, while setup and verification continue to
-use locally trusted verification keys.
+The main protocol process keeps Bulletproofs and its pinned native `blst` dependency. SP1's
+Network feature pulls a different native `blst`, so Network proving runs in the isolated Cargo
+workspace at `tools/sp1-network-worker/`.
 
-## Why the Network client must be isolated
+Build it once:
 
-With the versions pinned by this repository, enabling `sp1-sdk/network` pulls
-`alloy-signer-aws -> c-kzg -> blst >= 0.3.14`. The update/range-proof implementation uses
-`bulletproofs-bls -> blstrs_plus -> blst = 0.3.12`. Both native libraries export the same Cargo
-`links = "blst"` target, so Cargo cannot place them in one executable dependency graph.
+```bash
+./poa sp1-network-build
+```
 
-Do not solve this by changing the Bulletproof native dependency without a full cryptographic
-regression audit. The intended design is an isolated `sp1-network-worker` process with its own
-Cargo workspace and lockfile.
+Set `NETWORK_PRIVATE_KEY` in the environment (never in a repository file or command argument),
+then select the backend with `SP1_PROVER=network`. Both protocol initialization and SMT
+initialization scripts inherit this setting.
 
-## Worker contract
+The main process writes a versioned request into a fresh 0700 temporary directory using 0600
+files. Each request contains the guest ELF and serialized `SP1Stdin`. The worker always calls
+`private_stdin(true)`, writes the returned proof to a 0600 response file, and the main process
+deletes the directory after reading it. Before accepting the proof, the main process verifies it
+against the locally persisted trusted VK.
 
-The future worker should:
+The worker skips the Network client's duplicate local simulation by default, since fixtures and
+guest execution are already checked by the project workflow. Set
+`POA_SP1_NETWORK_SKIP_SIMULATION=false` when diagnosing a failing remote request.
 
-1. accept a guest identifier (`init-merkle`, `init-ownership`, or `kzg-insert`), proof mode,
-   serialized `SP1Stdin`, and the matching ELF/program identifier;
-2. construct `ProverClient::builder().network()` using `NETWORK_PRIVATE_KEY` from the environment;
-3. submit every request with `private_stdin(true)` because stdin contains reserve addresses,
-   balances, ownership witnesses and native state proofs;
-4. return a serialized `SP1ProofWithPublicValues` and request metadata;
-5. let the main process verify the returned proof against the locally trusted VK before accepting
-   it into a protocol proof.
+The worker and all of its SP1/slop transitive crates are pinned to 6.2.4 so its bincode proof
+format cannot drift away from the main process. Override the executable only when necessary:
 
-Secrets must never be placed in repository files or command-line arguments. The worker should use
-0600 temporary files or an authenticated local socket, erase request payloads after completion,
-and persist only the network request ID plus the returned proof.
+```bash
+export POA_SP1_NETWORK_WORKER=/absolute/path/to/sp1-network-worker
+```
 
-The three protocol guests are already separated and stable at:
+Supported guests include `init-merkle`, `init-ownership`, `kzg-insert`, `smt-init`, `smt-update`,
+and `smt-insert`. Network mode does not require the local gnark Docker image, including for
+Groth16 and Plonk proof modes.
 
-- `crates/sp1-programs/init-merkle/`
-- `crates/sp1-programs/init-ownership/`
-- `crates/sp1-programs/kzg-insert/`
-
-The `smt-*` guests belong to a separate experimental accumulator and are not required by the KZG
-Dynamic PoA protocol.
+Initialization ownership remains one protocol statement and one final proof. It is deliberately
+not split into project-level per-address proofs: doing that would either make proof size and
+verification linear in the number of chunks or require another aggregation protocol. SP1 Network
+already shards the guest execution across provers and recursively aggregates those shards while
+preserving the existing public values, VK, and constant-size final proof.

@@ -8,4 +8,6 @@ pub mod insert;
 pub mod kzg_insert;
 pub mod setup;
 #[cfg(feature = "smt-sp1")]
+pub mod smt_init;
+#[cfg(feature = "smt-sp1")]
 pub mod update;

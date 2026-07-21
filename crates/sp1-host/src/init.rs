@@ -41,15 +41,11 @@ static SP1_INIT_OWNERSHIP_CONTEXT: OnceLock<Mutex<Option<Sp1InitContext>>> = Onc
 
 pub struct ProvedInitMerkle {
     pub proof_hex: String,
-    pub vk_hex: String,
-    pub public_values_hex: String,
     pub public: Sp1InitPublicValues,
 }
 
 pub struct ProvedInitOwnership {
     pub proof_hex: String,
-    pub vk_hex: String,
-    pub public_values_hex: String,
     pub public: Sp1InitOwnershipPublicValues,
 }
 
@@ -82,8 +78,6 @@ pub fn prove_init_ownership(
     )?;
     Ok(ProvedInitOwnership {
         proof_hex: serialize_sp1_proof(&ownership_bundle)?,
-        vk_hex: serialize_sp1_vk(&ownership_ctx)?,
-        public_values_hex: hex_encode(ownership_bundle.public_values.as_slice()),
         public: decode_ownership_public_values(&ownership_bundle),
     })
 }
@@ -93,8 +87,6 @@ pub fn prove_init_merkle(merkle_stdin: Sp1InitStdin) -> Result<ProvedInitMerkle,
     let merkle_bundle = run_sp1_proof(&merkle_ctx, INIT_ELF, merkle_stdin, "init-merkle")?;
     Ok(ProvedInitMerkle {
         proof_hex: serialize_sp1_proof(&merkle_bundle)?,
-        vk_hex: serialize_sp1_vk(&merkle_ctx)?,
-        public_values_hex: hex_encode(merkle_bundle.public_values.as_slice()),
         public: decode_public_values(&merkle_bundle),
     })
 }
@@ -102,11 +94,7 @@ pub fn prove_init_merkle(merkle_stdin: Sp1InitStdin) -> Result<ProvedInitMerkle,
 pub fn verify_init_proof(
     proof: &StoredInitProof,
 ) -> Result<(Sp1InitPublicValues, Sp1InitOwnershipPublicValues), String> {
-    if proof.sp1_proof_hex.is_empty()
-        || proof.sp1_vk_hex.is_empty()
-        || proof.ownership_sp1_proof_hex.is_empty()
-        || proof.ownership_sp1_vk_hex.is_empty()
-    {
+    if proof.sp1_proof_hex.is_empty() || proof.ownership_sp1_proof_hex.is_empty() {
         return Err("missing serialized SP1 init proof artifacts".to_string());
     }
     let merkle_ctx = sp1_context()?;
@@ -126,18 +114,22 @@ pub fn verify_init_proof(
             "stored SP1 init ownership public values do not match proof bundle".to_string(),
         );
     }
-    ensure_trusted_vk(
-        &proof.sp1_vk_hex,
-        merkle_ctx.pk.verifying_key(),
-        hex_decode,
-        "init Merkle",
-    )?;
-    ensure_trusted_vk(
-        &proof.ownership_sp1_vk_hex,
-        ownership_ctx.pk.verifying_key(),
-        hex_decode,
-        "init ownership",
-    )?;
+    if !proof.sp1_vk_hex.is_empty() {
+        ensure_trusted_vk(
+            &proof.sp1_vk_hex,
+            merkle_ctx.pk.verifying_key(),
+            hex_decode,
+            "init Merkle",
+        )?;
+    }
+    if !proof.ownership_sp1_vk_hex.is_empty() {
+        ensure_trusted_vk(
+            &proof.ownership_sp1_vk_hex,
+            ownership_ctx.pk.verifying_key(),
+            hex_decode,
+            "init ownership",
+        )?;
+    }
     merkle_ctx
         .prover
         .verify(&merkle_bundle, merkle_ctx.pk.verifying_key(), None)
@@ -491,12 +483,6 @@ fn serialize_sp1_proof(bundle: &SP1ProofWithPublicValues) -> Result<String, Stri
 fn deserialize_sp1_proof(value: &str) -> Result<SP1ProofWithPublicValues, String> {
     let bytes = hex_decode(value)?;
     bincode::deserialize(&bytes).map_err(|err| format!("deserialize sp1 init proof: {err}"))
-}
-
-fn serialize_sp1_vk(ctx: &Sp1InitContext) -> Result<String, String> {
-    let bytes = bincode::serialize(ctx.pk.verifying_key())
-        .map_err(|err| format!("serialize sp1 init vk: {err}"))?;
-    Ok(hex_encode(&bytes))
 }
 
 fn fr_to_le_bytes(value: Fr) -> [u8; 32] {

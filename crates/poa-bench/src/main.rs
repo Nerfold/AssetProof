@@ -24,10 +24,7 @@ use nizk_fixed_set::update::apply_update;
 use nizk_fixed_set::verifier::{
     public_state_digest, verify_init_with_policy, verify_update_debug, ChainPolicy,
 };
-
-mod ethereum_fixture;
-
-const FIXTURE_VERSION: &str = "ethereum-keccak-merkle-prefix-v2-ecdsa";
+use poa_bench::{ethereum_fixture, master_fixture_dir, FIXTURE_VERSION};
 
 fn main() {
     if let Err(err) = run() {
@@ -553,12 +550,6 @@ fn prepare_benchmark_inputs(config: &Config) -> Result<(), String> {
         .map_err(|err| format!("write {}: {err}", fixture_manifest.display()))?;
     println!("\npreparation complete: {}", report_path.display());
     Ok(())
-}
-
-fn master_fixture_dir(fixture_dir: &Path, max_n: usize) -> PathBuf {
-    fixture_dir
-        .join(format!("master_n_{max_n}"))
-        .join(FIXTURE_VERSION)
 }
 
 fn mock_initialized_state_path(master_dir: &Path, n: usize) -> PathBuf {

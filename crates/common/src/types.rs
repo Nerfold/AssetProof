@@ -329,6 +329,24 @@ pub struct StoredSmtState {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredSmtInitProof {
+    pub scheme: String,
+    pub mode: String,
+    pub chain_id: String,
+    pub state_root: String,
+    pub session_id: String,
+    pub depth: usize,
+    pub smt_root_hex: String,
+    pub balance_total: i128,
+    pub reserve_count: usize,
+    pub reserve_commitment_hex: String,
+    pub uses_mock_inputs: bool,
+    pub proof_digest_hex: String,
+    pub sp1_proof_hex: String,
+    pub ownership_sp1_proof_hex: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StoredSmtProof {
     pub scheme: String,
     pub mode: String,
@@ -341,6 +359,7 @@ pub struct StoredSmtProof {
     pub old_balance_commitment_hex: String,
     pub new_balance_commitment_hex: String,
     pub proof_digest_hex: String,
+    pub transition_commitment_hex: String,
     pub witness_hex: String,
     pub touched_addresses: Vec<String>,
     pub membership_flags: Vec<u8>,

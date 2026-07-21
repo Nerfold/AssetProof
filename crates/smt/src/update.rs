@@ -26,6 +26,7 @@ pub struct UpdateWitnessEntry {
 pub struct UpdateWitness {
     pub entries: Vec<UpdateWitnessEntry>,
     pub balance_blind_delta: Fr,
+    pub transition_salt: Hash,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -57,6 +58,15 @@ pub fn build_update_witness(
     deltas: &[Delta],
     balance_blind_delta: Fr,
 ) -> Result<UpdateWitness, String> {
+    build_update_witness_with_salt(state, deltas, balance_blind_delta, SmtState::random_salt())
+}
+
+pub fn build_update_witness_with_salt(
+    state: &SmtState,
+    deltas: &[Delta],
+    balance_blind_delta: Fr,
+    transition_salt: Hash,
+) -> Result<UpdateWitness, String> {
     ensure_canonical_deltas(deltas)?;
     let tree = state.tree();
     let mut entries = Vec::with_capacity(deltas.len());
@@ -70,7 +80,20 @@ pub fn build_update_witness(
     Ok(UpdateWitness {
         entries,
         balance_blind_delta,
+        transition_salt,
     })
+}
+
+pub fn transition_commitment(witness: &UpdateWitness) -> Result<Hash, String> {
+    let entries = witness
+        .entries
+        .iter()
+        .map(|entry| Ok((key_for_address(&entry.address)?, entry.delta)))
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(crate::hash::update_transition_commitment(
+        &witness.transition_salt,
+        &entries,
+    ))
 }
 
 pub fn apply_update_with_witness(
@@ -115,7 +138,9 @@ pub fn apply_update_in_place(
                     return Err(format!("negative updated balance for {}", entry.address));
                 }
                 let new_leaf = Leaf::new(entry.address.clone(), new_balance, leaf.salt)?;
-                aggregate_delta += entry.delta;
+                aggregate_delta = aggregate_delta
+                    .checked_add(entry.delta)
+                    .ok_or_else(|| "aggregate delta overflow".to_string())?;
                 flags.push(1);
                 prepared.push(Some(PreparedMemberUpdate { new_leaf }));
             }
@@ -128,9 +153,11 @@ pub fn apply_update_in_place(
     }
 
     for update in prepared.into_iter().flatten() {
-        state.tree_mut().upsert(update.new_leaf);
+        state.tree_mut().upsert(update.new_leaf)?;
     }
-    state.balance_total = old_balance_total + aggregate_delta;
+    state.balance_total = old_balance_total
+        .checked_add(aggregate_delta)
+        .ok_or_else(|| "updated balance total overflow".to_string())?;
     state.balance_blind = old_blind + witness.balance_blind_delta;
     state.state_root = new_state_root.to_string();
 
@@ -165,6 +192,7 @@ pub fn apply_update_in_place(
         old_balance_commitment_hex: point_g1_to_hex(&old_commitment)?,
         new_balance_commitment_hex: point_g1_to_hex(&new_commitment)?,
         proof_digest_hex: common::crypto::hex_encode(&proof_digest),
+        transition_commitment_hex: hex_string(&transition_commitment(witness)?),
         witness_hex,
         touched_addresses: witness
             .entries
@@ -210,21 +238,25 @@ pub fn verify_update(
     if replay.proof.proof_digest_hex != proof.proof_digest_hex {
         return Err("proof digest mismatch".to_string());
     }
+    if replay.proof.transition_commitment_hex != proof.transition_commitment_hex {
+        return Err("transition commitment mismatch".to_string());
+    }
     Ok(())
 }
 
 pub fn ensure_canonical_deltas(deltas: &[Delta]) -> Result<(), String> {
-    let mut last_address: Option<&str> = None;
+    let mut last_address: Option<String> = None;
     for delta in deltas {
         if delta.delta == 0 {
             return Err("zero delta not allowed in canonical list".to_string());
         }
-        if let Some(prev) = last_address {
-            if delta.address.as_str() <= prev {
+        let normalized = common::encoding::normalize_address(&delta.address)?;
+        if let Some(prev) = last_address.as_deref() {
+            if normalized.as_str() <= prev {
                 return Err("delta list must be strictly sorted and deduplicated".to_string());
             }
         }
-        last_address = Some(&delta.address);
+        last_address = Some(normalized);
     }
     Ok(())
 }
@@ -232,6 +264,9 @@ pub fn ensure_canonical_deltas(deltas: &[Delta]) -> Result<(), String> {
 fn verify_witness_shape(witness: &UpdateWitness) -> Result<(), String> {
     let mut last_address: Option<&str> = None;
     for entry in &witness.entries {
+        if entry.delta == 0 {
+            return Err("zero delta not allowed in update witness".to_string());
+        }
         if let Some(prev) = last_address {
             if entry.address.as_str() <= prev {
                 return Err("update witness entries must be sorted".to_string());
@@ -279,6 +314,9 @@ pub fn verify_membership_proof(
     salt: &Hash,
     siblings: &[Hash],
 ) -> Result<(), String> {
+    if !crate::hash::valid_depth(depth) {
+        return Err(format!("SMT depth must be in 1..=128, got {depth}"));
+    }
     if siblings.len() != depth {
         return Err(format!(
             "membership sibling length mismatch: expected {depth}, got {}",
@@ -306,6 +344,9 @@ pub fn verify_default_non_membership_proof(
     key: &Hash,
     proof: &DefaultNonMembershipProof,
 ) -> Result<(), String> {
+    if !crate::hash::valid_depth(depth) {
+        return Err(format!("SMT depth must be in 1..=128, got {depth}"));
+    }
     if proof.default_depth > depth {
         return Err("default non-membership depth exceeds tree depth".to_string());
     }
@@ -333,6 +374,9 @@ pub fn verify_collision_non_membership_proof(
     key: &Hash,
     proof: &CollisionNonMembershipProof,
 ) -> Result<(), String> {
+    if !crate::hash::valid_depth(depth) {
+        return Err(format!("SMT depth must be in 1..=128, got {depth}"));
+    }
     let collision_key = key_for_address(&proof.collision_address)?;
     if &collision_key == key {
         return Err("collision proof uses identical key".to_string());
@@ -361,6 +405,10 @@ pub fn serialize_update_witness(witness: &UpdateWitness) -> Result<String, Strin
     lines.push(format!(
         "blind={}",
         scalar_to_hex(&witness.balance_blind_delta)?
+    ));
+    lines.push(format!(
+        "transition_salt={}",
+        hex_string(&witness.transition_salt)
     ));
     for entry in &witness.entries {
         lines.push(format!("entry.address={}", entry.address));
@@ -410,6 +458,12 @@ pub fn deserialize_update_witness(encoded: &str) -> Result<UpdateWitness, String
     let blind_hex = blind_line
         .strip_prefix("blind=")
         .ok_or_else(|| "invalid witness blind prefix".to_string())?;
+    let transition_salt_line = lines
+        .next()
+        .ok_or_else(|| "missing transition salt".to_string())?;
+    let transition_salt = transition_salt_line
+        .strip_prefix("transition_salt=")
+        .ok_or_else(|| "invalid transition salt prefix".to_string())?;
     let mut entries = Vec::new();
     let mut current: Vec<String> = Vec::new();
     for line in lines {
@@ -425,6 +479,7 @@ pub fn deserialize_update_witness(encoded: &str) -> Result<UpdateWitness, String
     Ok(UpdateWitness {
         entries,
         balance_blind_delta: common::crypto::scalar_from_hex(blind_hex)?,
+        transition_salt: parse_hash_hex(transition_salt)?,
     })
 }
 

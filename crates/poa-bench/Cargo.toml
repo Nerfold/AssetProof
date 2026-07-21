@@ -10,6 +10,12 @@ k256 = { version = "0.13", features = ["arithmetic"] }
 nizk-fixed-set = { path = "../nizk" }
 rayon = "1.11"
 sha3 = "0.10"
+smt = { path = "../smt" }
+sp1-host = { path = "../sp1-host", features = ["smt-sp1"] }
 sp1-programs-common = { path = "../sp1-programs/common" }
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[[bin]]
+name = "poa-smt-fixture"
+path = "src/bin/smt_fixture.rs"

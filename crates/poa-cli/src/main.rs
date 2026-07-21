@@ -9,10 +9,10 @@ use ark_ff::Zero;
 use common::crypto::{hash_to_scalar, point_g1_to_hex};
 use common::io::{
     read_delta_csv, read_init, read_init_witness_csv, read_parallel_init, read_parallel_proof,
-    read_parallel_state, read_proof, read_public_state, read_reserve_csv, read_smt_proof,
-    read_smt_state, read_srs, read_srs_g1_prefix, read_srs_prefix, read_state, write_init,
-    write_parallel_init, write_parallel_proof, write_parallel_state, write_proof,
-    write_public_state, write_smt_proof, write_smt_state, write_srs, write_state,
+    read_parallel_state, read_proof, read_public_state, read_reserve_csv, read_smt_init_proof,
+    read_smt_proof, read_smt_state, read_srs, read_srs_g1_prefix, read_srs_prefix, read_state,
+    write_init, write_parallel_init, write_parallel_proof, write_parallel_state, write_proof,
+    write_public_state, write_smt_init_proof, write_smt_proof, write_srs, write_state,
 };
 use common::types::{Delta, InitProvingContext, StoredParallelState, StoredState};
 use mock_chain::generator::{generate_scenario, load_manifest, write_scenario};
@@ -40,6 +40,7 @@ use smt::state::SmtState;
 use sp1_host::init::ensure_sp1_setup as ensure_protocol_sp1_setup;
 use sp1_host::insert::{build_and_execute_insert, prove_insert, verify_insert_proof};
 use sp1_host::setup::default_setup_dir;
+use sp1_host::smt_init::{prove_smt_initialization, verify_smt_initialization};
 use sp1_host::update::{
     build_and_execute_update, build_and_prove_update, ensure_sp1_setup as ensure_smt_sp1_setup,
     verify_update_proof as verify_smt_update_proof,
@@ -834,9 +835,37 @@ fn real_main() -> Result<(), String> {
             );
         }
         "smt-init" => {
+            if args.len() != 9 {
+                return Err(
+                    "usage: poa-cli smt-init <depth> <init-witness.csv> <chain-id> <state-root> <session-id> <state.txt> <proof.txt>"
+                        .to_string(),
+                );
+            }
+            let depth = args[2]
+                .parse::<usize>()
+                .map_err(|err| format!("invalid depth: {err}"))?;
+            let witnesses = read_init_witness_csv(Path::new(&args[3]))?;
+            let context = InitProvingContext {
+                chain_id: args[4].clone(),
+                state_root: args[5].clone(),
+                session_id: args[6].clone(),
+                chain_batch_proof: None,
+            };
+            let result = prove_smt_initialization(&context, &witnesses, depth)?;
+            result.state.persist(Path::new(&args[7]))?;
+            write_smt_init_proof(Path::new(&args[8]), &result.proof)?;
+            println!(
+                "smt initialized and proved depth={}, n={}, balance_total={}, root={}",
+                depth,
+                result.state.leaf_count(),
+                result.state.balance_total,
+                result.proof.smt_root_hex
+            );
+        }
+        "smt-init-local" => {
             if args.len() != 6 {
                 return Err(
-                    "usage: poa-cli smt-init <depth> <reserves.csv> <state-root> <state.txt>"
+                    "usage: poa-cli smt-init-local <depth> <reserves.csv> <state-root> <state.txt>"
                         .to_string(),
                 );
             }
@@ -845,13 +874,31 @@ fn real_main() -> Result<(), String> {
                 .map_err(|err| format!("invalid depth: {err}"))?;
             let reserves = read_reserve_csv(Path::new(&args[3]))?;
             let state = build_smt_state_from_reserves(depth, &reserves, &args[4])?;
-            write_smt_state(Path::new(&args[5]), &state.to_stored()?)?;
+            state.persist(Path::new(&args[5]))?;
             println!(
-                "smt initialized depth={}, n={}, balance_total={}",
+                "smt locally initialized depth={}, n={}, balance_total={}",
                 depth,
                 state.leaf_count(),
                 state.balance_total
             );
+        }
+        "smt-init-verify" => {
+            if args.len() != 7 {
+                return Err(
+                    "usage: poa-cli smt-init-verify <chain-id> <state-root> <session-id> <state.txt> <proof.txt>"
+                        .to_string(),
+                );
+            }
+            let context = InitProvingContext {
+                chain_id: args[2].clone(),
+                state_root: args[3].clone(),
+                session_id: args[4].clone(),
+                chain_batch_proof: None,
+            };
+            let state = SmtState::from_stored_owned(read_smt_state(Path::new(&args[5]))?)?;
+            let proof = read_smt_init_proof(Path::new(&args[6]))?;
+            verify_smt_initialization(&context, &state.public_state(), &proof)?;
+            println!("SMT initialization proof verified: {}", proof.smt_root_hex);
         }
         "smt-update" => {
             if args.len() != 7 {
@@ -860,17 +907,21 @@ fn real_main() -> Result<(), String> {
                         .to_string(),
                 );
             }
-            let old_state = SmtState::from_stored(&read_smt_state(Path::new(&args[2]))?)?;
+            let old_state = SmtState::from_stored_owned(read_smt_state(Path::new(&args[2]))?)?;
             let deltas = read_delta_csv(Path::new(&args[3]))?;
-            let blind_delta = hash_to_scalar("smt-update-blind", args[4].as_bytes());
+            let blind_delta = SmtState::random_blind();
             let result = build_and_prove_update(&old_state, &deltas, &args[4], blind_delta)?;
-            write_smt_state(Path::new(&args[5]), &result.next_state.to_stored()?)?;
+            result.next_state.persist(Path::new(&args[5]))?;
             write_smt_proof(Path::new(&args[6]), &result.proof)?;
             println!(
                 "smt updated m={}, aggregate_delta={}, new_balance_total={}",
                 deltas.len(),
                 result.proof.aggregate_delta,
                 result.next_state.balance_total
+            );
+            println!(
+                "transition_commitment={}",
+                result.proof.transition_commitment_hex
             );
         }
         "smt-update-local" => {
@@ -880,12 +931,12 @@ fn real_main() -> Result<(), String> {
                         .to_string(),
                 );
             }
-            let old_state = SmtState::from_stored(&read_smt_state(Path::new(&args[2]))?)?;
+            let old_state = SmtState::from_stored_owned(read_smt_state(Path::new(&args[2]))?)?;
             let deltas = read_delta_csv(Path::new(&args[3]))?;
-            let blind_delta = hash_to_scalar("smt-update-blind", args[4].as_bytes());
+            let blind_delta = SmtState::random_blind();
             let witness = smt::update::build_update_witness(&old_state, &deltas, blind_delta)?;
             let result = smt::update::apply_update_with_witness(&old_state, &args[4], &witness)?;
-            write_smt_state(Path::new(&args[5]), &result.next_state.to_stored()?)?;
+            result.next_state.persist(Path::new(&args[5]))?;
             write_smt_proof(Path::new(&args[6]), &result.proof)?;
             println!(
                 "smt locally updated m={}, aggregate_delta={}, new_balance_total={}",
@@ -901,11 +952,11 @@ fn real_main() -> Result<(), String> {
                         .to_string(),
                 );
             }
-            let old_state = SmtState::from_stored(&read_smt_state(Path::new(&args[2]))?)?;
+            let old_state = SmtState::from_stored_owned(read_smt_state(Path::new(&args[2]))?)?;
             let deltas = read_delta_csv(Path::new(&args[3]))?;
-            let blind_delta = hash_to_scalar("smt-update-blind", args[4].as_bytes());
+            let blind_delta = SmtState::random_blind();
             let exec = build_and_execute_update(&old_state, &deltas, &args[4], blind_delta)?;
-            write_smt_state(Path::new(&args[5]), &exec.next_state.to_stored()?)?;
+            exec.next_state.persist(Path::new(&args[5]))?;
             println!("smt execute updated m={}", deltas.len());
             println!("update_execute_instructions={}", exec.instruction_count);
             println!("aggregate_delta={}", exec.public_values.aggregate_delta);
@@ -918,8 +969,8 @@ fn real_main() -> Result<(), String> {
                         .to_string(),
                 );
             }
-            let old_state = SmtState::from_stored(&read_smt_state(Path::new(&args[2]))?)?;
-            let new_state = SmtState::from_stored(&read_smt_state(Path::new(&args[3]))?)?;
+            let old_state = SmtState::from_stored_owned(read_smt_state(Path::new(&args[2]))?)?;
+            let new_state = SmtState::from_stored_owned(read_smt_state(Path::new(&args[3]))?)?;
             let proof = read_smt_proof(Path::new(&args[4]))?;
             match args[5].as_str() {
                 "update" => verify_smt_update_proof(&old_state, &new_state, &proof)?,
@@ -943,18 +994,51 @@ fn real_main() -> Result<(), String> {
                         .to_string(),
                 );
             }
-            let old_state = SmtState::from_stored(&read_smt_state(Path::new(&args[2]))?)?;
+            let old_state = SmtState::from_stored_owned(read_smt_state(Path::new(&args[2]))?)?;
             let balance = args[4]
                 .parse::<i128>()
                 .map_err(|err| format!("invalid balance: {err}"))?;
-            let blind_delta = hash_to_scalar("smt-insert-blind", args[5].as_bytes());
+            let blind_delta = SmtState::random_blind();
             let witness = build_insert_witness(&old_state, &args[3], balance, blind_delta)?;
             let result = prove_insert(&old_state, &args[5], witness)?;
-            write_smt_state(Path::new(&args[6]), &result.next_state.to_stored()?)?;
+            result.next_state.persist(Path::new(&args[6]))?;
             write_smt_proof(Path::new(&args[7]), &result.proof)?;
             println!(
                 "smt inserted address={}, balance={}, new_balance_total={}",
                 args[3], balance, result.next_state.balance_total
+            );
+            println!(
+                "transition_commitment={}",
+                result.proof.transition_commitment_hex
+            );
+        }
+        "smt-insert-file" => {
+            if args.len() != 7 {
+                return Err(
+                    "usage: poa-cli smt-insert-file <state.txt> <insert.csv> <new-state-root> <next-state.txt> <proof.txt>"
+                        .to_string(),
+                );
+            }
+            let old_state = SmtState::from_stored_owned(read_smt_state(Path::new(&args[2]))?)?;
+            let entries = read_reserve_csv(Path::new(&args[3]))?;
+            let [entry] = entries.as_slice() else {
+                return Err(
+                    "SMT insert input must contain exactly one address,balance row".to_string(),
+                );
+            };
+            let blind_delta = SmtState::random_blind();
+            let witness =
+                build_insert_witness(&old_state, &entry.address, entry.balance, blind_delta)?;
+            let result = prove_insert(&old_state, &args[4], witness)?;
+            result.next_state.persist(Path::new(&args[5]))?;
+            write_smt_proof(Path::new(&args[6]), &result.proof)?;
+            println!(
+                "smt inserted address={}, balance={}, new_balance_total={}",
+                entry.address, entry.balance, result.next_state.balance_total
+            );
+            println!(
+                "transition_commitment={}",
+                result.proof.transition_commitment_hex
             );
         }
         "prepare-smt-run" => {
@@ -973,7 +1057,7 @@ fn real_main() -> Result<(), String> {
             let reserves = read_reserve_csv(Path::new(&args[4]))?;
             let state = build_smt_state_from_reserves(depth, &reserves, &args[5])?;
             let state_path = run_dir.join("state_0000.txt");
-            write_smt_state(&state_path, &state.to_stored()?)?;
+            state.persist(&state_path)?;
             println!(
                 "prepared smt run: state={}, depth={}, n={}",
                 state_path.display(),
@@ -1141,11 +1225,11 @@ fn real_main() -> Result<(), String> {
                 );
             }
             let _run_dir = Path::new(&args[2]);
-            let old_state = SmtState::from_stored(&read_smt_state(Path::new(&args[3]))?)?;
+            let old_state = SmtState::from_stored_owned(read_smt_state(Path::new(&args[3]))?)?;
             let deltas = read_delta_csv(Path::new(&args[4]))?;
-            let blind_delta = hash_to_scalar("smt-update-blind", args[5].as_bytes());
+            let blind_delta = SmtState::random_blind();
             let result = build_and_prove_update(&old_state, &deltas, &args[5], blind_delta)?;
-            write_smt_state(Path::new(&args[6]), &result.next_state.to_stored()?)?;
+            result.next_state.persist(Path::new(&args[6]))?;
             let proof_path = derive_companion_proof_path(Path::new(&args[6]))?;
             write_smt_proof(&proof_path, &result.proof)?;
             println!(
@@ -1164,12 +1248,12 @@ fn real_main() -> Result<(), String> {
                 );
             }
             let _run_dir = Path::new(&args[2]);
-            let old_state = SmtState::from_stored(&read_smt_state(Path::new(&args[3]))?)?;
+            let old_state = SmtState::from_stored_owned(read_smt_state(Path::new(&args[3]))?)?;
             let deltas = read_delta_csv(Path::new(&args[4]))?;
-            let blind_delta = hash_to_scalar("smt-update-blind", args[5].as_bytes());
+            let blind_delta = SmtState::random_blind();
             let witness = smt::update::build_update_witness(&old_state, &deltas, blind_delta)?;
             let result = smt::update::apply_update_with_witness(&old_state, &args[5], &witness)?;
-            write_smt_state(Path::new(&args[6]), &result.next_state.to_stored()?)?;
+            result.next_state.persist(Path::new(&args[6]))?;
             let proof_path = derive_companion_proof_path(Path::new(&args[6]))?;
             write_smt_proof(&proof_path, &result.proof)?;
             println!(
@@ -1188,11 +1272,11 @@ fn real_main() -> Result<(), String> {
                 );
             }
             let _run_dir = Path::new(&args[2]);
-            let old_state = SmtState::from_stored(&read_smt_state(Path::new(&args[3]))?)?;
+            let old_state = SmtState::from_stored_owned(read_smt_state(Path::new(&args[3]))?)?;
             let deltas = read_delta_csv(Path::new(&args[4]))?;
-            let blind_delta = hash_to_scalar("smt-update-blind", args[5].as_bytes());
+            let blind_delta = SmtState::random_blind();
             let exec = build_and_execute_update(&old_state, &deltas, &args[5], blind_delta)?;
-            write_smt_state(Path::new(&args[6]), &exec.next_state.to_stored()?)?;
+            exec.next_state.persist(Path::new(&args[6]))?;
             println!(
                 "continued smt execute run: next_state={}, m={}",
                 args[6],
@@ -1968,13 +2052,18 @@ fn print_advanced_usage() {
     println!("  poa-cli synthetic-update-bench <srs.bin> <degree> <modified-addresses> [iterations] [warmup]");
     println!("  poa-cli update-bench <srs.bin> <state.txt> <deltas.csv> [iterations] [warmup]");
     println!("  poa-cli parallel-synthetic-update-bench <srs.bin> <degree> <modified-addresses> <shards>");
-    println!("  poa-cli smt-init <depth> <reserves.csv> <state-root> <state.txt>");
+    println!("  poa-cli smt-init <depth> <init-witness.csv> <chain-id> <state-root> <session-id> <state.txt> <proof.txt>");
+    println!("  poa-cli smt-init-local <depth> <reserves.csv> <state-root> <state.txt>");
+    println!(
+        "  poa-cli smt-init-verify <chain-id> <state-root> <session-id> <state.txt> <proof.txt>"
+    );
     println!("  poa-cli smt-update <state.txt> <deltas.csv> <new-state-root> <next-state.txt> <proof.txt>");
     println!("  poa-cli smt-update-local <state.txt> <deltas.csv> <new-state-root> <next-state.txt> <proof.txt>");
     println!(
         "  poa-cli smt-update-execute <state.txt> <deltas.csv> <new-state-root> <next-state.txt>"
     );
     println!("  poa-cli smt-insert <state.txt> <address> <balance> <new-state-root> <next-state.txt> <proof.txt>");
+    println!("  poa-cli smt-insert-file <state.txt> <insert.csv> <new-state-root> <next-state.txt> <proof.txt>");
     println!("  poa-cli smt-verify <old-state.txt> <new-state.txt> <proof.txt> <mode>");
     println!("  poa-cli prepare-smt-run <run-dir> <depth> <reserves.csv> <state-root> <state.txt>");
     println!("  poa-cli smt-synthetic-bench <depth> <num-reserves> <modified-addresses>");
@@ -2130,11 +2219,11 @@ fn build_smt_state_from_reserves(
 ) -> Result<SmtState, String> {
     let mut leaves = Vec::with_capacity(reserves.len());
     for reserve in reserves {
-        let salt = SmtState::fresh_salt("smt-init-salt", &reserve.address, reserve.balance);
+        let salt = SmtState::random_salt();
         leaves.push(Leaf::new(reserve.address.clone(), reserve.balance, salt)?);
     }
     leaves.sort_by(|a, b| a.address.cmp(&b.address));
-    let blind = hash_to_scalar("smt-init-blind", state_root.as_bytes());
+    let blind = SmtState::random_blind();
     SmtState::new(state_root.to_string(), depth, leaves, blind)
 }
 
@@ -2147,7 +2236,7 @@ fn build_synthetic_smt_state(
     for index in 0..num_reserves {
         let address = format!("0x{:040x}", index + 1);
         let balance = 1000 + (index as i128 % 97);
-        let salt = SmtState::fresh_salt("smt-synth-init-salt", &address, balance);
+        let salt = SmtState::mock_salt("smt-synth-init-salt", &address, balance);
         leaves.push(Leaf::new(address, balance, salt)?);
     }
     let blind = hash_to_scalar("smt-synth-init-blind", state_root.as_bytes());

@@ -1,8 +1,9 @@
 [package]
-name = "sp1-smt-update"
+name = "sp1-smt-init"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
 sp1-programs-common = { path = "../common" }
 sp1-zkvm = { version = "6.2.2" }
+

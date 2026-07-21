@@ -22,6 +22,10 @@ case "${1:-}" in
         shift
         exec cargo run --quiet --release -p sp1-host --bin poa-protocol-sp1-setup -- "$@"
         ;;
+    sp1-network-build)
+        shift
+        exec cargo build --release --manifest-path "$ROOT_DIR/tools/sp1-network-worker/Cargo.toml" "$@"
+        ;;
 esac
 
 exec cargo run --quiet --release -p poa-cli -- "$@"

@@ -1,23 +1,22 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use common::crypto::{hex_decode, hex_encode};
+use common::crypto::{hash_bytes, hex_decode, hex_encode};
 use common::types::StoredSmtProof;
-use smt::insert::{
-    apply_insert_with_witness, build_insert_witness, verify_insert, InsertResult, InsertWitness,
-};
+use smt::insert::{apply_insert_with_witness, build_insert_witness, InsertResult, InsertWitness};
 use smt::key::key_for_address;
 use smt::proof::{CompactNonMembershipProof, SiblingRef};
-use smt::state::SmtState;
+use smt::state::{SmtPublicState, SmtState};
 use sp1_programs_common::io::{
-    Sp1CollisionNonMembershipProof, Sp1DefaultNonMembershipProof, Sp1InsertPublicValues,
-    Sp1InsertStdin, Sp1Leaf, Sp1NonMembershipProof, Sp1SiblingRef,
+    Sp1DefaultNonMembershipProof, Sp1InsertPublicValues, Sp1InsertStdin, Sp1NonMembershipProof,
+    Sp1SiblingRef,
 };
-use sp1_sdk::blocking::{ProveRequest, Prover as BlockingProver, ProverClient};
+use sp1_sdk::blocking::{Prover as BlockingProver, ProverClient};
 use sp1_sdk::include_elf;
 use sp1_sdk::{ProvingKey, SP1ProofWithPublicValues, SP1Stdin};
 
-use crate::proof_mode::{configured_proof_mode, ensure_trusted_vk, ConfiguredProofMode};
+use crate::proof_mode::configured_proof_mode;
+use crate::prover_backend::ProofGenerator;
 use crate::setup::{default_setup_dir, load_insert_vk};
 
 const SMT_INSERT_ELF: sp1_sdk::Elf = include_elf!("sp1-smt-insert");
@@ -25,6 +24,7 @@ const SMT_INSERT_ELF: sp1_sdk::Elf = include_elf!("sp1-smt-insert");
 #[derive(Clone)]
 struct Sp1InsertContext {
     prover: sp1_sdk::blocking::CpuProver,
+    generator: ProofGenerator,
     pk: Arc<sp1_sdk::SP1ProvingKey>,
 }
 
@@ -51,10 +51,12 @@ fn sp1_insert_context_with_setup_dir(setup_dir: &Path) -> Result<Sp1InsertContex
     }
 
     let prover = ProverClient::builder().cpu().build();
+    let generator = ProofGenerator::from_env()?;
     let vk = load_insert_vk(setup_dir, SMT_INSERT_ELF)?;
     let pk = sp1_sdk::SP1ProvingKey::new(vk, SMT_INSERT_ELF);
     let ctx = Sp1InsertContext {
         prover,
+        generator,
         pk: Arc::new(pk),
     };
     *guard = Some(ctx.clone());
@@ -81,6 +83,9 @@ pub fn prove_insert(
     if public_values.old_smt_root != old_state.smt_root() {
         return Err("sp1 insert old smt root mismatch".to_string());
     }
+    if public_values.depth != old_state.depth {
+        return Err("sp1 insert SMT depth mismatch".to_string());
+    }
     if public_values.new_smt_root != result.next_state.smt_root() {
         return Err("sp1 insert new smt root mismatch".to_string());
     }
@@ -90,11 +95,19 @@ pub fn prove_insert(
     if public_values.new_balance_total != result.next_state.balance_total {
         return Err("sp1 insert balance total mismatch".to_string());
     }
+    if public_values.old_balance_total != old_state.balance_total {
+        return Err("sp1 insert old balance total mismatch".to_string());
+    }
+    if public_values.old_leaf_count != old_state.leaf_count()
+        || public_values.new_leaf_count != result.next_state.leaf_count()
+    {
+        return Err("sp1 insert leaf count mismatch".to_string());
+    }
+    if public_values.transition_commitment != expected_insert_transition(&stdin_value) {
+        return Err("sp1 insert transition commitment mismatch".to_string());
+    }
 
-    result.proof.mode = "sp1".to_string();
-    result.proof.sp1_proof_hex = serialize_sp1_proof(&proof_bundle)?;
-    result.proof.sp1_vk_hex = serialize_sp1_vk(&ctx)?;
-    result.proof.sp1_public_values_hex = hex_encode(proof_bundle.public_values.as_slice());
+    make_sp1_proof_public(&mut result.proof, &proof_bundle, &public_values)?;
     Ok(result)
 }
 
@@ -128,6 +141,9 @@ pub fn execute_insert(
     if public_values.old_smt_root != old_state.smt_root() {
         return Err("sp1 insert execute old smt root mismatch".to_string());
     }
+    if public_values.depth != old_state.depth {
+        return Err("sp1 insert execute SMT depth mismatch".to_string());
+    }
     if public_values.new_smt_root != result.next_state.smt_root() {
         return Err("sp1 insert execute new smt root mismatch".to_string());
     }
@@ -136,6 +152,14 @@ pub fn execute_insert(
     }
     if public_values.new_balance_total != result.next_state.balance_total {
         return Err("sp1 insert execute balance total mismatch".to_string());
+    }
+    if public_values.old_leaf_count != old_state.leaf_count()
+        || public_values.new_leaf_count != result.next_state.leaf_count()
+    {
+        return Err("sp1 insert execute leaf count mismatch".to_string());
+    }
+    if public_values.transition_commitment != expected_insert_transition(&stdin_value) {
+        return Err("sp1 insert execute transition commitment mismatch".to_string());
     }
 
     Ok(InsertExecutionResult {
@@ -161,22 +185,24 @@ pub fn verify_insert_proof(
     new_state: &SmtState,
     proof: &StoredSmtProof,
 ) -> Result<(), String> {
-    verify_insert(old_state, new_state, proof)?;
+    verify_insert_proof_public(&old_state.public_state(), &new_state.public_state(), proof)
+}
+
+pub fn verify_insert_proof_public(
+    old_state: &SmtPublicState,
+    new_state: &SmtPublicState,
+    proof: &StoredSmtProof,
+) -> Result<(), String> {
+    verify_sp1_insert_metadata(old_state, new_state, proof)?;
     if proof.mode != "sp1" {
         return Err(format!("unexpected insert proof mode {}", proof.mode));
     }
-    if proof.sp1_proof_hex.is_empty() || proof.sp1_vk_hex.is_empty() {
-        return Err("missing serialized sp1 insert proof artifacts".to_string());
+    if proof.sp1_proof_hex.is_empty() {
+        return Err("missing serialized sp1 insert proof".to_string());
     }
 
     let ctx = sp1_insert_context()?;
     let bundle = deserialize_sp1_proof(&proof.sp1_proof_hex)?;
-    ensure_trusted_vk(
-        &proof.sp1_vk_hex,
-        ctx.pk.verifying_key(),
-        hex_decode,
-        "insert",
-    )?;
     ctx.prover
         .verify(&bundle, ctx.pk.verifying_key(), None)
         .map_err(|err| format!("sp1 insert verify failed: {err}"))?;
@@ -187,13 +213,34 @@ pub fn verify_insert_proof(
     {
         return Err("sp1 insert public state root mismatch".to_string());
     }
-    if public_values.old_smt_root != old_state.smt_root()
-        || public_values.new_smt_root != new_state.smt_root()
+    if public_values.old_smt_root != old_state.smt_root
+        || public_values.new_smt_root != new_state.smt_root
     {
         return Err("sp1 insert public smt root mismatch".to_string());
     }
+    if public_values.depth != old_state.depth || public_values.depth != new_state.depth {
+        return Err("sp1 insert public SMT depth mismatch".to_string());
+    }
     if public_values.inserted_balance != proof.aggregate_delta {
         return Err("sp1 insert public balance mismatch".to_string());
+    }
+    if public_values.old_balance_total != old_state.balance_total
+        || public_values.new_balance_total != new_state.balance_total
+    {
+        return Err("sp1 insert public balance total mismatch".to_string());
+    }
+    if public_values.old_leaf_count != old_state.leaf_count
+        || public_values.new_leaf_count != new_state.leaf_count
+    {
+        return Err("sp1 insert public leaf count mismatch".to_string());
+    }
+    if hex_encode(&public_values.transition_commitment) != proof.transition_commitment_hex {
+        return Err("sp1 insert public transition commitment mismatch".to_string());
+    }
+    let proof_bytes = hex_decode(&proof.sp1_proof_hex)?;
+    let expected_digest = hash_bytes("smt-sp1-insert-proof-v1", &[&proof_bytes]);
+    if hex_encode(&expected_digest) != proof.proof_digest_hex {
+        return Err("sp1 insert proof digest mismatch".to_string());
     }
     Ok(())
 }
@@ -220,16 +267,12 @@ fn build_sp1_insert_stdin(
             default_depth: proof.default_depth,
             siblings: proof.siblings.iter().map(convert_sibling_ref).collect(),
         }),
-        smt::proof::CompactAddressProof::NonMembership(CompactNonMembershipProof::Collision(
-            proof,
-        )) => Sp1NonMembershipProof::Collision(Sp1CollisionNonMembershipProof {
-            collision_leaf: Sp1Leaf {
-                key: key_for_address(&proof.collision_address)?,
-                balance: proof.collision_balance,
-                salt: proof.collision_salt,
-            },
-            siblings: proof.siblings.iter().map(convert_sibling_ref).collect(),
-        }),
+        smt::proof::CompactAddressProof::NonMembership(CompactNonMembershipProof::Collision(_)) => {
+            return Err(format!(
+                "cannot insert {}: occupied SMT path at depth {}; use a deeper tree",
+                witness.address, old_state.depth
+            ))
+        }
     };
 
     Ok(Sp1InsertStdin {
@@ -238,10 +281,13 @@ fn build_sp1_insert_stdin(
         depth: old_state.depth,
         old_smt_root: old_state.smt_root(),
         old_balance_total: old_state.balance_total,
+        old_leaf_count: old_state.leaf_count(),
         frontier_hashes: multiproof.frontier_hashes,
+        address: witness.address.clone(),
         key: key_for_address(&witness.address)?,
         balance: witness.balance,
         salt: witness.salt,
+        transition_salt: witness.transition_salt,
         non_membership_proof,
     })
 }
@@ -259,14 +305,13 @@ fn run_sp1_insert_proof(
 ) -> Result<SP1ProofWithPublicValues, String> {
     let mut stdin = SP1Stdin::new();
     stdin.write(stdin_value);
-    let request = ctx.prover.prove(&ctx.pk, stdin);
-    let proof = match configured_proof_mode()? {
-        ConfiguredProofMode::Groth16 => request.groth16().run(),
-        ConfiguredProofMode::Plonk => request.plonk().run(),
-        ConfiguredProofMode::Compressed => request.compressed().run(),
-    }
-    .map_err(|err| format!("sp1 insert prove failed: {err}"))?;
-    Ok(proof)
+    ctx.generator.prove(
+        &ctx.prover,
+        &ctx.pk,
+        stdin,
+        configured_proof_mode()?,
+        "smt-insert",
+    )
 }
 
 fn run_sp1_insert_execute(
@@ -294,19 +339,83 @@ fn decode_insert_public_values(
     Ok(public_values.read::<Sp1InsertPublicValues>())
 }
 
-fn serialize_sp1_proof(bundle: &SP1ProofWithPublicValues) -> Result<String, String> {
-    let bytes =
-        bincode::serialize(bundle).map_err(|err| format!("serialize sp1 insert proof: {err}"))?;
-    Ok(hex_encode(&bytes))
-}
-
 fn deserialize_sp1_proof(value: &str) -> Result<SP1ProofWithPublicValues, String> {
     let bytes = hex_decode(value)?;
     bincode::deserialize(&bytes).map_err(|err| format!("deserialize sp1 insert proof: {err}"))
 }
 
-fn serialize_sp1_vk(ctx: &Sp1InsertContext) -> Result<String, String> {
-    let bytes = bincode::serialize(ctx.pk.verifying_key())
-        .map_err(|err| format!("serialize sp1 insert vk: {err}"))?;
-    Ok(hex_encode(&bytes))
+fn expected_insert_transition(stdin: &Sp1InsertStdin) -> [u8; 32] {
+    sp1_programs_common::smt::insert_transition_commitment(
+        &stdin.transition_salt,
+        &stdin.key,
+        stdin.balance,
+        &stdin.salt,
+    )
+}
+
+fn make_sp1_proof_public(
+    proof: &mut StoredSmtProof,
+    bundle: &SP1ProofWithPublicValues,
+    public_values: &Sp1InsertPublicValues,
+) -> Result<(), String> {
+    let encoded =
+        bincode::serialize(bundle).map_err(|err| format!("serialize sp1 insert proof: {err}"))?;
+    proof.mode = "sp1".to_string();
+    proof.scheme = "smt-poseidon-sp1-v1".to_string();
+    proof.proof_digest_hex = hex_encode(&hash_bytes("smt-sp1-insert-proof-v1", &[&encoded]));
+    proof.transition_commitment_hex = hex_encode(&public_values.transition_commitment);
+    proof.sp1_proof_hex = hex_encode(&encoded);
+    proof.balance_blind_delta = ark_bls12_381::Fr::from(0u64);
+    proof.old_balance_commitment_hex.clear();
+    proof.new_balance_commitment_hex.clear();
+    proof.witness_hex.clear();
+    proof.touched_addresses.clear();
+    proof.membership_flags.clear();
+    proof.sp1_vk_hex.clear();
+    proof.sp1_public_values_hex.clear();
+    Ok(())
+}
+
+fn verify_sp1_insert_metadata(
+    old_state: &SmtPublicState,
+    new_state: &SmtPublicState,
+    proof: &StoredSmtProof,
+) -> Result<(), String> {
+    if proof.scheme != "smt-poseidon-sp1-v1" {
+        return Err("unexpected proof scheme".to_string());
+    }
+    if proof.old_state_root != old_state.state_root || proof.new_state_root != new_state.state_root
+    {
+        return Err("insert state root labels mismatch".to_string());
+    }
+    if proof.old_smt_root_hex != smt::state::hex_string(&old_state.smt_root)
+        || proof.new_smt_root_hex != smt::state::hex_string(&new_state.smt_root)
+    {
+        return Err("insert SMT root metadata mismatch".to_string());
+    }
+    if !proof.old_balance_commitment_hex.is_empty() || !proof.new_balance_commitment_hex.is_empty()
+    {
+        return Err("SP1 SMT proof contains obsolete external balance commitments".to_string());
+    }
+    let expected_delta = new_state
+        .balance_total
+        .checked_sub(old_state.balance_total)
+        .ok_or_else(|| "insert balance delta overflow".to_string())?;
+    if proof.aggregate_delta != expected_delta {
+        return Err("insert aggregate delta metadata mismatch".to_string());
+    }
+    let expected_count = old_state
+        .leaf_count
+        .checked_add(1)
+        .ok_or_else(|| "insert leaf count overflow".to_string())?;
+    if new_state.leaf_count != expected_count {
+        return Err("insert leaf count transition mismatch".to_string());
+    }
+    if !proof.witness_hex.is_empty()
+        || !proof.touched_addresses.is_empty()
+        || !proof.membership_flags.is_empty()
+    {
+        return Err("SP1 insert artifact contains private SMT witness metadata".to_string());
+    }
+    Ok(())
 }

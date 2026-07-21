@@ -3,19 +3,17 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
-use slop_algebra::{AbstractField, PrimeField32};
-use sp1_primitives::{poseidon2_hash, SP1Field};
 use sp1_programs_common::io::{
-    Hash, Sp1CollisionNonMembershipProof, Sp1InsertPublicValues, Sp1InsertStdin, Sp1Leaf,
-    Sp1NonMembershipProof, Sp1SiblingRef,
+    Hash, Sp1InsertPublicValues, Sp1InsertStdin, Sp1Leaf, Sp1NonMembershipProof, Sp1SiblingRef,
+};
+use sp1_programs_common::smt::{
+    default_hashes, expand_default_membership_siblings, insert_transition_commitment,
+    internal_hash, key_bit, key_hash, leaf_hash, valid_depth,
 };
 use sp1_zkvm::entrypoint;
 
 entrypoint!(main);
 
-const LEAF_TAG: u32 = 1;
-const NODE_TAG: u32 = 2;
-const EMPTY_TAG: u32 = 3;
 fn main() {
     let input: Sp1InsertStdin = sp1_zkvm::io::read();
     let pv = verify_and_apply_insert(input);
@@ -23,7 +21,13 @@ fn main() {
 }
 
 fn verify_and_apply_insert(input: Sp1InsertStdin) -> Sp1InsertPublicValues {
+    assert!(valid_depth(input.depth), "SMT depth must be in 1..=128");
     assert!(input.balance >= 0, "negative inserted balance");
+    assert_eq!(
+        key_hash(&input.address).expect("invalid Ethereum insert address"),
+        input.key,
+        "insert address/key mismatch"
+    );
     let defaults = default_hashes(input.depth);
 
     let membership_siblings = match &input.non_membership_proof {
@@ -42,19 +46,15 @@ fn verify_and_apply_insert(input: Sp1InsertStdin) -> Sp1InsertPublicValues {
                 proof.default_depth,
                 &resolved,
             );
-            expand_default_to_membership(input.depth, &defaults, &resolved, proof.default_depth)
-        }
-        Sp1NonMembershipProof::Collision(proof) => {
-            let resolved =
-                resolve_membership_siblings(&proof.siblings, &input.frontier_hashes, &defaults);
-            verify_collision_non_membership_root(
-                &input.key,
-                input.old_smt_root,
+            expand_default_membership_siblings(
                 input.depth,
-                proof,
+                &defaults,
                 &resolved,
-            );
-            resolved
+                proof.default_depth,
+            )
+        }
+        Sp1NonMembershipProof::Collision(_) => {
+            panic!("cannot insert into an occupied fixed-depth SMT path; use a deeper tree")
         }
     };
 
@@ -68,38 +68,30 @@ fn verify_and_apply_insert(input: Sp1InsertStdin) -> Sp1InsertPublicValues {
         .old_balance_total
         .checked_add(input.balance)
         .expect("balance total overflow");
+    let new_leaf_count = input
+        .old_leaf_count
+        .checked_add(1)
+        .expect("leaf count overflow");
+    let transition_commitment = insert_transition_commitment(
+        &input.transition_salt,
+        &input.key,
+        input.balance,
+        &input.salt,
+    );
 
     Sp1InsertPublicValues {
         old_state_root: input.state_root,
         new_state_root: input.new_state_root,
+        depth: input.depth,
         old_smt_root: input.old_smt_root,
         new_smt_root: new_root,
         inserted_balance: input.balance,
         old_balance_total: input.old_balance_total,
         new_balance_total,
+        old_leaf_count: input.old_leaf_count,
+        new_leaf_count,
+        transition_commitment,
     }
-}
-
-fn expand_default_to_membership(
-    depth: usize,
-    defaults: &[Hash],
-    resolved_default_siblings: &[Hash],
-    default_depth: usize,
-) -> Vec<Hash> {
-    let mut siblings = Vec::with_capacity(depth);
-    let default_subtree_height = depth.saturating_sub(default_depth);
-    for level_from_leaf in 0..default_subtree_height {
-        siblings.push(defaults[level_from_leaf]);
-    }
-    for sibling in resolved_default_siblings.iter().rev() {
-        siblings.push(*sibling);
-    }
-    assert_eq!(
-        siblings.len(),
-        depth,
-        "expanded default path length mismatch"
-    );
-    siblings
 }
 
 fn verify_default_non_membership_root(
@@ -127,36 +119,6 @@ fn verify_default_non_membership_root(
         };
     }
     assert_eq!(current, root, "default non-membership root mismatch");
-}
-
-fn verify_collision_non_membership_root(
-    key: &Hash,
-    root: Hash,
-    depth: usize,
-    proof: &Sp1CollisionNonMembershipProof,
-    siblings: &[Hash],
-) {
-    assert!(
-        proof.collision_leaf.key != *key,
-        "collision proof uses identical key"
-    );
-    let collision_root = compute_membership_root(&proof.collision_leaf, siblings, depth);
-    assert_eq!(
-        collision_root, root,
-        "collision non-membership root mismatch"
-    );
-}
-
-fn resolve_membership_siblings(
-    siblings: &[Sp1SiblingRef],
-    frontier_hashes: &[Hash],
-    defaults: &[Hash],
-) -> Vec<Hash> {
-    siblings
-        .iter()
-        .enumerate()
-        .map(|(level, sibling)| resolve_sibling_ref(sibling, defaults[level], frontier_hashes))
-        .collect()
 }
 
 fn resolve_default_siblings(
@@ -202,67 +164,4 @@ fn compute_membership_root(leaf: &Sp1Leaf, siblings: &[Hash], depth: usize) -> H
         };
     }
     hash
-}
-
-fn leaf_hash(key: &Hash, balance: i128, salt: &Hash) -> Hash {
-    let mut inputs = Vec::with_capacity(21);
-    inputs.push(SP1Field::from_wrapped_u32(LEAF_TAG));
-    push_bytes_fields(&mut inputs, key);
-    push_i128_fields(&mut inputs, balance);
-    push_bytes_fields(&mut inputs, salt);
-    poseidon_digest(inputs)
-}
-
-fn internal_hash(depth: usize, left: &Hash, right: &Hash) -> Hash {
-    let mut inputs = Vec::with_capacity(18);
-    inputs.push(SP1Field::from_wrapped_u32(NODE_TAG));
-    inputs.push(SP1Field::from_wrapped_u32(depth as u32));
-    push_bytes_fields(&mut inputs, left);
-    push_bytes_fields(&mut inputs, right);
-    poseidon_digest(inputs)
-}
-
-fn default_hashes(depth: usize) -> Vec<Hash> {
-    let mut values = Vec::with_capacity(depth + 1);
-    values.push(poseidon_digest(vec![SP1Field::from_wrapped_u32(EMPTY_TAG)]));
-    for height in 1..=depth {
-        let child = values[height - 1];
-        values.push(internal_hash(depth - height, &child, &child));
-    }
-    values
-}
-
-fn poseidon_digest(inputs: Vec<SP1Field>) -> Hash {
-    let digest = poseidon2_hash(inputs);
-    fields_to_bytes(&digest)
-}
-
-fn push_bytes_fields(out: &mut Vec<SP1Field>, bytes: &[u8; 32]) {
-    for chunk in bytes.chunks(4) {
-        let mut word = [0u8; 4];
-        word.copy_from_slice(chunk);
-        out.push(SP1Field::from_wrapped_u32(u32::from_be_bytes(word)));
-    }
-}
-
-fn push_i128_fields(out: &mut Vec<SP1Field>, value: i128) {
-    for chunk in value.to_be_bytes().chunks(4) {
-        let mut word = [0u8; 4];
-        word.copy_from_slice(chunk);
-        out.push(SP1Field::from_wrapped_u32(u32::from_be_bytes(word)));
-    }
-}
-
-fn fields_to_bytes(fields: &[SP1Field; 8]) -> Hash {
-    let mut out = [0u8; 32];
-    for (index, field) in fields.iter().enumerate() {
-        out[index * 4..(index + 1) * 4].copy_from_slice(&field.as_canonical_u32().to_be_bytes());
-    }
-    out
-}
-
-fn key_bit(key: &Hash, depth: usize) -> bool {
-    let byte = key[depth / 8];
-    let offset = 7 - (depth % 8);
-    ((byte >> offset) & 1) == 1
 }

@@ -13,6 +13,7 @@ SAMPLES="${SAMPLES:-3}"
 WARMUP="${WARMUP:-1}"
 POA_SP1_PROOF_MODE="${POA_SP1_PROOF_MODE:-groth16}"
 POA_SP1_PROFILE="${POA_SP1_PROFILE:-0}"
+SP1_PROVER="${SP1_PROVER:-cpu}"
 BENCHMARK_OPERATIONS="${BENCHMARK_OPERATIONS:-initialization,insert,update}"
 # SP1's defaults target large proving machines (2^24-cycle shards and very
 # large trace buffers). Keep protocol benchmarks bounded on workstation-class
@@ -30,6 +31,7 @@ SP1_GNARK_IMAGE="${SP1_GNARK_IMAGE:-ghcr.io/succinctlabs/sp1-gnark:$SP1_CIRCUIT_
 
 export POA_SP1_PROOF_MODE
 export POA_SP1_PROFILE
+export SP1_PROVER
 export SP1_GNARK_IMAGE
 export SHARD_SIZE MINIMAL_TRACE_CHUNK_THRESHOLD TRACE_CHUNK_SLOTS
 export GAS_TRACE_CHUNK_THRESHOLD GAS_TRACE_CHUNK_SLOTS
@@ -41,10 +43,24 @@ echo "  master n:   $MASTER_N"
 echo "  samples:    $SAMPLES"
 echo "  warmup:     $WARMUP"
 echo "  SP1 mode:   $POA_SP1_PROOF_MODE"
+echo "  SP1 prover: $SP1_PROVER"
 echo "  SP1 profile: $POA_SP1_PROFILE"
-if [[ "$POA_SP1_PROOF_MODE" == "groth16" || "$POA_SP1_PROOF_MODE" == "plonk" ]]; then
+if [[ "$SP1_PROVER" != "network" && ( "$POA_SP1_PROOF_MODE" == "groth16" || "$POA_SP1_PROOF_MODE" == "plonk" ) ]]; then
   echo "  gnark image: $SP1_GNARK_IMAGE"
   echo "  Docker arch: ${DOCKER_DEFAULT_PLATFORM:-native}"
+fi
+
+if [[ "$SP1_PROVER" == "network" ]]; then
+  NETWORK_WORKER="${POA_SP1_NETWORK_WORKER:-$ROOT_DIR/tools/sp1-network-worker/target/release/sp1-network-worker}"
+  if [[ -z "${NETWORK_PRIVATE_KEY:-}" ]]; then
+    echo "NETWORK_PRIVATE_KEY is required for SP1 Network proving." >&2
+    exit 1
+  fi
+  if [[ ! -x "$NETWORK_WORKER" ]]; then
+    echo "SP1 Network worker is missing: $NETWORK_WORKER" >&2
+    echo "Run ./poa sp1-network-build first." >&2
+    exit 1
+  fi
 fi
 echo "  operations: $BENCHMARK_OPERATIONS"
 echo "  SP1 shard:  $SHARD_SIZE cycles"
@@ -68,27 +84,29 @@ fi
 
 case "$POA_SP1_PROOF_MODE" in
   groth16|plonk)
-    if ! command -v docker >/dev/null 2>&1; then
-      echo "Docker is required for SP1 $POA_SP1_PROOF_MODE wrapping. Run ./poa bootstrap." >&2
-      exit 1
-    fi
-    if ! docker info >/dev/null 2>&1; then
-      echo "Docker is installed but its daemon is unavailable. Start Docker Desktop, then rerun." >&2
-      exit 1
-    fi
-    image_arch="$(docker image inspect --format '{{.Architecture}}' "$SP1_GNARK_IMAGE" 2>/dev/null || true)"
-    expected_arch=""
-    case "${DOCKER_DEFAULT_PLATFORM:-}" in
-      linux/amd64) expected_arch="amd64" ;;
-      linux/arm64|linux/arm64/v8) expected_arch="arm64" ;;
-    esac
-    if [[ -z "$image_arch" || ( -n "$expected_arch" && "$image_arch" != "$expected_arch" ) ]]; then
-      echo
-      echo "Preparing SP1 gnark wrapper image before benchmark timers..."
-      if [[ -n "${DOCKER_DEFAULT_PLATFORM:-}" ]]; then
-        docker pull --platform "$DOCKER_DEFAULT_PLATFORM" "$SP1_GNARK_IMAGE"
-      else
-        docker pull "$SP1_GNARK_IMAGE"
+    if [[ "$SP1_PROVER" != "network" ]]; then
+      if ! command -v docker >/dev/null 2>&1; then
+        echo "Docker is required for local SP1 $POA_SP1_PROOF_MODE wrapping. Run ./poa bootstrap." >&2
+        exit 1
+      fi
+      if ! docker info >/dev/null 2>&1; then
+        echo "Docker is installed but its daemon is unavailable. Start Docker Desktop, then rerun." >&2
+        exit 1
+      fi
+      image_arch="$(docker image inspect --format '{{.Architecture}}' "$SP1_GNARK_IMAGE" 2>/dev/null || true)"
+      expected_arch=""
+      case "${DOCKER_DEFAULT_PLATFORM:-}" in
+        linux/amd64) expected_arch="amd64" ;;
+        linux/arm64|linux/arm64/v8) expected_arch="arm64" ;;
+      esac
+      if [[ -z "$image_arch" || ( -n "$expected_arch" && "$image_arch" != "$expected_arch" ) ]]; then
+        echo
+        echo "Preparing SP1 gnark wrapper image before benchmark timers..."
+        if [[ -n "${DOCKER_DEFAULT_PLATFORM:-}" ]]; then
+          docker pull --platform "$DOCKER_DEFAULT_PLATFORM" "$SP1_GNARK_IMAGE"
+        else
+          docker pull "$SP1_GNARK_IMAGE"
+        fi
       fi
     fi
     ;;

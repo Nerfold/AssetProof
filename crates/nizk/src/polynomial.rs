@@ -440,9 +440,20 @@ fn product_tree_poly(roots: &[Fr]) -> Polynomial {
         return Polynomial::from_coeffs(vec![-roots[0], Fr::from(1u64)]);
     }
     let mid = roots.len() / 2;
-    let left = product_tree_poly(&roots[..mid]);
-    let right = product_tree_poly(&roots[mid..]);
-    Polynomial::from_dense(fast_mul_dense(&left.as_dense(), &right.as_dense()))
+    let (left, right) = if roots.len() >= TREE_PARALLEL_THRESHOLD {
+        rayon::join(
+            || product_tree_poly(&roots[..mid]),
+            || product_tree_poly(&roots[mid..]),
+        )
+    } else {
+        (
+            product_tree_poly(&roots[..mid]),
+            product_tree_poly(&roots[mid..]),
+        )
+    };
+    // Multiply coefficient slices directly. The previous dense conversion
+    // cloned both child polynomials at every internal product-tree node.
+    left.mul(&right)
 }
 
 fn interpolate_on_tree(

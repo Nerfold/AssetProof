@@ -1,6 +1,8 @@
 use common::encoding::normalize_address;
 
-use crate::hash::{key_hash, Hash};
+use crate::hash::{
+    common_prefix_len as shared_common_prefix_len, key_bit as shared_key_bit, key_hash, Hash,
+};
 
 pub fn key_for_address(address: &str) -> Result<Hash, String> {
     let normalized = normalize_address(address)?;
@@ -8,16 +10,9 @@ pub fn key_for_address(address: &str) -> Result<Hash, String> {
 }
 
 pub fn key_bit(key: &Hash, depth: usize) -> bool {
-    let byte = key[depth / 8];
-    let offset = 7 - (depth % 8);
-    ((byte >> offset) & 1) == 1
+    shared_key_bit(key, depth)
 }
 
 pub fn common_prefix_len(a: &Hash, b: &Hash, max_depth: usize) -> usize {
-    for depth in 0..max_depth {
-        if key_bit(a, depth) != key_bit(b, depth) {
-            return depth;
-        }
-    }
-    max_depth
+    shared_common_prefix_len(a, b, max_depth)
 }

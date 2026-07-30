@@ -2,11 +2,12 @@ use std::collections::BTreeMap;
 use std::io::{ErrorKind, Read, Write};
 use std::os::unix::net::UnixListener;
 use std::path::Path;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
+use sp1_core_machine::riscv::RiscvAir;
 use sp1_cuda::CudaProvingKey;
-use sp1_sdk::blocking::{CudaProver, ProveRequest, Prover, ProverClient};
-use sp1_sdk::{Elf, SP1Stdin};
+use sp1_prover_types::network_base_types::ProofMode;
+use sp1_sdk::{Elf, SP1Context, SP1ProofWithPublicValues, SP1Stdin};
 
 // Private control protocol shared with crates/sp1-host. It is deliberately
 // separate from the file protocol used by the Network worker.
@@ -51,25 +52,64 @@ fn serve(socket_path: &Path) -> Result<(), String> {
                 return Err("POA_SP1_CUDA_DEVICE is not valid UTF-8".to_string())
             }
         };
-        eprintln!("starting persistent SP1 CUDA prover on device {device}");
-        let client = ProverClient::builder()
-            .cuda()
-            .with_device_id(device)
-            .build();
+        eprintln!("initializing persistent SP1 CUDA server client on device {device}");
+        let gpu_server_path = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .map(|home| home.join(".sp1/bin/sp1-gpu-server"));
+        match gpu_server_path {
+            Some(path) if path.is_file() => {
+                eprintln!("using SP1 GPU server binary {}", path.display())
+            }
+            Some(path) => eprintln!(
+                "SP1 GPU server binary is missing at {}; SP1 will download it before connecting",
+                path.display()
+            ),
+            None => eprintln!("HOME is unset; SP1 GPU server initialization will fail"),
+        }
+        let runtime = tokio::runtime::Runtime::new()
+            .map_err(|err| format!("create CUDA worker runtime: {err}"))?;
+        let connect_started = Instant::now();
+        let client = runtime
+            .block_on(async {
+                tokio::time::timeout(
+                    Duration::from_secs(600),
+                    sp1_cuda::CudaProver::new_with_id(device),
+                )
+                .await
+            })
+            .map_err(|_| {
+                "timed out after 600s downloading, starting, or connecting to sp1-gpu-server"
+                    .to_string()
+            })?
+            .map_err(|err| format!("initialize CUDA server client: {err}"))?;
+        eprintln!(
+            "persistent SP1 CUDA server client ready in {:.3}s",
+            connect_started.elapsed().as_secs_f64()
+        );
         let mut keys = BTreeMap::<String, CudaProvingKey>::new();
 
-        loop {
-            let command = match read_command(&mut stream)? {
-                Some(command) => command,
-                None => return Ok(()),
-            };
-            let result = match command {
-                PREPARE => handle_prepare(&mut stream, &client, &mut keys),
-                PROVE => handle_prove(&mut stream, &client, &keys),
-                value => Err(format!("unsupported CUDA worker command {value}")),
-            };
-            write_response(&mut stream, result)?;
-        }
+        let result = (|| {
+            loop {
+                let command = match read_command(&mut stream)? {
+                    Some(command) => command,
+                    None => return Ok(()),
+                };
+                let result = match command {
+                    PREPARE => handle_prepare(&mut stream, &runtime, &client, &mut keys),
+                    PROVE => handle_prove(&mut stream, &runtime, &client, &keys),
+                    value => Err(format!("unsupported CUDA worker command {value}")),
+                };
+                write_response(&mut stream, result)?;
+            }
+        })();
+
+        // CudaProvingKey and CudaClient use tokio tasks in Drop. Entering the
+        // runtime here keeps graceful worker shutdown well-defined.
+        let runtime_guard = runtime.enter();
+        drop(keys);
+        drop(client);
+        drop(runtime_guard);
+        result
     }
 }
 
@@ -92,7 +132,8 @@ fn read_command(reader: &mut impl Read) -> Result<Option<u8>, String> {
 
 fn handle_prepare(
     reader: &mut impl Read,
-    client: &CudaProver,
+    runtime: &tokio::runtime::Runtime,
+    client: &sp1_cuda::CudaProver,
     keys: &mut BTreeMap<String, CudaProvingKey>,
 ) -> Result<Vec<u8>, String> {
     let guest = read_guest(reader)?;
@@ -103,8 +144,8 @@ fn handle_prepare(
 
     eprintln!("setting up SP1 CUDA guest {guest}");
     let started = Instant::now();
-    let pk = client
-        .setup(Elf::from(elf))
+    let pk = runtime
+        .block_on(client.setup_with_machine(Elf::from(elf), RiscvAir::machine()))
         .map_err(|err| format!("CUDA setup for {guest}: {err}"))?;
     keys.insert(guest.clone(), pk);
     eprintln!(
@@ -116,7 +157,8 @@ fn handle_prepare(
 
 fn handle_prove(
     reader: &mut impl Read,
-    client: &CudaProver,
+    runtime: &tokio::runtime::Runtime,
+    client: &sp1_cuda::CudaProver,
     keys: &BTreeMap<String, CudaProvingKey>,
 ) -> Result<Vec<u8>, String> {
     let mut mode = [0u8; 1];
@@ -133,14 +175,16 @@ fn handle_prove(
 
     eprintln!("generating SP1 CUDA proof for {guest}");
     let started = Instant::now();
-    let request = client.prove(pk, stdin);
-    let proof = match mode[0] {
-        0 => request.compressed().run(),
-        1 => request.groth16().run(),
-        2 => request.plonk().run(),
+    let proof_mode = match mode[0] {
+        0 => ProofMode::Compressed,
+        1 => ProofMode::Groth16,
+        2 => ProofMode::Plonk,
         value => return Err(format!("unsupported proof mode byte {value}")),
-    }
-    .map_err(|err| format!("CUDA prove for {guest}: {err}"))?;
+    };
+    let proof: SP1ProofWithPublicValues = runtime
+        .block_on(client.prove_with_mode(pk, stdin, SP1Context::default(), proof_mode))
+        .map_err(|err| format!("CUDA prove for {guest}: {err}"))?
+        .into();
     eprintln!(
         "SP1 CUDA proof for {guest} complete in {:.3}s",
         started.elapsed().as_secs_f64()

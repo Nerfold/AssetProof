@@ -13,12 +13,12 @@ use sp1_programs_common::io::{
     Sp1BinaryMerklePrefixProof, Sp1MerkleSubtree, Sp1SmtInitPublicValues, Sp1SmtInitReserveEntry,
     Sp1SmtInitStdin,
 };
-use sp1_sdk::blocking::{Prover as BlockingProver, ProverClient};
+use sp1_sdk::blocking::Prover as BlockingProver;
 use sp1_sdk::include_elf;
 use sp1_sdk::{ProvingKey, SP1ProofWithPublicValues, SP1Stdin};
 
 use crate::proof_mode::configured_proof_mode;
-use crate::prover_backend::ProofGenerator;
+use crate::prover_backend::{shared_cpu_prover, ProofGenerator};
 use crate::setup::{
     default_setup_dir, ensure_smt_init_setups, load_init_ownership_vk, load_smt_init_vk,
 };
@@ -182,7 +182,7 @@ pub fn verify_smt_initialization(
         .verify(&chain_bundle, ctx.pk.verifying_key(), None)
         .map_err(|err| format!("SP1 SMT initialization verify failed: {err}"))?;
 
-    let ownership_prover = ProverClient::builder().cpu().build();
+    let ownership_prover = shared_cpu_prover();
     let ownership_vk = load_init_ownership_vk(&default_setup_dir(), INIT_OWNERSHIP_ELF)?;
     let ownership_bundle = deserialize_sp1_proof(&proof.ownership_sp1_proof_hex)?;
     ownership_prover
@@ -337,7 +337,7 @@ fn smt_init_context() -> Result<Context, String> {
     if let Some(context) = guard.as_ref() {
         return Ok(context.clone());
     }
-    let prover = ProverClient::builder().cpu().build();
+    let prover = shared_cpu_prover();
     let generator = ProofGenerator::from_env()?;
     let vk = load_smt_init_vk(&default_setup_dir(), SMT_INIT_ELF)?;
     let pk = sp1_sdk::SP1ProvingKey::new(vk, SMT_INIT_ELF);

@@ -67,6 +67,12 @@ case "$SP1_PROVER" in
       echo "Run ./poa sp1-cuda-build first." >&2
       exit 1
     fi
+    CUDA_WORKER_VERSION="$("$CUDA_WORKER" protocol-version 2>/dev/null || true)"
+    if [[ "$CUDA_WORKER_VERSION" != "poa-sp1-cuda-worker-v3-direct" ]]; then
+      echo "SP1 CUDA worker is stale or incompatible: ${CUDA_WORKER_VERSION:-unknown}" >&2
+      echo "Run ./poa sp1-cuda-build again." >&2
+      exit 1
+    fi
     ;;
   network)
     NETWORK_WORKER="${POA_SP1_NETWORK_WORKER:-$ROOT_DIR/tools/sp1-network-worker/target/release/sp1-network-worker}"

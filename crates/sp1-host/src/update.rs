@@ -15,12 +15,12 @@ use sp1_programs_common::io::{
     Sp1MembershipProof, Sp1NonMembershipProof, Sp1SiblingRef, Sp1UpdateEntryWitness,
     Sp1UpdatePublicValues, Sp1UpdateStdin,
 };
-use sp1_sdk::blocking::{Prover as BlockingProver, ProverClient};
+use sp1_sdk::blocking::Prover as BlockingProver;
 use sp1_sdk::include_elf;
 use sp1_sdk::{ProvingKey, SP1ProofWithPublicValues, SP1Stdin};
 
 use crate::proof_mode::configured_proof_mode;
-use crate::prover_backend::ProofGenerator;
+use crate::prover_backend::{shared_cpu_prover, ProofGenerator};
 use crate::setup::{default_setup_dir, ensure_smt_setups, load_update_vk};
 
 const SMT_UPDATE_ELF: sp1_sdk::Elf = include_elf!("sp1-smt-update");
@@ -57,7 +57,7 @@ fn sp1_context_with_setup_dir(setup_dir: &Path) -> Result<Sp1Context, String> {
         return Ok(ctx.clone());
     }
 
-    let prover = ProverClient::builder().cpu().build();
+    let prover = shared_cpu_prover();
     let generator = ProofGenerator::from_env()?;
     let vk = load_update_vk(setup_dir, SMT_UPDATE_ELF)?;
     let pk = sp1_sdk::SP1ProvingKey::new(vk, SMT_UPDATE_ELF);

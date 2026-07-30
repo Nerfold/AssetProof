@@ -3,10 +3,12 @@ use std::path::{Path, PathBuf};
 
 use common::crypto::hash_bytes;
 use serde::{Deserialize, Serialize};
-use sp1_sdk::blocking::{Prover as BlockingProver, ProverClient};
+use sp1_sdk::blocking::Prover as BlockingProver;
 use sp1_sdk::Elf;
 use sp1_sdk::ProvingKey;
 use sp1_sdk::SP1VerifyingKey;
+
+use crate::prover_backend::shared_cpu_prover;
 
 const UPDATE_ELF_NAME: &str = "smt-update";
 const INSERT_ELF_NAME: &str = "smt-insert";
@@ -131,7 +133,7 @@ fn ensure_setup_file(setup_dir: &Path, elf_name: &str, elf: Elf) -> Result<(), S
         println!("SP1 setup [{elf_name}]: generating...");
     }
 
-    let prover = ProverClient::builder().cpu().build();
+    let prover = shared_cpu_prover();
     let pk = prover
         .setup(elf)
         .map_err(|err| format!("sp1 setup failed for {elf_name}: {err}"))?;

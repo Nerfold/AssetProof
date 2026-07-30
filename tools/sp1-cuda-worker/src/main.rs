@@ -4,10 +4,11 @@ use std::os::unix::net::UnixListener;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use sp1_core_machine::riscv::RiscvAir;
+use sp1_core_executor::SP1Context;
+use sp1_core_machine::{io::SP1Stdin, riscv::RiscvAir};
 use sp1_cuda::CudaProvingKey;
+use sp1_primitives::Elf;
 use sp1_prover_types::network_base_types::ProofMode;
-use sp1_sdk::{Elf, SP1Context, SP1ProofWithPublicValues, SP1Stdin};
 
 // Private control protocol shared with crates/sp1-host. It is deliberately
 // separate from the file protocol used by the Network worker.
@@ -15,6 +16,7 @@ const REQUEST_MAGIC: &[u8; 8] = b"POACUD02";
 const RESPONSE_MAGIC: &[u8; 8] = b"POACUR02";
 const PREPARE: u8 = 0;
 const PROVE: u8 = 1;
+const WORKER_VERSION: &str = "poa-sp1-cuda-worker-v3-direct";
 
 fn main() {
     if let Err(err) = run() {
@@ -25,8 +27,14 @@ fn main() {
 
 fn run() -> Result<(), String> {
     let args = std::env::args().collect::<Vec<_>>();
+    if args.len() == 2 && args[1] == "protocol-version" {
+        println!("{WORKER_VERSION}");
+        return Ok(());
+    }
     if args.len() != 3 || args[1] != "serve" {
-        return Err("usage: sp1-cuda-worker serve <control.sock>".to_string());
+        return Err(
+            "usage: sp1-cuda-worker protocol-version | serve <control.sock>".to_string(),
+        );
     }
     serve(Path::new(&args[2]))
 }
@@ -181,10 +189,9 @@ fn handle_prove(
         2 => ProofMode::Plonk,
         value => return Err(format!("unsupported proof mode byte {value}")),
     };
-    let proof: SP1ProofWithPublicValues = runtime
+    let proof = runtime
         .block_on(client.prove_with_mode(pk, stdin, SP1Context::default(), proof_mode))
-        .map_err(|err| format!("CUDA prove for {guest}: {err}"))?
-        .into();
+        .map_err(|err| format!("CUDA prove for {guest}: {err}"))?;
     eprintln!(
         "SP1 CUDA proof for {guest} complete in {:.3}s",
         started.elapsed().as_secs_f64()

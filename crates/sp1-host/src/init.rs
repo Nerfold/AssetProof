@@ -14,12 +14,12 @@ use sp1_programs_common::io::{
     Sp1InitOwnershipPublicValues, Sp1InitOwnershipStdin, Sp1MerkleSubtree, Sp1OwnershipWitness,
 };
 use sp1_programs_common::io::{Sp1InitPublicValues, Sp1InitReserveEntry, Sp1InitStdin};
-use sp1_sdk::blocking::{Prover as BlockingProver, ProverClient};
+use sp1_sdk::blocking::Prover as BlockingProver;
 use sp1_sdk::include_elf;
 use sp1_sdk::{ProvingKey, SP1ProofWithPublicValues, SP1Stdin};
 
 use crate::proof_mode::{configured_proof_mode, ensure_trusted_vk};
-use crate::prover_backend::ProofGenerator;
+use crate::prover_backend::{shared_cpu_prover, ProofGenerator};
 use crate::setup::{
     default_setup_dir, ensure_protocol_setup_components, ensure_protocol_setups,
     load_init_ownership_vk, load_init_vk,
@@ -412,7 +412,7 @@ fn sp1_context() -> Result<Sp1InitContext, String> {
     }
     let start = Instant::now();
     let setup_dir = default_setup_dir();
-    let prover = ProverClient::builder().cpu().build();
+    let prover = shared_cpu_prover();
     let generator = ProofGenerator::from_env()?;
     let vk = load_init_vk(&setup_dir, INIT_ELF)?;
     let pk = sp1_sdk::SP1ProvingKey::new(vk, INIT_ELF);
@@ -436,7 +436,7 @@ fn sp1_ownership_context() -> Result<Sp1InitContext, String> {
     }
     let start = Instant::now();
     let setup_dir = default_setup_dir();
-    let prover = ProverClient::builder().cpu().build();
+    let prover = shared_cpu_prover();
     let generator = ProofGenerator::from_env()?;
     let vk = load_init_ownership_vk(&setup_dir, INIT_OWNERSHIP_ELF)?;
     let pk = sp1_sdk::SP1ProvingKey::new(vk, INIT_OWNERSHIP_ELF);

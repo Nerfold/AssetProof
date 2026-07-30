@@ -9,7 +9,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
 
-use sp1_sdk::blocking::{CpuProver, ProveRequest, Prover as BlockingProver};
+use sp1_sdk::blocking::{CpuProver, ProveRequest, Prover as BlockingProver, ProverClient};
 use sp1_sdk::{Elf, ProvingKey, SP1ProofWithPublicValues, SP1ProvingKey, SP1Stdin};
 
 use crate::proof_mode::ConfiguredProofMode;
@@ -99,8 +99,16 @@ const CUDA_REQUEST_MAGIC: &[u8; 8] = b"POACUD02";
 const CUDA_RESPONSE_MAGIC: &[u8; 8] = b"POACUR02";
 const CUDA_PREPARE: u8 = 0;
 const CUDA_PROVE: u8 = 1;
+const CUDA_WORKER_VERSION: &str = "poa-sp1-cuda-worker-v3-direct";
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 static CUDA_CLIENT: OnceLock<Arc<Mutex<CudaWorkerClient>>> = OnceLock::new();
+static CPU_PROVER: OnceLock<CpuProver> = OnceLock::new();
+
+pub(crate) fn shared_cpu_prover() -> CpuProver {
+    CPU_PROVER
+        .get_or_init(|| ProverClient::builder().cpu().build())
+        .clone()
+}
 
 fn repository_root() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -150,7 +158,7 @@ fn run_network_worker(
     run_external_worker(worker, "Network", pk, stdin, mode, guest)
 }
 
-struct CudaWorkerClient {
+pub(crate) struct CudaWorkerClient {
     worker: PathBuf,
     process: Option<CudaWorkerProcess>,
     prepared_guests: std::collections::BTreeSet<String>,
@@ -217,8 +225,9 @@ impl CudaWorkerClient {
             .and_then(|_| process.stream.flush())
             .map_err(|err| format!("send SP1 CUDA prove request for {guest}: {err}"))?;
         let payload = read_cuda_response(&mut process.stream, guest, "prove")?;
-        bincode::deserialize(&payload)
-            .map_err(|err| format!("deserialize SP1 {guest} CUDA proof: {err}"))
+        let proof: sp1_sdk::ProofFromNetwork = bincode::deserialize(&payload)
+            .map_err(|err| format!("deserialize SP1 {guest} CUDA proof: {err}"))?;
+        Ok(proof.into())
     }
 
     #[cfg(unix)]
@@ -230,6 +239,7 @@ impl CudaWorkerClient {
                     self.worker.display()
                 ));
             }
+            validate_cuda_worker(&self.worker)?;
             let session = PrivateRequestDir::new("cuda-session")?;
             let socket_path = session.path.join("worker.sock");
             let mut child = Command::new(&self.worker)
@@ -261,6 +271,24 @@ impl CudaWorkerClient {
     fn process(&mut self) -> Result<&mut CudaWorkerProcess, String> {
         Err("SP1 CUDA proving requires a Unix host".to_string())
     }
+}
+
+fn validate_cuda_worker(worker: &Path) -> Result<(), String> {
+    let output = Command::new(worker)
+        .arg("protocol-version")
+        .output()
+        .map_err(|err| format!("inspect SP1 CUDA worker {}: {err}", worker.display()))?;
+    let version = String::from_utf8_lossy(&output.stdout);
+    if !output.status.success() || version.trim() != CUDA_WORKER_VERSION {
+        return Err(format!(
+            "SP1 CUDA worker {} is stale or incompatible (found {:?}, expected {}). \
+             Run `./poa sp1-cuda-build` again.",
+            worker.display(),
+            version.trim(),
+            CUDA_WORKER_VERSION
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(unix)]

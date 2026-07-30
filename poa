@@ -36,15 +36,7 @@ case "${1:-}" in
             echo "SP1 CUDA requires Linux x86_64; found $(uname -m)." >&2
             exit 1
         }
-        command -v nvidia-smi >/dev/null 2>&1 || {
-            echo "nvidia-smi is unavailable; attach an NVIDIA GPU and driver first." >&2
-            exit 1
-        }
-        nvidia-smi -L >/dev/null 2>&1 || {
-            echo "NVIDIA driver cannot access a GPU inside this container." >&2
-            exit 1
-        }
-        exec cargo build --release --manifest-path "$ROOT_DIR/tools/sp1-cuda-worker/Cargo.toml" "$@"
+        exec cargo build --locked --release --manifest-path "$ROOT_DIR/tools/sp1-cuda-worker/Cargo.toml" "$@"
         ;;
 esac
 

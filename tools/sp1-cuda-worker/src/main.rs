@@ -42,14 +42,15 @@ fn serve(socket_path: &Path) -> Result<(), String> {
             .accept()
             .map_err(|err| format!("accept control connection: {err}"))?;
 
-        let device = std::env::var("POA_SP1_CUDA_DEVICE")
-            .map(|value| {
-                value
-                    .parse::<u32>()
-                    .map_err(|err| format!("invalid POA_SP1_CUDA_DEVICE {value}: {err}"))
-            })
-            .transpose()?
-            .unwrap_or(0);
+        let device = match std::env::var("POA_SP1_CUDA_DEVICE") {
+            Ok(value) => value
+                .parse::<u32>()
+                .map_err(|err| format!("invalid POA_SP1_CUDA_DEVICE {value}: {err}"))?,
+            Err(std::env::VarError::NotPresent) => 0,
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err("POA_SP1_CUDA_DEVICE is not valid UTF-8".to_string())
+            }
+        };
         eprintln!("starting persistent SP1 CUDA prover on device {device}");
         let client = ProverClient::builder()
             .cuda()

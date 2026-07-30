@@ -687,9 +687,41 @@ POA_SP1_PROOF_MODE=compressed \
 ./scripts/initialize_smt_benchmark_data.sh
 ```
 
-所有 Network stdin 都强制使用 private upload。返回 proof 会先由主进程使用本地可信 VK
-验证，再进入协议 proof。临时请求文件权限、worker 覆盖方式和安全边界见
+所有 Network stdin 都强制使用 private upload。返回 proof 在显式 verifier 阶段由主进程
+使用本地可信 VK 验证；这次验证不会混入 prover benchmark。临时请求文件权限、worker
+覆盖方式和安全边界见
 [`docs/SP1_NETWORK.md`](docs/SP1_NETWORK.md)。
+
+### 本地 CUDA prover
+
+本地 GPU proving 使用独立 worker，因此普通 CPU/macOS 构建不需要 CUDA 依赖。CUDA
+设备必须是 Linux x86_64，并能从容器内通过 `nvidia-smi` 访问。先在 GPU 机器构建：
+
+```bash
+./poa sp1-cuda-build
+```
+
+然后运行 NIZK benchmark：
+
+```bash
+SP1_PROVER=cuda POA_SP1_CUDA_DEVICE=0 POA_SP1_PROOF_MODE=compressed \
+MASTER_N=1000 N_SIZES=1000 M_SIZES=100 \
+FIXTURE_DIR=data/mock/bench/generated-merkle-n1000-m100 \
+SRS_DIR=params/srs/bench-n1000-m100 \
+BENCHMARK_OPERATIONS=initialization,insert,update \
+SAMPLES=3 WARMUP=1 \
+OUTPUT_DIR=artifacts/benchmarks/nizk-cuda-n1000-m100 \
+./scripts/benchmark_protocol.sh
+```
+
+第一次 CUDA setup 会由 SP1 6.2.4 自动下载匹配的
+`~/.sp1/bin/sp1-gpu-server`。benchmark 使用一个长驻 worker，每个选中的 guest ELF
+只 setup 一次；启动/setup 时间写入 `loading.csv` 和报告的 preparation 表，不进入
+sample 的 prover time。worker 返回的 proof 在独立 verifier 阶段使用本地可信 VK 验证。
+建议先使用 `compressed`：它加速 SP1 core proving 且不需要 Docker；
+`groth16/plonk` 的最终 wrapper 仍使用原有本地 Docker/artifact 路径。本集成没有启用
+额外的 Icicle `groth16-cuda` wrapper。完整环境要求、设备选择和诊断方式见
+[`docs/SP1_CUDA.md`](docs/SP1_CUDA.md)。
 
 ### SP1 阶段分析
 

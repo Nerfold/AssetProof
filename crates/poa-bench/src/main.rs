@@ -143,6 +143,41 @@ fn run() -> Result<(), String> {
     println!("  samples: {}, warmup: {}", config.samples, config.warmup);
     println!("  output: {}", config.output_dir.display());
 
+    if includes_operation(&config, BenchmarkOperation::Initialization)
+        || includes_operation(&config, BenchmarkOperation::Insert)
+    {
+        println!("\n== preparing SP1 prover contexts outside sample timers ==");
+    }
+    if includes_operation(&config, BenchmarkOperation::Initialization) {
+        for (guest, elapsed) in sp1_host::init::prepare_provers()? {
+            println!("   {guest}: prepare={}", human_duration(elapsed));
+            loads.push(LoadRecord {
+                n: 0,
+                m: 0,
+                phase: match guest {
+                    "init-merkle" => "sp1_prover_prepare_init_merkle",
+                    "init-ownership" => "sp1_prover_prepare_init_ownership",
+                    _ => "sp1_prover_prepare_initialization_guest",
+                },
+                elapsed,
+                bytes: 0,
+                reused: false,
+            });
+        }
+    }
+    if includes_operation(&config, BenchmarkOperation::Insert) {
+        let elapsed = sp1_host::kzg_insert::prepare_prover()?;
+        println!("   kzg-insert: prepare={}", human_duration(elapsed));
+        loads.push(LoadRecord {
+            n: 0,
+            m: 0,
+            phase: "sp1_prover_prepare_kzg_insert",
+            elapsed,
+            bytes: 0,
+            reused: false,
+        });
+    }
+
     for &n in &config.n_sizes {
         println!("\n== loading prepared n={n} ==");
         let degree = n
@@ -298,7 +333,11 @@ fn run() -> Result<(), String> {
         if includes_operation(&config, BenchmarkOperation::Update) {
             for &m in &config.m_sizes {
                 if m > n {
-                    return Err(format!("m={m} cannot exceed n={n}"));
+                    return Err(format!(
+                        "m={m} exceeds n={n}: the NIZK update relation supports non-member \
+                         touch-list entries, but the current persisted Ethereum fixture only \
+                         materializes n distinct transition accounts"
+                    ));
                 }
                 let delta_path = ethereum_fixture::delta_fixture_path(&master_dir, n, m);
                 if config.require_existing {
@@ -524,7 +563,10 @@ fn prepare_benchmark_inputs(config: &Config) -> Result<(), String> {
 
         for &m in &config.m_sizes {
             if m > n {
-                return Err(format!("m={m} cannot exceed n={n}"));
+                return Err(format!(
+                    "m={m} exceeds n={n}: the current persisted Ethereum transition fixture \
+                     cannot yet generate more than n distinct touch-list accounts"
+                ));
             }
             let delta_path = ethereum_fixture::delta_fixture_path(&master_dir, n, m);
             let (_, new_root, generation, validation, reused) =
@@ -564,7 +606,9 @@ fn benchmark_srs_spec(config: &Config) -> Result<(usize, usize, usize), String> 
     let max_g2_degree = config.m_sizes.iter().copied().max().unwrap_or(1).max(1);
     if max_g2_degree > max_degree {
         return Err(format!(
-            "maximum update size {max_g2_degree} exceeds benchmark SRS degree {max_degree}"
+            "maximum update size {max_g2_degree} exceeds benchmark SRS degree {max_degree}; \
+             m>n requires an expanded SRS plus a persisted fixture with additional distinct \
+             non-member chain accounts"
         ));
     }
     Ok((max_n, max_degree, max_g2_degree))
@@ -1190,16 +1234,17 @@ fn write_summary_markdown(
     let mut body = String::new();
     body.push_str("# Dynamic PoA benchmark report\n\n");
     body.push_str(&format!(
-        "- n sizes: `{:?}`\n- m sizes: `{:?}`\n- operations: `{}`\n- measured samples: `{}`\n- warmup samples: `{}`\n- SP1 proof mode: `{}`\n\n",
+        "- n sizes: `{:?}`\n- m sizes: `{:?}`\n- operations: `{}`\n- measured samples: `{}`\n- warmup samples: `{}`\n- SP1 prover: `{}`\n- SP1 proof mode: `{}`\n\n",
         config.n_sizes,
         config.m_sizes,
         operations_label(&config.operations),
         config.samples,
         config.warmup,
+        std::env::var("SP1_PROVER").unwrap_or_else(|_| "cpu".to_string()),
         std::env::var("POA_SP1_PROOF_MODE").unwrap_or_else(|_| "groth16".to_string())
     ));
     body.push_str(
-        "Prover and verifier columns exclude fixture generation, CSV parsing, SRS generation/loading, proof serialization, and report I/O. Each operation uses the same prepared state for all measured repetitions.\n\n",
+        "Prover and verifier columns exclude fixture generation, CSV parsing, SRS generation/loading, reusable prover/program setup, output-artifact serialization, and report I/O. Each operation uses the same prepared state and already-prepared proving program for all measured repetitions.\n\n",
     );
     body.push_str("## Protocol timings\n\n");
     body.push_str("| operation | n | m | input load | SRS load | prover median | prover mean | prover p95 | verifier median | verifier mean | verifier p95 | proof size | encoding |\n");
@@ -1239,7 +1284,8 @@ fn write_summary_markdown(
     }
     body.push_str("\n## Methodology notes\n\n");
     body.push_str("- The release binary is compiled before the benchmark process starts.\n");
-    body.push_str("- SP1 setup is performed by the wrapper script before timing.\n");
+    body.push_str("- SP1 verification-key artifacts are prepared by the wrapper script. Runtime prover/VK contexts for every selected guest are preloaded before warmups and measured samples. With CUDA, this also starts one persistent worker and setups each guest ELF exactly once. These wall-clock preparation costs are reported in the preparation table and excluded from prover samples.\n");
+    body.push_str("- CUDA prover samples are end-to-end host wall times after preload, so they include the local Unix-socket request/response and its transport encoding; this is intentionally retained as observable proving latency.\n");
     body.push_str("- KZG ceremony and power-sequence validation belong to setup/import. Runtime loading authenticates the fixed SRS artifact; proof verification does not scan SRS powers.\n");
     body.push_str("- All n sizes use prefixes of one persisted max-n Ethereum account store and one fixed-height Keccak-Merkle tree under a shared root; the tree is not rebuilt per n.\n");
     body.push_str("- Initialization uses valid secp256k1 EOA witnesses and one compact shared-prefix Merkle proof. Ownership and Merkle/polynomial checks run in separate SP1 guests and are joined by a common ordered reserve commitment.\n");
@@ -1269,6 +1315,10 @@ fn write_environment(config: &Config) -> Result<(), String> {
         std::thread::available_parallelism()
             .map(|value| value.get().to_string())
             .unwrap_or_else(|_| "unknown".to_string()),
+    );
+    values.insert(
+        "sp1_prover",
+        std::env::var("SP1_PROVER").unwrap_or_else(|_| "cpu".to_string()),
     );
     values.insert(
         "sp1_proof_mode",

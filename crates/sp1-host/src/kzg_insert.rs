@@ -1,6 +1,6 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use ark_bls12_381::{Fr, G1Projective};
 use ark_ec::CurveGroup;
@@ -27,6 +27,15 @@ struct Context {
 }
 
 static CONTEXT: OnceLock<Mutex<Option<Context>>> = OnceLock::new();
+
+/// Preloads the insert guest into the selected prover backend. The returned
+/// duration includes context/VK loading and, for CUDA, one-time guest setup.
+pub fn prepare_prover() -> Result<Duration, String> {
+    let started = Instant::now();
+    let ctx = context()?;
+    ctx.generator.prepare(&ctx.pk, "kzg-insert")?;
+    Ok(started.elapsed())
+}
 
 #[allow(clippy::too_many_arguments)]
 pub fn build_stdin(

@@ -8,6 +8,7 @@ cd "$ROOT_DIR"
 export PATH="$HOME/.cargo/bin:$HOME/.sp1/bin:$PATH"
 
 MODE="${POA_SP1_PROOF_MODE:-groth16}"
+PROVER="${SP1_PROVER:-cpu}"
 SP1_GNARK_IMAGE="${SP1_GNARK_IMAGE:-ghcr.io/succinctlabs/sp1-gnark:$SP1_CIRCUIT_VERSION}"
 export SP1_GNARK_IMAGE
 errors=0
@@ -17,6 +18,7 @@ bad() { printf '  [missing] %s\n' "$1"; errors=$((errors + 1)); }
 
 printf 'Dynamic PoA environment doctor\n'
 printf '  proof mode: %s\n' "$MODE"
+printf '  prover: %s\n' "$PROVER"
 printf '  SP1 toolchain pin: %s\n' "$SP1_TOOLCHAIN_VERSION"
 printf '  SP1 circuit pin: %s\n\n' "$SP1_CIRCUIT_VERSION"
 if [[ "$MODE" == "groth16" || "$MODE" == "plonk" ]]; then
@@ -32,6 +34,28 @@ command -v rustup >/dev/null 2>&1 && rustup toolchain list 2>/dev/null | grep -q
 command -v cargo-prove >/dev/null 2>&1 \
   && ok "cargo-prove: $(cargo prove --version 2>/dev/null || echo installed)" \
   || bad "cargo-prove (run ./poa bootstrap)"
+
+case "$PROVER" in
+  cpu|local) ;;
+  cuda|gpu)
+    [[ "$(uname -s)" == "Linux" && "$(uname -m)" == "x86_64" ]] \
+      && ok "CUDA host: Linux x86_64" \
+      || bad "CUDA host must be Linux x86_64"
+    command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1 \
+      && ok "NVIDIA GPU: $(nvidia-smi -L | head -1)" \
+      || bad "NVIDIA GPU/driver inside the container"
+    CUDA_WORKER="${POA_SP1_CUDA_WORKER:-$ROOT_DIR/tools/sp1-cuda-worker/target/release/sp1-cuda-worker}"
+    [[ -x "$CUDA_WORKER" ]] \
+      && ok "SP1 CUDA worker: $CUDA_WORKER" \
+      || bad "SP1 CUDA worker (run ./poa sp1-cuda-build)"
+    ;;
+  network)
+    [[ -n "${NETWORK_PRIVATE_KEY:-}" ]] \
+      && ok "SP1 Network private key is set" \
+      || bad "NETWORK_PRIVATE_KEY"
+    ;;
+  *) bad "unknown SP1_PROVER=$PROVER (expected cpu, cuda, or network)" ;;
+esac
 
 check_artifacts() {
   local kind="$1"

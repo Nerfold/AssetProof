@@ -284,7 +284,11 @@ pub fn ensure_delta_fixture(
     m: usize,
 ) -> Result<(Vec<Delta>, String, Duration, Duration, bool), String> {
     if m > reserve_count {
-        return Err(format!("m={m} exceeds reserve count {reserve_count}",));
+        return Err(format!(
+            "m={m} exceeds reserve count {reserve_count}: this persisted fixture contains only \
+             reserve-member transition accounts; the update proof relation itself also supports \
+             distinct non-member touch-list entries"
+        ));
     }
     if !path.is_file() {
         return Err(format!(
@@ -1077,7 +1081,10 @@ fn validate_requested_sizes(
             return Err(format!("n={n} is outside master size {max_n}"));
         }
         if m_sizes.iter().any(|m| *m == 0 || *m > n) {
-            return Err(format!("update size must be in 1..={n}"));
+            return Err(format!(
+                "persisted Ethereum transition fixture size must be in 1..={n}; m>n needs an \
+                 expanded chain-account pool containing distinct non-members"
+            ));
         }
     }
     Ok(())

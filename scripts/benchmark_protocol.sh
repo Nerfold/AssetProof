@@ -50,18 +50,41 @@ if [[ "$SP1_PROVER" != "network" && ( "$POA_SP1_PROOF_MODE" == "groth16" || "$PO
   echo "  Docker arch: ${DOCKER_DEFAULT_PLATFORM:-native}"
 fi
 
-if [[ "$SP1_PROVER" == "network" ]]; then
-  NETWORK_WORKER="${POA_SP1_NETWORK_WORKER:-$ROOT_DIR/tools/sp1-network-worker/target/release/sp1-network-worker}"
-  if [[ -z "${NETWORK_PRIVATE_KEY:-}" ]]; then
-    echo "NETWORK_PRIVATE_KEY is required for SP1 Network proving." >&2
+case "$SP1_PROVER" in
+  cpu|local) ;;
+  cuda|gpu)
+    CUDA_WORKER="${POA_SP1_CUDA_WORKER:-$ROOT_DIR/tools/sp1-cuda-worker/target/release/sp1-cuda-worker}"
+    if [[ "$(uname -s)" != "Linux" || "$(uname -m)" != "x86_64" ]]; then
+      echo "SP1 CUDA requires Linux x86_64." >&2
+      exit 1
+    fi
+    if ! command -v nvidia-smi >/dev/null 2>&1 || ! nvidia-smi -L >/dev/null 2>&1; then
+      echo "NVIDIA GPU/driver is unavailable inside this container." >&2
+      exit 1
+    fi
+    if [[ ! -x "$CUDA_WORKER" ]]; then
+      echo "SP1 CUDA worker is missing: $CUDA_WORKER" >&2
+      echo "Run ./poa sp1-cuda-build first." >&2
+      exit 1
+    fi
+    ;;
+  network)
+    NETWORK_WORKER="${POA_SP1_NETWORK_WORKER:-$ROOT_DIR/tools/sp1-network-worker/target/release/sp1-network-worker}"
+    if [[ -z "${NETWORK_PRIVATE_KEY:-}" ]]; then
+      echo "NETWORK_PRIVATE_KEY is required for SP1 Network proving." >&2
+      exit 1
+    fi
+    if [[ ! -x "$NETWORK_WORKER" ]]; then
+      echo "SP1 Network worker is missing: $NETWORK_WORKER" >&2
+      echo "Run ./poa sp1-network-build first." >&2
+      exit 1
+    fi
+    ;;
+  *)
+    echo "SP1_PROVER must be cpu, cuda, or network; got $SP1_PROVER." >&2
     exit 1
-  fi
-  if [[ ! -x "$NETWORK_WORKER" ]]; then
-    echo "SP1 Network worker is missing: $NETWORK_WORKER" >&2
-    echo "Run ./poa sp1-network-build first." >&2
-    exit 1
-  fi
-fi
+    ;;
+esac
 echo "  operations: $BENCHMARK_OPERATIONS"
 echo "  SP1 shard:  $SHARD_SIZE cycles"
 echo "  trace:      chunk=$MINIMAL_TRACE_CHUNK_THRESHOLD slots=$TRACE_CHUNK_SLOTS"

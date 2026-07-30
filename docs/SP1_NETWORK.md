@@ -17,8 +17,9 @@ initialization scripts inherit this setting.
 The main process writes a versioned request into a fresh 0700 temporary directory using 0600
 files. Each request contains the guest ELF and serialized `SP1Stdin`. The worker always calls
 `private_stdin(true)`, writes the returned proof to a 0600 response file, and the main process
-deletes the directory after reading it. Before accepting the proof, the main process verifies it
-against the locally persisted trusted VK.
+deletes the directory after reading it. During the explicit protocol verifier phase, the main
+process verifies the proof against the locally persisted trusted VK; this verification is not
+charged to the prover benchmark.
 
 The worker skips the Network client's duplicate local simulation by default, since fixtures and
 guest execution are already checked by the project workflow. Set

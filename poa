@@ -26,6 +26,26 @@ case "${1:-}" in
         shift
         exec cargo build --release --manifest-path "$ROOT_DIR/tools/sp1-network-worker/Cargo.toml" "$@"
         ;;
+    sp1-cuda-build)
+        shift
+        [ "$(uname -s)" = "Linux" ] || {
+            echo "SP1 CUDA requires Linux x86_64." >&2
+            exit 1
+        }
+        [ "$(uname -m)" = "x86_64" ] || {
+            echo "SP1 CUDA requires Linux x86_64; found $(uname -m)." >&2
+            exit 1
+        }
+        command -v nvidia-smi >/dev/null 2>&1 || {
+            echo "nvidia-smi is unavailable; attach an NVIDIA GPU and driver first." >&2
+            exit 1
+        }
+        nvidia-smi -L >/dev/null 2>&1 || {
+            echo "NVIDIA driver cannot access a GPU inside this container." >&2
+            exit 1
+        }
+        exec cargo build --release --manifest-path "$ROOT_DIR/tools/sp1-cuda-worker/Cargo.toml" "$@"
+        ;;
 esac
 
 exec cargo run --quiet --release -p poa-cli -- "$@"

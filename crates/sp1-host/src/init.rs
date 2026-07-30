@@ -1,6 +1,6 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use ark_bls12_381::{Fr, G1Projective};
 use ark_ff::{BigInteger, PrimeField};
@@ -64,6 +64,29 @@ pub fn ensure_sp1_setup_components(
         include_init.then_some(INIT_OWNERSHIP_ELF),
         include_insert.then_some(KZG_INSERT_ELF),
     )
+}
+
+/// Preloads the two initialization guests into the selected prover backend.
+///
+/// Durations include runtime context/VK loading. For CUDA they additionally
+/// include persistent worker startup and the one-time guest ELF setup.
+pub fn prepare_provers() -> Result<Vec<(&'static str, Duration)>, String> {
+    let merkle_started = Instant::now();
+    let merkle = sp1_context()?;
+    merkle.generator.prepare(&merkle.pk, "init-merkle")?;
+    let merkle_elapsed = merkle_started.elapsed();
+
+    let ownership_started = Instant::now();
+    let ownership = sp1_ownership_context()?;
+    ownership
+        .generator
+        .prepare(&ownership.pk, "init-ownership")?;
+    let ownership_elapsed = ownership_started.elapsed();
+
+    Ok(vec![
+        ("init-merkle", merkle_elapsed),
+        ("init-ownership", ownership_elapsed),
+    ])
 }
 
 pub fn prove_init_ownership(

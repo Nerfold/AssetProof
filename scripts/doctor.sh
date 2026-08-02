@@ -4,6 +4,7 @@ set -uo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$ROOT_DIR/scripts/sp1-version.env"
 source "$ROOT_DIR/scripts/sp1-docker-env.sh"
+source "$ROOT_DIR/scripts/check-sp1-cuda-runtime.sh"
 cd "$ROOT_DIR"
 export PATH="$HOME/.cargo/bin:$HOME/.sp1/bin:$PATH"
 
@@ -44,6 +45,9 @@ case "$PROVER" in
     command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1 \
       && ok "NVIDIA GPU: $(nvidia-smi -L | head -1)" \
       || bad "NVIDIA GPU/driver inside the container"
+    check_sp1_cuda_runtime \
+      && ok "SP1 GPU server CUDA runtime libraries" \
+      || bad "SP1 GPU server CUDA runtime libraries"
     CUDA_WORKER="${POA_SP1_CUDA_WORKER:-$ROOT_DIR/tools/sp1-cuda-worker/target/release/sp1-cuda-worker}"
     if [[ -x "$CUDA_WORKER" ]]; then
       CUDA_WORKER_VERSION="$("$CUDA_WORKER" protocol-version 2>/dev/null || true)"

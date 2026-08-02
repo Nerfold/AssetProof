@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$ROOT_DIR/scripts/sp1-docker-env.sh"
+source "$ROOT_DIR/scripts/check-sp1-cuda-runtime.sh"
 cd "$ROOT_DIR"
 
 MASTER_N="${MASTER_N:-1000000}"
@@ -73,6 +74,7 @@ case "$SP1_PROVER" in
       echo "NVIDIA GPU/driver is unavailable inside this container." >&2
       exit 1
     fi
+    check_sp1_cuda_runtime || exit 1
     if [[ ! -x "$CUDA_WORKER" ]]; then
       echo "SP1 CUDA worker is missing: $CUDA_WORKER" >&2
       echo "Run ./poa sp1-cuda-build first." >&2

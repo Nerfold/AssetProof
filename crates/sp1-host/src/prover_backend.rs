@@ -240,6 +240,7 @@ impl CudaWorkerClient {
                 ));
             }
             validate_cuda_worker(&self.worker)?;
+            validate_cuda_runtime_libraries()?;
             let session = PrivateRequestDir::new("cuda-session")?;
             let socket_path = session.path.join("worker.sock");
             let mut child = Command::new(&self.worker)
@@ -286,6 +287,48 @@ fn validate_cuda_worker(worker: &Path) -> Result<(), String> {
             worker.display(),
             version.trim(),
             CUDA_WORKER_VERSION
+        ));
+    }
+    Ok(())
+}
+
+fn validate_cuda_runtime_libraries() -> Result<(), String> {
+    let Some(home) = std::env::var_os("HOME") else {
+        return Err("HOME is unset; cannot locate the SP1 GPU server".to_string());
+    };
+    let gpu_server = PathBuf::from(home).join(".sp1/bin/sp1-gpu-server");
+    if !gpu_server.is_file() {
+        return Ok(());
+    }
+    let output = Command::new("ldd")
+        .arg(&gpu_server)
+        .output()
+        .map_err(|err| {
+            format!(
+                "inspect SP1 GPU server runtime libraries {}: {err}",
+                gpu_server.display()
+            )
+        })?;
+    let diagnostics = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let missing = diagnostics
+        .lines()
+        .filter(|line| line.contains("not found"))
+        .collect::<Vec<_>>();
+    if !output.status.success() || !missing.is_empty() {
+        let detail = if missing.is_empty() {
+            diagnostics.trim().to_string()
+        } else {
+            missing.join("; ")
+        };
+        return Err(format!(
+            "SP1 GPU server {} cannot load its runtime libraries: {}. Install the CUDA 12 \
+             runtime inside the container or add its lib64 directory to LD_LIBRARY_PATH.",
+            gpu_server.display(),
+            detail
         ));
     }
     Ok(())

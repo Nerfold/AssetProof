@@ -293,18 +293,7 @@ impl SparseMerkleTree {
         if layer > self.depth {
             return None;
         }
-        let lower = if layer == 128 {
-            0
-        } else {
-            index.checked_shl(layer as u32)?
-        };
-        let upper = if layer == 128 {
-            None
-        } else {
-            index
-                .checked_add(1)
-                .and_then(|value| value.checked_shl(layer as u32))
-        };
+        let (lower, upper) = subtree_leaf_range(layer, index)?;
         let mut current = BTreeMap::<u128, Hash>::new();
         match upper {
             Some(upper) => {
@@ -584,6 +573,29 @@ fn sibling_index(index: u128) -> u128 {
     }
 }
 
+/// Returns the half-open leaf-path range covered by a node `layer` levels
+/// above the leaves. `None` as the upper bound means the range reaches the end
+/// of the u128 key space.
+///
+/// `u128::checked_shl` is deliberately not used here: it only checks whether
+/// the shift count is in range and silently truncates value overflow. For the
+/// rightmost subtree that would turn the mathematical upper bound 2^128 into
+/// zero and make `BTreeMap::range(lower..upper)` panic.
+fn subtree_leaf_range(layer: usize, index: u128) -> Option<(u128, Option<u128>)> {
+    if layer > 128 {
+        return None;
+    }
+    if layer == 128 {
+        return (index == 0).then_some((0, None));
+    }
+    let span = 1u128 << layer;
+    let lower = index.checked_mul(span)?;
+    let upper = index
+        .checked_add(1)
+        .and_then(|value| value.checked_mul(span));
+    Some((lower, upper))
+}
+
 pub fn prefix_index(key: &Hash, prefix_len: usize) -> u128 {
     crate::hash::prefix_index(key, prefix_len)
 }
@@ -593,4 +605,22 @@ fn validate_depth(depth: usize) -> Result<(), String> {
         return Err(format!("SMT depth must be in 1..=128, got {depth}"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::subtree_leaf_range;
+
+    #[test]
+    fn rightmost_subtree_uses_unbounded_upper_range() {
+        assert_eq!(subtree_leaf_range(0, u128::MAX), Some((u128::MAX, None)));
+        assert_eq!(subtree_leaf_range(127, 1), Some((1u128 << 127, None)));
+    }
+
+    #[test]
+    fn subtree_range_rejects_invalid_overflowing_indices() {
+        assert_eq!(subtree_leaf_range(127, 2), None);
+        assert_eq!(subtree_leaf_range(128, 0), Some((0, None)));
+        assert_eq!(subtree_leaf_range(128, 1), None);
+    }
 }

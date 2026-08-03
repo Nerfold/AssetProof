@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::EnvFilter;
 
+use common::crypto::hex_decode;
 use common::io::{encode_proof_binary, read_srs, read_state, write_init, write_srs, write_state};
 use common::types::{
     Delta, InitProvingContext, InitReserveWitness, StoredInitProof, StoredProof, StoredState,
@@ -69,7 +70,8 @@ struct SampleRecord {
     sample: usize,
     prover: Duration,
     verifier: Duration,
-    proof_bytes: usize,
+    proof_payload_bytes: usize,
+    artifact_bytes: usize,
     proof_encoding: &'static str,
 }
 
@@ -92,7 +94,8 @@ struct SummaryRecord {
     srs_load: Duration,
     prover: Stats,
     verifier: Stats,
-    proof_bytes: usize,
+    proof_payload_bytes: usize,
+    artifact_bytes: usize,
     proof_encoding: &'static str,
 }
 
@@ -700,7 +703,8 @@ fn benchmark_init(
 
     let mut prover_samples = Vec::with_capacity(config.samples);
     let mut verifier_samples = Vec::with_capacity(config.samples);
-    let mut proof_sizes = Vec::with_capacity(config.samples);
+    let mut proof_payload_sizes = Vec::with_capacity(config.samples);
+    let mut artifact_sizes = Vec::with_capacity(config.samples);
     let mut last_result: Option<InitProofResult> = None;
     for sample in 0..config.samples {
         let _profile_context =
@@ -737,14 +741,16 @@ fn benchmark_init(
             .join("proof-samples")
             .join(format!("init-n-{n}-last.txt"));
         write_init(&proof_path, &result.proof)?;
-        let proof_bytes = file_len(&proof_path)? as usize;
+        let proof_payload_bytes = init_proof_payload_bytes(&result.proof)?;
+        let artifact_bytes = file_len(&proof_path)? as usize;
         println!(
-            "   sample {}/{}: prover={} verifier={} proof={}",
+            "   sample {}/{}: prover={} verifier={} proof-payload={} artifact={}",
             sample + 1,
             config.samples,
             human_duration(prover),
             human_duration(verifier),
-            human_bytes(proof_bytes)
+            human_bytes(proof_payload_bytes),
+            human_bytes(artifact_bytes)
         );
         raw.push(SampleRecord {
             operation: "initialization",
@@ -753,12 +759,14 @@ fn benchmark_init(
             sample: sample + 1,
             prover,
             verifier,
-            proof_bytes,
+            proof_payload_bytes,
+            artifact_bytes,
             proof_encoding: "init-key-value-text-v3",
         });
         prover_samples.push(prover);
         verifier_samples.push(verifier);
-        proof_sizes.push(proof_bytes);
+        proof_payload_sizes.push(proof_payload_bytes);
+        artifact_sizes.push(artifact_bytes);
         last_result = Some(result);
     }
     let result =
@@ -771,7 +779,8 @@ fn benchmark_init(
         srs_load,
         &prover_samples,
         &verifier_samples,
-        &proof_sizes,
+        &proof_payload_sizes,
+        &artifact_sizes,
         "init-key-value-text-v4-split-sp1",
     );
     Ok((result.state, summary))
@@ -825,7 +834,8 @@ fn benchmark_insert(
 
     let mut prover_samples = Vec::with_capacity(config.samples);
     let mut verifier_samples = Vec::with_capacity(config.samples);
-    let mut proof_sizes = Vec::with_capacity(config.samples);
+    let mut proof_payload_sizes = Vec::with_capacity(config.samples);
+    let mut artifact_sizes = Vec::with_capacity(config.samples);
     for sample in 0..config.samples {
         let _profile_context =
             common::profiling::enter_context(common::profiling::ProfileContext {
@@ -856,7 +866,8 @@ fn benchmark_insert(
         common::profiling::record_phase("insert-verifier", "total", verifier);
 
         let encoded = encode_insert_proof_text(&result.proof)?;
-        let proof_bytes = encoded.len();
+        let proof_payload_bytes = insert_proof_payload_bytes(&result.proof)?;
+        let artifact_bytes = encoded.len();
         let proof_path = config
             .output_dir
             .join("proof-samples")
@@ -864,12 +875,13 @@ fn benchmark_insert(
         fs::write(&proof_path, encoded)
             .map_err(|err| format!("write {}: {err}", proof_path.display()))?;
         println!(
-            "   sample {}/{}: prover={} verifier={} proof={}",
+            "   sample {}/{}: prover={} verifier={} proof-payload={} artifact={}",
             sample + 1,
             config.samples,
             human_duration(prover),
             human_duration(verifier),
-            human_bytes(proof_bytes)
+            human_bytes(proof_payload_bytes),
+            human_bytes(artifact_bytes)
         );
         raw.push(SampleRecord {
             operation: "insert",
@@ -878,12 +890,14 @@ fn benchmark_insert(
             sample: sample + 1,
             prover,
             verifier,
-            proof_bytes,
+            proof_payload_bytes,
+            artifact_bytes,
             proof_encoding: "insert-key-value-text-v2",
         });
         prover_samples.push(prover);
         verifier_samples.push(verifier);
-        proof_sizes.push(proof_bytes);
+        proof_payload_sizes.push(proof_payload_bytes);
+        artifact_sizes.push(artifact_bytes);
         black_box(result.next_state);
     }
     Ok(make_summary(
@@ -894,7 +908,8 @@ fn benchmark_insert(
         srs_load,
         &prover_samples,
         &verifier_samples,
-        &proof_sizes,
+        &proof_payload_sizes,
+        &artifact_sizes,
         "insert-key-value-text-v2",
     ))
 }
@@ -928,7 +943,8 @@ fn benchmark_update(
 
     let mut prover_samples = Vec::with_capacity(config.samples);
     let mut verifier_samples = Vec::with_capacity(config.samples);
-    let mut proof_sizes = Vec::with_capacity(config.samples);
+    let mut proof_payload_sizes = Vec::with_capacity(config.samples);
+    let mut artifact_sizes = Vec::with_capacity(config.samples);
     for sample in 0..config.samples {
         let prove_start = Instant::now();
         let result = apply_update(srs, state, deltas, new_state_root)?;
@@ -945,7 +961,8 @@ fn benchmark_update(
         let verifier = verify_start.elapsed();
 
         let encoded = encode_proof_binary(&result.proof)?;
-        let proof_bytes = encoded.len();
+        let proof_payload_bytes = update_proof_payload_bytes(&result.proof)?;
+        let artifact_bytes = encoded.len();
         let proof_path = config
             .output_dir
             .join("proof-samples")
@@ -953,12 +970,13 @@ fn benchmark_update(
         fs::write(&proof_path, encoded)
             .map_err(|err| format!("write {}: {err}", proof_path.display()))?;
         println!(
-            "   sample {}/{}: prover={} verifier={} proof={}",
+            "   sample {}/{}: prover={} verifier={} proof-payload={} artifact={}",
             sample + 1,
             config.samples,
             human_duration(prover),
             human_duration(verifier),
-            human_bytes(proof_bytes)
+            human_bytes(proof_payload_bytes),
+            human_bytes(artifact_bytes)
         );
         raw.push(SampleRecord {
             operation: "update",
@@ -967,12 +985,14 @@ fn benchmark_update(
             sample: sample + 1,
             prover,
             verifier,
-            proof_bytes,
+            proof_payload_bytes,
+            artifact_bytes,
             proof_encoding: "DPOAUPD6-multizkopen-binary",
         });
         prover_samples.push(prover);
         verifier_samples.push(verifier);
-        proof_sizes.push(proof_bytes);
+        proof_payload_sizes.push(proof_payload_bytes);
+        artifact_sizes.push(artifact_bytes);
         black_box(result.next_state);
     }
     Ok(make_summary(
@@ -983,7 +1003,8 @@ fn benchmark_update(
         srs_load,
         &prover_samples,
         &verifier_samples,
-        &proof_sizes,
+        &proof_payload_sizes,
+        &artifact_sizes,
         "DPOAUPD6-multizkopen-binary",
     ))
 }
@@ -1119,11 +1140,14 @@ fn make_summary(
     srs_load: Duration,
     prover_samples: &[Duration],
     verifier_samples: &[Duration],
-    proof_sizes: &[usize],
+    proof_payload_sizes: &[usize],
+    artifact_sizes: &[usize],
     proof_encoding: &'static str,
 ) -> SummaryRecord {
-    let mut sizes = proof_sizes.to_vec();
-    sizes.sort_unstable();
+    let mut payloads = proof_payload_sizes.to_vec();
+    payloads.sort_unstable();
+    let mut artifacts = artifact_sizes.to_vec();
+    artifacts.sort_unstable();
     SummaryRecord {
         operation,
         n,
@@ -1132,7 +1156,8 @@ fn make_summary(
         srs_load,
         prover: stats(prover_samples),
         verifier: stats(verifier_samples),
-        proof_bytes: sizes[(sizes.len() - 1) / 2],
+        proof_payload_bytes: payloads[(payloads.len() - 1) / 2],
+        artifact_bytes: artifacts[(artifacts.len() - 1) / 2],
         proof_encoding,
     }
 }
@@ -1163,18 +1188,20 @@ fn stats(samples: &[Duration]) -> Stats {
 }
 
 fn write_raw_csv(path: &Path, records: &[SampleRecord]) -> Result<(), String> {
-    let mut body =
-        String::from("operation,n,m,sample,prover_ns,verifier_ns,proof_bytes,proof_encoding\n");
+    let mut body = String::from(
+        "scheme,operation,n,m,sample,prover_ns,verifier_ns,proof_payload_bytes,artifact_bytes,proof_encoding\n",
+    );
     for record in records {
         body.push_str(&format!(
-            "{},{},{},{},{},{},{},{}\n",
+            "nizk,{},{},{},{},{},{},{},{},{}\n",
             record.operation,
             record.n,
             record.m,
             record.sample,
             record.prover.as_nanos(),
             record.verifier.as_nanos(),
-            record.proof_bytes,
+            record.proof_payload_bytes,
+            record.artifact_bytes,
             record.proof_encoding
         ));
     }
@@ -1182,10 +1209,10 @@ fn write_raw_csv(path: &Path, records: &[SampleRecord]) -> Result<(), String> {
 }
 
 fn write_load_csv(path: &Path, records: &[LoadRecord]) -> Result<(), String> {
-    let mut body = String::from("n,m,phase,elapsed_ns,bytes,reused\n");
+    let mut body = String::from("scheme,n,m,phase,elapsed_ns,bytes,reused\n");
     for record in records {
         body.push_str(&format!(
-            "{},{},{},{},{},{}\n",
+            "nizk,{},{},{},{},{},{}\n",
             record.n,
             record.m,
             record.phase,
@@ -1199,11 +1226,11 @@ fn write_load_csv(path: &Path, records: &[LoadRecord]) -> Result<(), String> {
 
 fn write_summary_csv(path: &Path, records: &[SummaryRecord]) -> Result<(), String> {
     let mut body = String::from(
-        "operation,n,m,input_load_ms,srs_load_ms,prover_min_ms,prover_median_ms,prover_mean_ms,prover_p95_ms,prover_stddev_ms,verifier_min_ms,verifier_median_ms,verifier_mean_ms,verifier_p95_ms,verifier_stddev_ms,proof_bytes,proof_encoding\n",
+        "scheme,operation,n,m,input_load_ms,parameter_load_ms,prover_min_ms,prover_median_ms,prover_mean_ms,prover_p95_ms,prover_stddev_ms,verifier_min_ms,verifier_median_ms,verifier_mean_ms,verifier_p95_ms,verifier_stddev_ms,proof_payload_bytes,artifact_bytes,proof_encoding\n",
     );
     for record in records {
         body.push_str(&format!(
-            "{},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{}\n",
+            "nizk,{},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{},{}\n",
             record.operation,
             record.n,
             record.m,
@@ -1219,7 +1246,8 @@ fn write_summary_csv(path: &Path, records: &[SummaryRecord]) -> Result<(), Strin
             record.verifier.mean_ms,
             record.verifier.p95_ms,
             record.verifier.stddev_ms,
-            record.proof_bytes,
+            record.proof_payload_bytes,
+            record.artifact_bytes,
             record.proof_encoding,
         ));
     }
@@ -1247,11 +1275,11 @@ fn write_summary_markdown(
         "Prover and verifier columns exclude fixture generation, CSV parsing, SRS generation/loading, reusable prover/program setup, output-artifact serialization, and report I/O. Each operation uses the same prepared state and already-prepared proving program for all measured repetitions.\n\n",
     );
     body.push_str("## Protocol timings\n\n");
-    body.push_str("| operation | n | m | input load | SRS load | prover median | prover mean | prover p95 | verifier median | verifier mean | verifier p95 | proof size | encoding |\n");
-    body.push_str("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|\n");
+    body.push_str("| operation | n | m | input load | SRS load | prover median | prover mean | prover p95 | verifier median | verifier mean | verifier p95 | proof payload | persisted artifact | encoding |\n");
+    body.push_str("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|\n");
     for record in summaries {
         body.push_str(&format!(
-            "| {} | {} | {} | {:.3} ms | {:.3} ms | {:.3} ms | {:.3} ms | {:.3} ms | {:.3} ms | {:.3} ms | {:.3} ms | {} | {} |\n",
+            "| {} | {} | {} | {:.3} ms | {:.3} ms | {:.3} ms | {:.3} ms | {:.3} ms | {:.3} ms | {:.3} ms | {:.3} ms | {} | {} | {} |\n",
             record.operation,
             record.n,
             record.m,
@@ -1263,7 +1291,8 @@ fn write_summary_markdown(
             record.verifier.median_ms,
             record.verifier.mean_ms,
             record.verifier.p95_ms,
-            human_bytes(record.proof_bytes),
+            human_bytes(record.proof_payload_bytes),
+            human_bytes(record.artifact_bytes),
             record.proof_encoding,
         ));
     }
@@ -1293,9 +1322,7 @@ fn write_summary_markdown(
     body.push_str("- Insert authenticates an additional EOA against the same binary Merkle root with a self-contained path.\n");
     body.push_str("- Update verification uses the debug verifier and excludes canonical Sync/finality verification.\n");
     body.push_str("- Update-only mode loads a persisted, structurally valid initialized root polynomial and KZG/balance commitments; it skips only the initialization proof and excludes that state loading/validation from prover time.\n");
-    body.push_str(
-        "- Proof size is measured after the timer using the labeled artifact encoding.\n",
-    );
+    body.push_str("- Proof payload counts canonical binary cryptographic proof components and excludes the public statement/VK. Persisted artifact size records the project's current text or binary file format. Both are measured after the timer.\n");
     body.push_str("- Ethereum keys, balances, deltas, binary Merkle roots, and proofs are deterministically generated outside SP1; fixture preparation is excluded from prover time.\n");
     body.push_str("- Merkle and large salted witness commitments use SP1's Keccak permutation syscall; ECDSA uses the patched k256 precompiles and BLS12-381 commitment checks use SP1 BLS add/double syscalls.\n");
 
@@ -1306,6 +1333,7 @@ fn write_summary_markdown(
 fn write_environment(config: &Config) -> Result<(), String> {
     let mut values = BTreeMap::new();
     values.insert("fixture_version", FIXTURE_VERSION.to_string());
+    values.insert("scheme", "nizk".to_string());
     values.insert("mode", format!("{:?}", config.mode));
     values.insert("require_existing", config.require_existing.to_string());
     values.insert("os", std::env::consts::OS.to_string());
@@ -1394,6 +1422,45 @@ fn encode_insert_proof_text(proof: &KzgInsertProof) -> Result<String, String> {
         format!("sp1_public_values_hex={}", proof.sp1_public_values_hex),
     ]
     .join("\n"))
+}
+
+fn init_proof_payload_bytes(proof: &StoredInitProof) -> Result<usize, String> {
+    decoded_payload_bytes(&[
+        &proof.kzg_opening_proof_hex,
+        &proof.sp1_proof_hex,
+        &proof.ownership_sp1_proof_hex,
+        &proof.transcript_hex,
+    ])
+}
+
+fn insert_proof_payload_bytes(proof: &KzgInsertProof) -> Result<usize, String> {
+    decoded_payload_bytes(&[
+        &proof.strong_zkopen_proof_hex,
+        &proof.nonzero_proof_hex,
+        &proof.transcript_hex,
+        &proof.sp1_proof_hex,
+    ])
+}
+
+fn update_proof_payload_bytes(proof: &StoredProof) -> Result<usize, String> {
+    let decoded = decoded_payload_bytes(&[
+        &proof.multi_zkopen_proof_hex,
+        &proof.transcript_hex,
+        &proof.bp_proof_hex,
+        &proof.balance_range_proof_hex,
+    ])?;
+    decoded
+        .checked_add(proof.committed_input_link_ipa_proof.len())
+        .and_then(|value| value.checked_add(proof.projection_ipa_proof.len()))
+        .ok_or_else(|| "update proof payload size overflow".to_string())
+}
+
+fn decoded_payload_bytes(parts: &[&str]) -> Result<usize, String> {
+    parts.iter().try_fold(0usize, |total, value| {
+        total
+            .checked_add(hex_decode(value)?.len())
+            .ok_or_else(|| "proof payload size overflow".to_string())
+    })
 }
 
 fn parse_config() -> Result<Config, String> {

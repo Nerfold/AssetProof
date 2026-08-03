@@ -1,5 +1,6 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use common::crypto::{hash_bytes, hex_decode, hex_encode};
 use common::types::{Delta, StoredSmtProof};
@@ -7,8 +8,8 @@ use smt::key::key_for_address;
 use smt::proof::{CompactAddressProof, CompactNonMembershipProof, CompactProofEntry, SiblingRef};
 use smt::state::{SmtPublicState, SmtState};
 use smt::update::{
-    apply_update_with_witness, build_update_multiproof, build_update_witness, UpdateResult,
-    UpdateWitness,
+    apply_update_in_place, apply_update_with_witness, build_update_multiproof,
+    build_update_witness, UpdateResult, UpdateWitness,
 };
 use sp1_programs_common::io::{
     Sp1AddressProof, Sp1CollisionNonMembershipProof, Sp1DefaultNonMembershipProof, Sp1Leaf,
@@ -70,6 +71,14 @@ fn sp1_context_with_setup_dir(setup_dir: &Path) -> Result<Sp1Context, String> {
     Ok(ctx)
 }
 
+/// Preloads the SMT update guest into the selected backend.
+pub fn prepare_prover() -> Result<Duration, String> {
+    let started = Instant::now();
+    let ctx = sp1_context()?;
+    ctx.generator.prepare(&ctx.pk, "smt-update")?;
+    Ok(started.elapsed())
+}
+
 pub fn ensure_sp1_setup(setup_dir: &Path) -> Result<(), String> {
     ensure_smt_setups(
         setup_dir,
@@ -85,11 +94,40 @@ pub fn prove_update(
     new_state_root: &str,
     witness: UpdateWitness,
 ) -> Result<UpdateResult, String> {
-    let mut result = apply_update_with_witness(old_state, new_state_root, &witness)?;
+    let mut next_state = old_state.clone();
+    let proof = prove_update_into(old_state, &mut next_state, new_state_root, witness)?;
+    Ok(UpdateResult { next_state, proof })
+}
 
+/// Proves an update into an already reset mutable state.
+///
+/// This avoids charging benchmark samples for a full-tree clone whose only
+/// purpose is restoring the immutable starting state between repetitions. The
+/// caller must pass a state with the same authenticated public state as
+/// `old_state`; witness construction, the actual transition and proving remain
+/// inside this function.
+pub fn prove_update_into(
+    old_state: &SmtState,
+    next_state: &mut SmtState,
+    new_state_root: &str,
+    witness: UpdateWitness,
+) -> Result<StoredSmtProof, String> {
+    if next_state.public_state() != old_state.public_state() {
+        return Err("reset SMT state does not match update old state".to_string());
+    }
     let ctx = sp1_context()?;
+    let stdin_timer = common::profiling::PhaseTimer::start("smt-update-host", "build_sp1_stdin");
     let stdin_value = build_sp1_stdin(old_state, new_state_root, &witness)?;
+    stdin_timer.finish();
+    let transition_timer =
+        common::profiling::PhaseTimer::start("smt-update-host", "apply_private_transition");
+    let mut proof = apply_update_in_place(next_state, new_state_root, &witness)?;
+    transition_timer.finish();
+
+    let prove_timer = common::profiling::PhaseTimer::start("smt-update-prover", "sp1_prove");
     let proof_bundle = run_sp1_proof(&ctx, &stdin_value)?;
+    prove_timer.finish();
+    let finalize_timer = common::profiling::PhaseTimer::start("smt-update-host", "finalize");
     let public_values = decode_public_values(&proof_bundle)?;
 
     if public_values.old_state_root != old_state.state_root {
@@ -104,20 +142,20 @@ pub fn prove_update(
     if public_values.depth != old_state.depth {
         return Err("sp1 SMT depth mismatch".to_string());
     }
-    if public_values.new_smt_root != result.next_state.smt_root() {
+    if public_values.new_smt_root != next_state.smt_root() {
         return Err("sp1 new smt root mismatch".to_string());
     }
-    if public_values.aggregate_delta != result.proof.aggregate_delta {
+    if public_values.aggregate_delta != proof.aggregate_delta {
         return Err("sp1 aggregate delta mismatch".to_string());
     }
     if public_values.old_balance_total != old_state.balance_total {
         return Err("sp1 old balance total mismatch".to_string());
     }
-    if public_values.new_balance_total != result.next_state.balance_total {
+    if public_values.new_balance_total != next_state.balance_total {
         return Err("sp1 balance total mismatch".to_string());
     }
     if public_values.old_leaf_count != old_state.leaf_count()
-        || public_values.new_leaf_count != result.next_state.leaf_count()
+        || public_values.new_leaf_count != next_state.leaf_count()
     {
         return Err("sp1 leaf count mismatch".to_string());
     }
@@ -127,8 +165,9 @@ pub fn prove_update(
         return Err("sp1 update transition commitment mismatch".to_string());
     }
 
-    make_sp1_proof_public(&mut result.proof, &proof_bundle, &public_values)?;
-    Ok(result)
+    make_sp1_proof_public(&mut proof, &proof_bundle, &public_values)?;
+    finalize_timer.finish();
+    Ok(proof)
 }
 
 pub fn build_and_prove_update(
@@ -137,8 +176,25 @@ pub fn build_and_prove_update(
     new_state_root: &str,
     balance_blind_delta: ark_bls12_381::Fr,
 ) -> Result<UpdateResult, String> {
+    let witness_timer =
+        common::profiling::PhaseTimer::start("smt-update-host", "build_update_witness");
     let witness = build_update_witness(old_state, deltas, balance_blind_delta)?;
+    witness_timer.finish();
     prove_update(old_state, new_state_root, witness)
+}
+
+pub fn build_and_prove_update_into(
+    old_state: &SmtState,
+    next_state: &mut SmtState,
+    deltas: &[Delta],
+    new_state_root: &str,
+    balance_blind_delta: ark_bls12_381::Fr,
+) -> Result<StoredSmtProof, String> {
+    let witness_timer =
+        common::profiling::PhaseTimer::start("smt-update-host", "build_update_witness");
+    let witness = build_update_witness(old_state, deltas, balance_blind_delta)?;
+    witness_timer.finish();
+    prove_update_into(old_state, next_state, new_state_root, witness)
 }
 
 pub fn execute_update(

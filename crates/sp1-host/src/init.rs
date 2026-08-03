@@ -76,17 +76,27 @@ pub fn prepare_provers() -> Result<Vec<(&'static str, Duration)>, String> {
     merkle.generator.prepare(&merkle.pk, "init-merkle")?;
     let merkle_elapsed = merkle_started.elapsed();
 
-    let ownership_started = Instant::now();
-    let ownership = sp1_ownership_context()?;
-    ownership
-        .generator
-        .prepare(&ownership.pk, "init-ownership")?;
-    let ownership_elapsed = ownership_started.elapsed();
+    let ownership_elapsed = prepare_ownership_prover()?;
 
     Ok(vec![
         ("init-merkle", merkle_elapsed),
         ("init-ownership", ownership_elapsed),
     ])
+}
+
+/// Preloads only the shared ECDSA ownership guest.
+///
+/// SMT initialization reuses this guest but must not also prepare the unrelated
+/// KZG/Merkle initialization guest. Keeping this hook separate lets benchmark
+/// runners move process startup, VK loading, and CUDA ELF setup outside sample
+/// timers without changing the proof path.
+pub fn prepare_ownership_prover() -> Result<Duration, String> {
+    let started = Instant::now();
+    let ownership = sp1_ownership_context()?;
+    ownership
+        .generator
+        .prepare(&ownership.pk, "init-ownership")?;
+    Ok(started.elapsed())
 }
 
 pub fn prove_init_ownership(

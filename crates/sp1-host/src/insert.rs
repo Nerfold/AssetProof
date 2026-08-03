@@ -1,9 +1,13 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use common::crypto::{hash_bytes, hex_decode, hex_encode};
 use common::types::StoredSmtProof;
-use smt::insert::{apply_insert_with_witness, build_insert_witness, InsertResult, InsertWitness};
+use smt::insert::{
+    apply_insert_in_place, apply_insert_with_witness, build_insert_witness, InsertResult,
+    InsertWitness,
+};
 use smt::key::key_for_address;
 use smt::proof::{CompactNonMembershipProof, SiblingRef};
 use smt::state::{SmtPublicState, SmtState};
@@ -63,15 +67,47 @@ fn sp1_insert_context_with_setup_dir(setup_dir: &Path) -> Result<Sp1InsertContex
     Ok(ctx)
 }
 
+/// Preloads the SMT insert guest into the selected backend.
+pub fn prepare_prover() -> Result<Duration, String> {
+    let started = Instant::now();
+    let ctx = sp1_insert_context()?;
+    ctx.generator.prepare(&ctx.pk, "smt-insert")?;
+    Ok(started.elapsed())
+}
+
 pub fn prove_insert(
     old_state: &SmtState,
     new_state_root: &str,
     witness: InsertWitness,
 ) -> Result<InsertResult, String> {
-    let mut result = apply_insert_with_witness(old_state, new_state_root, &witness)?;
+    let mut next_state = old_state.clone();
+    let proof = prove_insert_into(old_state, &mut next_state, new_state_root, witness)?;
+    Ok(InsertResult { next_state, proof })
+}
+
+/// Proves an insertion into an already reset mutable state without performing
+/// a full-tree clone in the measured proof path.
+pub fn prove_insert_into(
+    old_state: &SmtState,
+    next_state: &mut SmtState,
+    new_state_root: &str,
+    witness: InsertWitness,
+) -> Result<StoredSmtProof, String> {
+    if next_state.public_state() != old_state.public_state() {
+        return Err("reset SMT state does not match insert old state".to_string());
+    }
     let ctx = sp1_insert_context()?;
+    let stdin_timer = common::profiling::PhaseTimer::start("smt-insert-host", "build_sp1_stdin");
     let stdin_value = build_sp1_insert_stdin(old_state, new_state_root, &witness)?;
+    stdin_timer.finish();
+    let transition_timer =
+        common::profiling::PhaseTimer::start("smt-insert-host", "apply_private_transition");
+    let mut proof = apply_insert_in_place(next_state, new_state_root, &witness)?;
+    transition_timer.finish();
+    let prove_timer = common::profiling::PhaseTimer::start("smt-insert-prover", "sp1_prove");
     let proof_bundle = run_sp1_insert_proof(&ctx, &stdin_value)?;
+    prove_timer.finish();
+    let finalize_timer = common::profiling::PhaseTimer::start("smt-insert-host", "finalize");
     let public_values = decode_insert_public_values(&proof_bundle)?;
 
     if public_values.old_state_root != old_state.state_root {
@@ -86,20 +122,20 @@ pub fn prove_insert(
     if public_values.depth != old_state.depth {
         return Err("sp1 insert SMT depth mismatch".to_string());
     }
-    if public_values.new_smt_root != result.next_state.smt_root() {
+    if public_values.new_smt_root != next_state.smt_root() {
         return Err("sp1 insert new smt root mismatch".to_string());
     }
     if public_values.inserted_balance != witness.balance {
         return Err("sp1 insert balance mismatch".to_string());
     }
-    if public_values.new_balance_total != result.next_state.balance_total {
+    if public_values.new_balance_total != next_state.balance_total {
         return Err("sp1 insert balance total mismatch".to_string());
     }
     if public_values.old_balance_total != old_state.balance_total {
         return Err("sp1 insert old balance total mismatch".to_string());
     }
     if public_values.old_leaf_count != old_state.leaf_count()
-        || public_values.new_leaf_count != result.next_state.leaf_count()
+        || public_values.new_leaf_count != next_state.leaf_count()
     {
         return Err("sp1 insert leaf count mismatch".to_string());
     }
@@ -107,8 +143,9 @@ pub fn prove_insert(
         return Err("sp1 insert transition commitment mismatch".to_string());
     }
 
-    make_sp1_proof_public(&mut result.proof, &proof_bundle, &public_values)?;
-    Ok(result)
+    make_sp1_proof_public(&mut proof, &proof_bundle, &public_values)?;
+    finalize_timer.finish();
+    Ok(proof)
 }
 
 pub fn build_and_prove_insert(
@@ -118,8 +155,26 @@ pub fn build_and_prove_insert(
     new_state_root: &str,
     balance_blind_delta: ark_bls12_381::Fr,
 ) -> Result<InsertResult, String> {
+    let witness_timer =
+        common::profiling::PhaseTimer::start("smt-insert-host", "build_insert_witness");
     let witness = build_insert_witness(old_state, address, balance, balance_blind_delta)?;
+    witness_timer.finish();
     prove_insert(old_state, new_state_root, witness)
+}
+
+pub fn build_and_prove_insert_into(
+    old_state: &SmtState,
+    next_state: &mut SmtState,
+    address: &str,
+    balance: i128,
+    new_state_root: &str,
+    balance_blind_delta: ark_bls12_381::Fr,
+) -> Result<StoredSmtProof, String> {
+    let witness_timer =
+        common::profiling::PhaseTimer::start("smt-insert-host", "build_insert_witness");
+    let witness = build_insert_witness(old_state, address, balance, balance_blind_delta)?;
+    witness_timer.finish();
+    prove_insert_into(old_state, next_state, new_state_root, witness)
 }
 
 pub fn execute_insert(

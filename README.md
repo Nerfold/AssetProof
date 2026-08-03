@@ -299,12 +299,12 @@ signature、共享 Merkle prefix proof、delta 和 insert candidate，先准备�
 
 ```bash
 MASTER_N=1000 N_SIZES=1000 M_SIZES=100 \
-  FIXTURE_DIR=data/mock/bench/generated \
+  FIXTURE_DIR=data/mock/bench/generated-merkle-n1000-m100 \
   ./scripts/initialize_benchmark_data.sh
 
 MASTER_N=1000 N_SIZES=1000 M_SIZES=100 SMT_DEPTH=128 \
-  FIXTURE_DIR=data/mock/bench/generated \
-  SMT_OUTPUT_DIR=data/mock/bench/smt-persisted/master_n_1000/depth_128 \
+  FIXTURE_DIR=data/mock/bench/generated-merkle-n1000-m100 \
+  SMT_OUTPUT_DIR=data/mock/bench/smt-persisted-n1000-m100/master_n_1000/depth_128 \
   POA_SP1_PROOF_MODE=compressed \
   ./scripts/initialize_smt_benchmark_data.sh
 ```
@@ -322,7 +322,7 @@ guest 或持久化格式升级后，可设置 `SMT_FORCE=true` 强制覆盖生�
 例如继续测试 `n=1000,m=100`：
 
 ```bash
-RUN=data/mock/bench/smt-persisted/master_n_1000/depth_128/n_1000
+RUN=data/mock/bench/smt-persisted-n1000-m100/master_n_1000/depth_128/n_1000
 UPDATE_ROOT=$(sed -n 's/^m.100.new_state_root=//p' "$RUN/manifest.txt")
 INSERT_ROOT=$(sed -n 's/^insert_new_state_root=//p' "$RUN/manifest.txt")
 
@@ -335,6 +335,38 @@ INSERT_ROOT=$(sed -n 's/^insert_new_state_root=//p' "$RUN/manifest.txt")
 
 update 和 insert 都从同一个初始化状态分别开始，互不覆盖。新格式不再把百万个 leaf
 拼进超长文本行，因此加载时不会产生对应的大型临时字符串；旧的文本 SMT state 仍可读取。
+
+#### 标准 SMT + SP1 benchmark
+
+持久化准备完成后，使用独立的长驻 benchmark runner 测试 initialization、update 和
+insert。它与 NIZK benchmark 使用相同的 warmup/sample 统计方法，但不会把 Cargo build、
+fixture/state 文件加载、VK/PK context、CUDA worker 启动、guest ELF setup 或 proof 写盘计入
+prover time：
+
+```bash
+MASTER_N=1000 N_SIZES=1000 M_SIZES=100 SMT_DEPTH=128 \
+FIXTURE_DIR=data/mock/bench/generated-merkle-n1000-m100 \
+SMT_STATE_DIR=data/mock/bench/smt-persisted-n1000-m100/master_n_1000/depth_128 \
+SP1_PROVER=cuda POA_SP1_CUDA_DEVICE=0 POA_SP1_PROOF_MODE=compressed \
+BENCHMARK_OPERATIONS=initialization,insert,update \
+SAMPLES=3 WARMUP=1 \
+OUTPUT_DIR=artifacts/benchmarks/smt-cuda-n1000-m100 \
+./scripts/benchmark_smt_protocol.sh
+```
+
+每个 initialization sample 都会在 host 重新构造私有 Poseidon SMT，同时 `smt-init`
+guest 在 SP1 内根据全部 leaves 独立重建并公开绑定 root；两项都属于在线 prover time。
+update/insert 的 witness/multiproof 构造、host 私有状态转换、stdin 序列化与 CUDA IPC 也计入，
+但所有 sample 都从同一个不可变的 `state-0000` 独立开始，不串联状态。为重复实验而进行的
+整树 sample reset/deep clone 不属于协议在线工作，放在 prover timer 外；真正修改的路径、
+新 root 计算和全部证明工作仍在 timer 内。开启 profile 后，这项排除成本会以
+`sample_state_reset_excluded` 单独列出。
+
+输出包括 `raw.csv`、`summary.csv`、`loading.csv`、`summary.md` 和 `proof-samples/`。
+`proof_payload_bytes` 是原始二进制密码学 proof bundle；`artifact_bytes` 是当前项目落盘格式，
+避免把 hex 文本膨胀误认为密码学证明大小。设置 `POA_SP1_PROFILE=1` 时还会生成
+`profile/phase-times.csv`，其中列出 host 建树、witness、transition、stdin、SP1 prove 和
+finalize 阶段；初始化额外执行的 cycle diagnostic probe 会从 measured prover time 扣除。
 
 `scripts/benchmark_protocol.sh` 默认使用适合工作站的 SP1 分片与 trace-buffer
 上限（`SHARD_SIZE=1048576`、两个 trace slots），以控制 Groth16 峰值内存。这些值

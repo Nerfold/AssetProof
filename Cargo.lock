@@ -4329,9 +4329,10 @@ dependencies = [
 name = "smt-bench"
 version = "0.1.0"
 dependencies = [
- "ark-bls12-381",
  "common",
+ "poa-bench",
  "smt",
+ "sp1-host",
 ]
 
 [[package]]

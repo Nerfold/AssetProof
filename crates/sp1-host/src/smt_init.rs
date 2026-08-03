@@ -1,5 +1,6 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use common::crypto::{hash_bytes, hex_decode, hex_encode};
 use common::encoding::normalize_address;
@@ -46,6 +47,7 @@ pub fn prove_smt_initialization(
     witnesses: &[InitReserveWitness],
     depth: usize,
 ) -> Result<SmtInitializationResult, String> {
+    let validate_timer = common::profiling::PhaseTimer::start("smt-init-host", "validate_inputs");
     if witnesses.is_empty() {
         return Err("cannot initialize an empty SMT reserve set".to_string());
     }
@@ -73,7 +75,9 @@ pub fn prove_smt_initialization(
         }
         previous_address = Some(&witness.address);
     }
+    validate_timer.finish();
 
+    let state_timer = common::profiling::PhaseTimer::start("smt-init-host", "build_private_tree");
     let leaves = witnesses
         .iter()
         .map(|witness| {
@@ -90,14 +94,26 @@ pub fn prove_smt_initialization(
         leaves,
         SmtState::random_blind(),
     )?;
+    state_timer.finish();
 
+    let stdin_timer = common::profiling::PhaseTimer::start("smt-init-host", "build_smt_stdin");
     let init_stdin = build_smt_init_stdin(context, witnesses, &state)?;
+    stdin_timer.finish();
     let ctx = smt_init_context()?;
+    let prove_timer = common::profiling::PhaseTimer::start("smt-init-prover", "smt_sp1_prove");
     let bundle = run_smt_init_proof(&ctx, init_stdin)?;
+    prove_timer.finish();
     let public = decode_smt_init_public_values(&bundle);
+    let ownership_stdin_timer =
+        common::profiling::PhaseTimer::start("smt-init-host", "build_ownership_stdin");
     let ownership_stdin = build_ownership_stdin(context, witnesses)?;
+    ownership_stdin_timer.finish();
+    let ownership_timer =
+        common::profiling::PhaseTimer::start("smt-init-prover", "ownership_sp1_prove");
     let ownership = crate::init::prove_init_ownership(ownership_stdin)?;
+    ownership_timer.finish();
 
+    let finalize_timer = common::profiling::PhaseTimer::start("smt-init-host", "finalize");
     validate_split_public_values(context, &state.public_state(), &public, &ownership.public)?;
     let chain_bytes = bincode::serialize(&bundle)
         .map_err(|err| format!("serialize SP1 SMT initialization proof: {err}"))?;
@@ -107,6 +123,7 @@ pub fn prove_smt_initialization(
         &[&chain_bytes, &ownership_bytes],
     );
     let sp1_proof_hex = hex_encode(&chain_bytes);
+    finalize_timer.finish();
 
     Ok(SmtInitializationResult {
         proof: StoredSmtInitProof {
@@ -127,6 +144,23 @@ pub fn prove_smt_initialization(
         },
         state,
     })
+}
+
+/// Preloads both guests used by split SMT initialization.
+///
+/// Returned durations include host context/VK construction and, for CUDA, the
+/// persistent worker startup plus one-time ELF setup. Benchmark runners record
+/// these as preparation and exclude them from warmup/measured samples.
+pub fn prepare_provers() -> Result<Vec<(&'static str, Duration)>, String> {
+    let smt_started = Instant::now();
+    let smt = smt_init_context()?;
+    smt.generator.prepare(&smt.pk, "smt-init")?;
+    let smt_elapsed = smt_started.elapsed();
+    let ownership_elapsed = crate::init::prepare_ownership_prover()?;
+    Ok(vec![
+        ("smt-init", smt_elapsed),
+        ("init-ownership", ownership_elapsed),
+    ])
 }
 
 fn validate_chain_id(expected: &str, proof: &ChainBalanceProofInput) -> Result<(), String> {

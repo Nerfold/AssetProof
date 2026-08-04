@@ -25,7 +25,10 @@ use nizk_fixed_set::update::apply_update;
 use nizk_fixed_set::verifier::{
     public_state_digest, verify_init_with_policy, verify_update_debug, ChainPolicy,
 };
-use poa_bench::{ethereum_fixture, master_fixture_dir, FIXTURE_VERSION};
+use poa_bench::{
+    committed_range_proof_payload_bytes, ethereum_fixture, master_fixture_dir,
+    zkopen_proof_payload_bytes, FIXTURE_VERSION,
+};
 
 fn main() {
     if let Err(err) = run() {
@@ -1420,11 +1423,11 @@ fn encode_insert_proof_text(proof: &KzgInsertProof) -> Result<String, String> {
 }
 
 fn init_proof_payload_bytes(proof: &StoredInitProof) -> Result<usize, String> {
-    decoded_payload_bytes(&[
-        &proof.kzg_opening_proof_hex,
-        &proof.sp1_proof_hex,
-        &proof.transcript_hex,
-    ])
+    let zkopen = zkopen_proof_payload_bytes(&proof.kzg_opening_proof_hex)?;
+    let decoded = decoded_payload_bytes(&[&proof.sp1_proof_hex, &proof.transcript_hex])?;
+    decoded
+        .checked_add(zkopen)
+        .ok_or_else(|| "initialization proof payload size overflow".to_string())
 }
 
 fn insert_proof_payload_bytes(proof: &KzgInsertProof) -> Result<usize, String> {
@@ -1441,10 +1444,11 @@ fn update_proof_payload_bytes(proof: &StoredProof) -> Result<usize, String> {
         &proof.multi_zkopen_proof_hex,
         &proof.transcript_hex,
         &proof.bp_proof_hex,
-        &proof.balance_range_proof_hex,
     ])?;
+    let range = committed_range_proof_payload_bytes(&proof.balance_range_proof_hex)?;
     decoded
-        .checked_add(proof.committed_input_link_ipa_proof.len())
+        .checked_add(range)
+        .and_then(|value| value.checked_add(proof.committed_input_link_ipa_proof.len()))
         .and_then(|value| value.checked_add(proof.projection_ipa_proof.len()))
         .ok_or_else(|| "update proof payload size overflow".to_string())
 }

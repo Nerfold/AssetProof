@@ -9,11 +9,12 @@ usage() {
 Usage:
   ./poa benchmark-matrix [cpu|cuda|network]
 
-Runs the complete NIZK benchmark matrix from mock-data preparation through
-proof generation and verification:
+Runs the complete dynamic NIZK matrix and static PoA initialization baseline,
+from mock-data preparation through proof generation and verification:
   n = 2^10, 2^11, 2^12, 2^13 = 1024, 2048, 4096, 8192
   m = 2^8,  2^9,  2^10 = 256, 512, 1024
   measured samples per result row = 5; warmup = 1
+  static baseline n = 1024, 2048, 4096, 8192
 
 Examples:
   ./poa benchmark-matrix
@@ -51,6 +52,7 @@ FIXTURE_DIR="${FIXTURE_DIR:-data/mock/bench/matrix-powers-of-two}"
 SRS_DIR="${SRS_DIR:-params/srs/matrix-n8192-m1024}"
 OUTPUT_DIR="${OUTPUT_DIR:-artifacts/benchmarks/nizk-matrix-${RUN_ID}}"
 PREP_OUTPUT="$OUTPUT_DIR/preparation"
+STATIC_OUTPUT="$OUTPUT_DIR/static-baseline"
 LOG_FILE="$OUTPUT_DIR/run.log"
 
 mkdir -p "$OUTPUT_DIR"
@@ -65,12 +67,12 @@ fail_with_log() {
   exit 1
 }
 
-echo "NIZK benchmark matrix"
+echo "Dynamic NIZK + static PoA benchmark matrix"
 echo "  n: 1024, 2048, 4096, 8192"
 echo "  m: 256, 512, 1024"
 echo "  prover=$PROVER, mode=$PROOF_MODE, samples=5, warmup=1"
 
-echo "[1/2] Preparing or validating all mock fixtures and the shared SRS..."
+echo "[1/3] Preparing or validating all mock fixtures and the shared SRS..."
 if ! env \
   MASTER_N="$MASTER_N" N_SIZES="$N_SIZES" M_SIZES="$M_SIZES" \
   FIXTURE_DIR="$FIXTURE_DIR" SRS_DIR="$SRS_DIR" OUTPUT_DIR="$PREP_OUTPUT" \
@@ -78,7 +80,7 @@ if ! env \
   fail_with_log "Matrix input preparation"
 fi
 
-echo "[2/2] Preparing SP1 and running the complete benchmark matrix..."
+echo "[2/3] Running the dynamic NIZK benchmark matrix..."
 if ! env \
   MASTER_N="$MASTER_N" N_SIZES="$N_SIZES" M_SIZES="$M_SIZES" \
   FIXTURE_DIR="$FIXTURE_DIR" SRS_DIR="$SRS_DIR" OUTPUT_DIR="$OUTPUT_DIR" \
@@ -94,10 +96,31 @@ if [[ ! -s "$SUMMARY" ]]; then
   fail_with_log "Matrix summary generation"
 fi
 
+echo "[3/3] Running the static PoA initialization baseline..."
+if ! env \
+  MASTER_N="$MASTER_N" N_SIZES="$N_SIZES" \
+  FIXTURE_DIR="$FIXTURE_DIR" OUTPUT_DIR="$STATIC_OUTPUT" \
+  SP1_PROVER="$PROVER" POA_SP1_PROOF_MODE="$PROOF_MODE" \
+  SAMPLES="$SAMPLES_COUNT" WARMUP="$WARMUP_COUNT" POA_SP1_PROFILE=0 \
+  "${ROOT_DIR}/scripts/benchmark_static_baseline.sh" >>"$LOG_FILE" 2>&1; then
+  fail_with_log "Static baseline benchmark"
+fi
+
+STATIC_SUMMARY="$STATIC_OUTPUT/summary.csv"
+if [[ ! -s "$STATIC_SUMMARY" ]]; then
+  fail_with_log "Static baseline summary generation"
+fi
+
 echo
+echo "Dynamic NIZK"
 "$ROOT_DIR/scripts/print_benchmark_summary.sh" "$SUMMARY" "$SAMPLES_COUNT"
 echo
-echo "Coverage: init=4 rows, update=12 rows, insert=4 rows; each row uses 5 measured samples."
-echo "Details: $OUTPUT_DIR/summary.md"
-echo "Raw samples: $OUTPUT_DIR/raw.csv"
+echo "Static PoA baseline"
+"$ROOT_DIR/scripts/print_benchmark_summary.sh" "$STATIC_SUMMARY" "$SAMPLES_COUNT" "static-init"
+echo
+echo "Coverage: dynamic init=4, update=12, insert=4; static init=4 rows; every row uses 5 measured samples."
+echo "Dynamic details: $OUTPUT_DIR/summary.md"
+echo "Static details: $STATIC_OUTPUT/summary.md"
+echo "Dynamic raw samples: $OUTPUT_DIR/raw.csv"
+echo "Static raw samples: $STATIC_OUTPUT/raw.csv"
 echo "Full log: $LOG_FILE"

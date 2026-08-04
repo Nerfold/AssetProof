@@ -623,8 +623,10 @@ POA_TIMING=1 ./poa prove-update \
 ```
 
 该脚本从 mock fixture/SRS 准备开始，测试 `n=1024,2048,4096,8192` 和
-`m=256,512,1024`。Init 和 insert 对每个 `n` 各产生一行结果；update 对 12 个
-`(n,m)` 组合逐一测试。每行包含 1 次 warmup 和 5 次 measured samples。
+`m=256,512,1024`。动态 NIZK 的 init 和 insert 对每个 `n` 各产生一行结果，update
+对 12 个 `(n,m)` 组合逐一测试；传统静态 PoA initialization 也对四个 `n` 分别测试。
+静态和动态测试复用完全相同的 Ethereum 地址、ECDSA ownership、余额和固定深度 Merkle
+fixture。每行包含 1 次 warmup 和 5 次 measured samples。
 
 完整协议矩阵由 `scripts/benchmark_protocol.sh` 运行。其 initialization fixture 在
 SP1 外一次性生成 `10^6+1` 个确定性的有效 secp256k1 私钥、未压缩公钥、由 Keccak

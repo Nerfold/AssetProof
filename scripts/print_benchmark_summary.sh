@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ $# -ne 2 ]]; then
-  echo "usage: print_benchmark_summary.sh <summary.csv> <sample-count>" >&2
+if [[ $# -lt 2 || $# -gt 3 ]]; then
+  echo "usage: print_benchmark_summary.sh <summary.csv> <sample-count> [init-label]" >&2
   exit 2
 fi
 
 SUMMARY="$1"
 SAMPLES_COUNT="$2"
+INIT_LABEL="${3:-init}"
 if [[ ! -s "$SUMMARY" ]]; then
   echo "missing benchmark summary: $SUMMARY" >&2
   exit 1
@@ -17,7 +18,7 @@ echo "Average result ($SAMPLES_COUNT measured sample(s) per row)"
 printf '%-8s %10s %10s %16s %16s %14s\n' "operation" "n" "m" "prove avg" "verify avg" "proof size"
 printf '%-8s %10s %10s %16s %16s %14s\n' "--------" "----------" "----------" "----------------" "----------------" "--------------"
 for operation in initialization update insert; do
-  awk -F, -v wanted="$operation" '
+  awk -F, -v wanted="$operation" -v init_label="$INIT_LABEL" '
     function time_fmt(ms) {
       if (ms >= 60000) return sprintf("%.2f min", ms / 60000)
       if (ms >= 1000) return sprintf("%.3f s", ms / 1000)
@@ -40,7 +41,7 @@ for operation in initialization update insert; do
       next
     }
     $operation_col == wanted {
-      label = ($operation_col == "initialization" ? "init" : $operation_col)
+      label = ($operation_col == "initialization" ? init_label : $operation_col)
       m = ($operation_col == "update" ? $m_col : "-")
       printf "%-8s %10d %10s %16s %16s %14s\n", label, $n_col, m, time_fmt($prover_col), time_fmt($verifier_col), bytes_fmt($proof_col)
     }

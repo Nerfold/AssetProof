@@ -3856,8 +3856,6 @@ dependencies = [
 [[package]]
 name = "sp1-cuda"
 version = "6.2.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "121d30e6b08ab7b7458ea346bbe265cde3be82301a246cd4d84204f85a475ef4"
 dependencies = [
  "bincode",
  "bytes",

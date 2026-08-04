@@ -51,7 +51,7 @@ case "$PROVER" in
     CUDA_WORKER="${POA_SP1_CUDA_WORKER:-$ROOT_DIR/tools/sp1-cuda-worker/target/release/sp1-cuda-worker}"
     if [[ -x "$CUDA_WORKER" ]]; then
       CUDA_WORKER_VERSION="$("$CUDA_WORKER" protocol-version 2>/dev/null || true)"
-      [[ "$CUDA_WORKER_VERSION" == "poa-sp1-cuda-worker-v3-direct" ]] \
+      [[ "$CUDA_WORKER_VERSION" == "poa-sp1-cuda-worker-v4-server-wait" ]] \
         && ok "SP1 CUDA worker: $CUDA_WORKER ($CUDA_WORKER_VERSION)" \
         || bad "SP1 CUDA worker is stale or incompatible (run ./poa sp1-cuda-build)"
     else

@@ -16,7 +16,7 @@ const REQUEST_MAGIC: &[u8; 8] = b"POACUD02";
 const RESPONSE_MAGIC: &[u8; 8] = b"POACUR02";
 const PREPARE: u8 = 0;
 const PROVE: u8 = 1;
-const WORKER_VERSION: &str = "poa-sp1-cuda-worker-v3-direct";
+const WORKER_VERSION: &str = "poa-sp1-cuda-worker-v4-server-wait";
 
 fn main() {
     if let Err(err) = run() {

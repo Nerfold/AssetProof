@@ -626,8 +626,8 @@ POA_TIMING=1 ./poa prove-update \
 `m=256,512,1024`。动态 NIZK 的 init 和 insert 对每个 `n` 各产生一行结果，update
 对 12 个 `(n,m)` 组合逐一测试；传统静态 PoA initialization 也对四个 `n` 分别测试。
 静态和动态测试复用完全相同的 Ethereum 地址、ECDSA ownership、余额和固定深度 Merkle
-fixture。每行包含 1 次 warmup 和 3 次 measured samples。CUDA 模式会提前启动一个本地
-`sp1-gpu-server`，等其 Unix socket 就绪后再进入证明阶段，并在整套测试退出时自动回收。
+fixture。每行包含 1 次 warmup 和 3 次 measured samples。CUDA 模式由 SDK 启动并持有
+唯一的 `sp1-gpu-server`，等待其 Unix socket 就绪后再进入证明阶段，退出时自动回收。
 
 完整协议矩阵由 `scripts/benchmark_protocol.sh` 运行。其 initialization fixture 在
 SP1 外一次性生成 `10^6+1` 个确定性的有效 secp256k1 私钥、未压缩公钥、由 Keccak
@@ -833,7 +833,9 @@ OUTPUT_DIR=artifacts/benchmarks/nizk-cuda-n1000-m100 \
 第一次 CUDA setup 会由 SP1 6.2.4 自动下载匹配的
 `~/.sp1/bin/sp1-gpu-server`。benchmark 使用一个长驻 worker，每个选中的 guest ELF
 只 setup 一次；启动/setup 时间写入 `loading.csv` 和报告的 preparation 表，不进入
-sample 的 prover time。worker 返回的 proof 在独立 verifier 阶段使用本地可信 VK 验证。
+sample 的 prover time。项目固定使用带最小启动补丁的 `sp1-cuda` 6.2.4：SDK 仍只启动
+并持有一个 GPU server，但会等待同一个子进程最长 60 秒创建 socket；worker 退出时沿用
+SDK 的 `kill_on_drop` 自动回收。worker 返回的 proof 在独立 verifier 阶段使用本地可信 VK 验证。
 建议先使用 `compressed`：它加速 SP1 core proving 且不需要 Docker；
 `groth16/plonk` 的最终 wrapper 仍使用原有本地 Docker/artifact 路径。本集成没有启用
 额外的 Icicle `groth16-cuda` wrapper。完整环境要求、设备选择和诊断方式见

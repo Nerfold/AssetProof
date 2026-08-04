@@ -70,7 +70,7 @@ case "$SP1_PROVER" in
       exit 1
     fi
     CUDA_WORKER_VERSION="$("$CUDA_WORKER" protocol-version 2>/dev/null || true)"
-    if [[ "$CUDA_WORKER_VERSION" != "poa-sp1-cuda-worker-v3-direct" ]]; then
+    if [[ "$CUDA_WORKER_VERSION" != "poa-sp1-cuda-worker-v4-server-wait" ]]; then
       echo "SP1 CUDA worker is stale or incompatible: ${CUDA_WORKER_VERSION:-unknown}" >&2
       echo "Run ./poa sp1-cuda-build again." >&2
       exit 1

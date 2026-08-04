@@ -3,7 +3,6 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
-source "$ROOT_DIR/scripts/sp1-cuda-server-lifecycle.sh"
 
 usage() {
   cat <<'EOF'
@@ -79,11 +78,6 @@ if ! env \
   FIXTURE_DIR="$FIXTURE_DIR" SRS_DIR="$SRS_DIR" OUTPUT_DIR="$PREP_OUTPUT" \
   "${ROOT_DIR}/scripts/initialize_benchmark_data.sh" >>"$LOG_FILE" 2>&1; then
   fail_with_log "Matrix input preparation"
-fi
-
-if [[ "$PROVER" == "cuda" ]]; then
-  trap poa_stop_managed_sp1_gpu_server EXIT
-  poa_prestart_sp1_gpu_server "$OUTPUT_DIR"
 fi
 
 echo "[2/3] Running the dynamic NIZK benchmark matrix..."

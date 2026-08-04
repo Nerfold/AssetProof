@@ -622,8 +622,8 @@ POA_TIMING=1 ./poa prove-update \
 ./poa benchmark-matrix cuda     # CUDA
 ```
 
-该脚本从 mock fixture/SRS 准备开始，测试 `n=1024,4096,16384` 和
-`m=256,512,1024`。Init 和 insert 对每个 `n` 各产生一行结果；update 对 9 个
+该脚本从 mock fixture/SRS 准备开始，测试 `n=1024,2048,4096,8192` 和
+`m=256,512,1024`。Init 和 insert 对每个 `n` 各产生一行结果；update 对 12 个
 `(n,m)` 组合逐一测试。每行包含 1 次 warmup 和 5 次 measured samples。
 
 完整协议矩阵由 `scripts/benchmark_protocol.sh` 运行。其 initialization fixture 在

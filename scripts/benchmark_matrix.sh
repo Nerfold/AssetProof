@@ -11,7 +11,7 @@ Usage:
 
 Runs the complete NIZK benchmark matrix from mock-data preparation through
 proof generation and verification:
-  n = 2^10, 2^12, 2^14 = 1024, 4096, 16384
+  n = 2^10, 2^11, 2^12, 2^13 = 1024, 2048, 4096, 8192
   m = 2^8,  2^9,  2^10 = 256, 512, 1024
   measured samples per result row = 5; warmup = 1
 
@@ -41,14 +41,14 @@ case "$PROOF_MODE" in
   *) echo "POA_SP1_PROOF_MODE must be compressed, groth16, or plonk." >&2; exit 2 ;;
 esac
 
-MASTER_N=16384
-N_SIZES="1024,4096,16384"
+MASTER_N=8192
+N_SIZES="1024,2048,4096,8192"
 M_SIZES="256,512,1024"
 SAMPLES_COUNT=5
 WARMUP_COUNT=1
 RUN_ID="${RUN_ID:-$(date +%Y%m%d-%H%M%S)}"
 FIXTURE_DIR="${FIXTURE_DIR:-data/mock/bench/matrix-powers-of-two}"
-SRS_DIR="${SRS_DIR:-params/srs/matrix-n16384-m1024}"
+SRS_DIR="${SRS_DIR:-params/srs/matrix-n8192-m1024}"
 OUTPUT_DIR="${OUTPUT_DIR:-artifacts/benchmarks/nizk-matrix-${RUN_ID}}"
 PREP_OUTPUT="$OUTPUT_DIR/preparation"
 LOG_FILE="$OUTPUT_DIR/run.log"
@@ -66,7 +66,7 @@ fail_with_log() {
 }
 
 echo "NIZK benchmark matrix"
-echo "  n: 1024, 4096, 16384"
+echo "  n: 1024, 2048, 4096, 8192"
 echo "  m: 256, 512, 1024"
 echo "  prover=$PROVER, mode=$PROOF_MODE, samples=5, warmup=1"
 
@@ -97,7 +97,7 @@ fi
 echo
 "$ROOT_DIR/scripts/print_benchmark_summary.sh" "$SUMMARY" "$SAMPLES_COUNT"
 echo
-echo "Coverage: init=3 rows, update=9 rows, insert=3 rows; each row uses 5 measured samples."
+echo "Coverage: init=4 rows, update=12 rows, insert=4 rows; each row uses 5 measured samples."
 echo "Details: $OUTPUT_DIR/summary.md"
 echo "Raw samples: $OUTPUT_DIR/raw.csv"
 echo "Full log: $LOG_FILE"

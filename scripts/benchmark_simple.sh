@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
+source "$ROOT_DIR/scripts/sp1-cuda-server-lifecycle.sh"
 
 usage() {
   cat <<'EOF'
@@ -12,7 +13,7 @@ Usage:
 Examples:
   ./poa benchmark 1000 100
   ./poa benchmark 1000 100 cuda
-  ./poa benchmark 1000 100 cuda 5
+  ./poa benchmark 1000 100 cuda 3
 
 Defaults: cpu prover, compressed proof mode, 3 measured samples, 1 warmup.
 The command prepares/reuses mock data and SRS, then benchmarks init, update,
@@ -106,6 +107,11 @@ if [[ "${FORCE_PREPARE:-0}" == "1" ]] || ! fixtures_ready; then
   fi
 else
   echo "[1/2] Reusing prepared mock data and SRS."
+fi
+
+if [[ "$PROVER" == "cuda" ]]; then
+  trap poa_stop_managed_sp1_gpu_server EXIT
+  poa_prestart_sp1_gpu_server "$OUTPUT_DIR"
 fi
 
 echo "[2/2] Preparing SP1 and running init, update, and insert..."

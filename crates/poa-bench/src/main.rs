@@ -26,7 +26,7 @@ use nizk_fixed_set::verifier::{
     public_state_digest, verify_init_with_policy, verify_update_debug, ChainPolicy,
 };
 use poa_bench::{
-    committed_range_proof_payload_bytes, ethereum_fixture, master_fixture_dir,
+    bounded_i128_range_proof_payload_bytes, ethereum_fixture, master_fixture_dir,
     zkopen_proof_payload_bytes, FIXTURE_VERSION,
 };
 
@@ -1445,7 +1445,7 @@ fn update_proof_payload_bytes(proof: &StoredProof) -> Result<usize, String> {
         &proof.transcript_hex,
         &proof.bp_proof_hex,
     ])?;
-    let range = committed_range_proof_payload_bytes(&proof.balance_range_proof_hex)?;
+    let range = bounded_i128_range_proof_payload_bytes(&proof.balance_range_proof_hex)?;
     decoded
         .checked_add(range)
         .and_then(|value| value.checked_add(proof.committed_input_link_ipa_proof.len()))

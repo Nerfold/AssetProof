@@ -43,6 +43,24 @@ pub fn committed_range_proof_payload_bytes(encoded: &str) -> Result<usize, Strin
     checked_payload_add(total, hex_decode(parts[4])?.len())
 }
 
+/// Returns the decoded payload size of the bounded signed-i128 threshold proof
+/// used by update. The outer envelope contains lower- and upper-bound
+/// `crange:v1` proofs separated by a semicolon.
+pub fn bounded_i128_range_proof_payload_bytes(encoded: &str) -> Result<usize, String> {
+    let body = encoded
+        .strip_prefix("bounded-i128:v1:")
+        .ok_or_else(|| "invalid bounded i128 range proof encoding".to_string())?;
+    let (lower, upper) = body
+        .split_once(';')
+        .ok_or_else(|| "bounded i128 range proof is missing a component".to_string())?;
+    if upper.contains(';') {
+        return Err("bounded i128 range proof has trailing components".to_string());
+    }
+    let lower = committed_range_proof_payload_bytes(lower)?;
+    let upper = committed_range_proof_payload_bytes(upper)?;
+    checked_payload_add(lower, upper)
+}
+
 fn decoded_hex_payload_bytes(parts: &[&str]) -> Result<usize, String> {
     parts.iter().try_fold(0usize, |total, value| {
         checked_payload_add(total, hex_decode(value)?.len())
@@ -56,7 +74,10 @@ fn checked_payload_add(lhs: usize, rhs: usize) -> Result<usize, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{committed_range_proof_payload_bytes, zkopen_proof_payload_bytes};
+    use super::{
+        bounded_i128_range_proof_payload_bytes, committed_range_proof_payload_bytes,
+        zkopen_proof_payload_bytes,
+    };
 
     #[test]
     fn counts_tagged_zkopen_payload() {
@@ -80,5 +101,26 @@ mod tests {
     fn counts_committed_range_payload_without_limbs() {
         let encoded = "crange:v1:128::030405";
         assert_eq!(committed_range_proof_payload_bytes(encoded).unwrap(), 3);
+    }
+
+    #[test]
+    fn counts_bounded_i128_range_payload() {
+        let encoded = concat!(
+            "bounded-i128:v1:",
+            "crange:v1:128:00,0102:030405;",
+            "crange:v1:128:06,0708:090a"
+        );
+        assert_eq!(bounded_i128_range_proof_payload_bytes(encoded).unwrap(), 11);
+    }
+
+    #[test]
+    fn rejects_bounded_i128_range_with_trailing_component() {
+        let encoded = concat!(
+            "bounded-i128:v1:",
+            "crange:v1:128:00:01;",
+            "crange:v1:128:02:03;",
+            "crange:v1:128:04:05"
+        );
+        assert!(bounded_i128_range_proof_payload_bytes(encoded).is_err());
     }
 }

@@ -607,7 +607,7 @@ POA_TIMING=1 ./poa prove-update \
 
 ```bash
 ./poa benchmark 1000 100 cuda
-./poa benchmark 1000 100 cuda 5
+./poa benchmark 1000 100 cuda 3
 ```
 
 该入口自动生成或复用对应的 mock 数据和 SRS，然后依次测试 init、update、insert。
@@ -626,7 +626,8 @@ POA_TIMING=1 ./poa prove-update \
 `m=256,512,1024`。动态 NIZK 的 init 和 insert 对每个 `n` 各产生一行结果，update
 对 12 个 `(n,m)` 组合逐一测试；传统静态 PoA initialization 也对四个 `n` 分别测试。
 静态和动态测试复用完全相同的 Ethereum 地址、ECDSA ownership、余额和固定深度 Merkle
-fixture。每行包含 1 次 warmup 和 5 次 measured samples。
+fixture。每行包含 1 次 warmup 和 3 次 measured samples。CUDA 模式会提前启动一个本地
+`sp1-gpu-server`，等其 Unix socket 就绪后再进入证明阶段，并在整套测试退出时自动回收。
 
 完整协议矩阵由 `scripts/benchmark_protocol.sh` 运行。其 initialization fixture 在
 SP1 外一次性生成 `10^6+1` 个确定性的有效 secp256k1 私钥、未压缩公钥、由 Keccak

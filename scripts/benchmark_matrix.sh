@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
+source "$ROOT_DIR/scripts/sp1-cuda-server-lifecycle.sh"
 
 usage() {
   cat <<'EOF'
@@ -13,7 +14,7 @@ Runs the complete dynamic NIZK matrix and static PoA initialization baseline,
 from mock-data preparation through proof generation and verification:
   n = 2^10, 2^11, 2^12, 2^13 = 1024, 2048, 4096, 8192
   m = 2^8,  2^9,  2^10 = 256, 512, 1024
-  measured samples per result row = 5; warmup = 1
+  measured samples per result row = 3; warmup = 1
   static baseline n = 1024, 2048, 4096, 8192
 
 Examples:
@@ -45,7 +46,7 @@ esac
 MASTER_N=8192
 N_SIZES="1024,2048,4096,8192"
 M_SIZES="256,512,1024"
-SAMPLES_COUNT=5
+SAMPLES_COUNT=3
 WARMUP_COUNT=1
 RUN_ID="${RUN_ID:-$(date +%Y%m%d-%H%M%S)}"
 FIXTURE_DIR="${FIXTURE_DIR:-data/mock/bench/matrix-powers-of-two}"
@@ -70,7 +71,7 @@ fail_with_log() {
 echo "Dynamic NIZK + static PoA benchmark matrix"
 echo "  n: 1024, 2048, 4096, 8192"
 echo "  m: 256, 512, 1024"
-echo "  prover=$PROVER, mode=$PROOF_MODE, samples=5, warmup=1"
+echo "  prover=$PROVER, mode=$PROOF_MODE, samples=3, warmup=1"
 
 echo "[1/3] Preparing or validating all mock fixtures and the shared SRS..."
 if ! env \
@@ -78,6 +79,11 @@ if ! env \
   FIXTURE_DIR="$FIXTURE_DIR" SRS_DIR="$SRS_DIR" OUTPUT_DIR="$PREP_OUTPUT" \
   "${ROOT_DIR}/scripts/initialize_benchmark_data.sh" >>"$LOG_FILE" 2>&1; then
   fail_with_log "Matrix input preparation"
+fi
+
+if [[ "$PROVER" == "cuda" ]]; then
+  trap poa_stop_managed_sp1_gpu_server EXIT
+  poa_prestart_sp1_gpu_server "$OUTPUT_DIR"
 fi
 
 echo "[2/3] Running the dynamic NIZK benchmark matrix..."
@@ -118,7 +124,7 @@ echo
 echo "Static PoA baseline"
 "$ROOT_DIR/scripts/print_benchmark_summary.sh" "$STATIC_SUMMARY" "$SAMPLES_COUNT" "static-init"
 echo
-echo "Coverage: dynamic init=4, update=12, insert=4; static init=4 rows; every row uses 5 measured samples."
+echo "Coverage: dynamic init=4, update=12, insert=4; static init=4 rows; every row uses 3 measured samples."
 echo "Dynamic details: $OUTPUT_DIR/summary.md"
 echo "Static details: $STATIC_OUTPUT/summary.md"
 echo "Dynamic raw samples: $OUTPUT_DIR/raw.csv"

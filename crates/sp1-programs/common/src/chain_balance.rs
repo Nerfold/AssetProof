@@ -1,3 +1,5 @@
+use alloc::vec::Vec;
+#[cfg(target_os = "zkvm")]
 use alloc::vec;
 
 use crate::ethereum_binary_merkle::{leaf_hash, node_hash};
@@ -8,6 +10,9 @@ use crate::io::{
 
 pub trait ChainReserveEntry {
     fn address(&self) -> &str;
+    fn address_bytes(&self) -> [u8; 20] {
+        decode_address(self.address())
+    }
     fn balance(&self) -> i128;
     fn proof(&self) -> &Sp1ChainBalanceProof;
 }
@@ -19,6 +24,14 @@ impl ChainReserveEntry for Sp1InitReserveEntry {
 
     fn balance(&self) -> i128 {
         self.balance
+    }
+
+    fn address_bytes(&self) -> [u8; 20] {
+        let mut address = [0u8; 20];
+        for (index, byte) in address.iter_mut().enumerate() {
+            *byte = self.encoded_address_le[19 - index];
+        }
+        address
     }
 
     fn proof(&self) -> &Sp1ChainBalanceProof {
@@ -49,6 +62,10 @@ impl ChainReserveEntry for Sp1StaticInitReserveEntry {
         self.balance
     }
 
+    fn address_bytes(&self) -> [u8; 20] {
+        self.address_bytes
+    }
+
     fn proof(&self) -> &Sp1ChainBalanceProof {
         &self.chain_balance_proof
     }
@@ -75,7 +92,7 @@ pub fn verify_chain_balance<R: ChainReserveEntry>(
             leaf_index,
             siblings,
         } => {
-            let address = decode_address(reserve.address());
+            let address = reserve.address_bytes();
             let mut current = leaf_hash(&address, reserve.balance());
             let mut index = *leaf_index;
             for (level, sibling) in siblings.iter().enumerate() {
@@ -93,7 +110,7 @@ pub fn verify_chain_balance<R: ChainReserveEntry>(
             );
         }
         Sp1ChainBalanceProof::EthereumAccountProof { nodes } => {
-            let address = decode_address(reserve.address());
+            let address = reserve.address_bytes();
             crate::ethereum_mpt::verify_account_balance(
                 expected_root,
                 &address,
@@ -117,22 +134,51 @@ pub fn verify_merkle_prefix<R: ChainReserveEntry>(
     reserves: &[R],
     proof: &Sp1BinaryMerklePrefixProof,
 ) {
-    assert!(
-        proof.depth < usize::BITS as usize,
-        "Merkle depth is too large"
-    );
-    let capacity = 1usize << proof.depth;
-    assert!(
-        reserves.len() <= capacity,
-        "reserve prefix exceeds Merkle capacity"
-    );
-    assert!(
-        proof.suffix_subtrees.len() <= proof.depth + 1,
-        "Merkle prefix contains too many suffix subtrees"
-    );
-    let mut stack = vec![None; proof.depth + 1];
-    let mut cursor = 0usize;
-    for (expected_index, reserve) in reserves.iter().enumerate() {
+    let mut verifier = BinaryMerklePrefixVerifier::new(expected_root, proof);
+    for reserve in reserves {
+        verifier.update(reserve);
+    }
+    verifier.finalize();
+}
+
+/// Streaming verifier for a canonical dense-prefix Merkle witness.
+///
+/// Initialization guests can feed leaves during their existing account scan,
+/// avoiding a second O(n) traversal whose only purpose is rebuilding the root.
+pub struct BinaryMerklePrefixVerifier<'a> {
+    expected_root: Hash,
+    proof: &'a Sp1BinaryMerklePrefixProof,
+    stack: Vec<Option<Hash>>,
+    cursor: u64,
+    capacity: u64,
+    next_index: u64,
+}
+
+impl<'a> BinaryMerklePrefixVerifier<'a> {
+    pub fn new(expected_root: &Hash, proof: &'a Sp1BinaryMerklePrefixProof) -> Self {
+        assert!(
+            proof.depth < u64::BITS as usize,
+            "Merkle depth is too large"
+        );
+        assert!(
+            proof.suffix_subtrees.len() <= proof.depth + 1,
+            "Merkle prefix contains too many suffix subtrees"
+        );
+        Self {
+            expected_root: *expected_root,
+            proof,
+            stack: vec![None; proof.depth + 1],
+            cursor: 0,
+            capacity: 1u64 << proof.depth,
+            next_index: 0,
+        }
+    }
+
+    pub fn update<R: ChainReserveEntry>(&mut self, reserve: &R) {
+        assert!(
+            self.next_index < self.capacity,
+            "reserve prefix exceeds Merkle capacity"
+        );
         let Sp1ChainBalanceProof::BinaryMerkleV1 {
             leaf_index,
             siblings,
@@ -141,7 +187,7 @@ pub fn verify_merkle_prefix<R: ChainReserveEntry>(
             panic!("shared Merkle prefix proof requires binary Merkle members")
         };
         assert_eq!(
-            *leaf_index as usize, expected_index,
+            *leaf_index, self.next_index,
             "non-canonical Merkle prefix index"
         );
         assert!(
@@ -149,33 +195,37 @@ pub fn verify_merkle_prefix<R: ChainReserveEntry>(
             "prefix member repeated an individual Merkle path"
         );
         append_subtree(
-            &mut stack,
-            &mut cursor,
+            &mut self.stack,
+            &mut self.cursor,
             0,
-            leaf_hash(&decode_address(reserve.address()), reserve.balance()),
+            leaf_hash(&reserve.address_bytes(), reserve.balance()),
+        );
+        self.next_index += 1;
+    }
+
+    pub fn finalize(mut self) {
+        for subtree in &self.proof.suffix_subtrees {
+            append_subtree(
+                &mut self.stack,
+                &mut self.cursor,
+                subtree.level as usize,
+                subtree.root,
+            );
+        }
+        assert_eq!(
+            self.cursor, self.capacity,
+            "Merkle prefix proof did not cover the tree"
+        );
+        assert!(
+            self.stack[..self.proof.depth].iter().all(Option::is_none),
+            "Merkle prefix proof left an incomplete frontier"
+        );
+        assert_eq!(
+            self.stack[self.proof.depth].expect("missing reconstructed Merkle root"),
+            self.expected_root,
+            "native chain Merkle prefix proof mismatch"
         );
     }
-    for subtree in &proof.suffix_subtrees {
-        append_subtree(
-            &mut stack,
-            &mut cursor,
-            subtree.level as usize,
-            subtree.root,
-        );
-    }
-    assert_eq!(
-        cursor, capacity,
-        "Merkle prefix proof did not cover the tree"
-    );
-    assert!(
-        stack[..proof.depth].iter().all(Option::is_none),
-        "Merkle prefix proof left an incomplete frontier"
-    );
-    assert_eq!(
-        stack[proof.depth].expect("missing reconstructed Merkle root"),
-        *expected_root,
-        "native chain Merkle prefix proof mismatch"
-    );
 }
 
 pub fn decode_hash(value: &str) -> Hash {
@@ -202,7 +252,7 @@ pub fn decode_address(address: &str) -> [u8; 20] {
 
 fn append_subtree(
     stack: &mut [Option<Hash>],
-    cursor: &mut usize,
+    cursor: &mut u64,
     mut level: usize,
     mut current: Hash,
 ) {
@@ -210,7 +260,7 @@ fn append_subtree(
         level < stack.len(),
         "Merkle subtree level exceeds tree depth"
     );
-    let width = 1usize << level;
+    let width = 1u64 << level;
     assert_eq!(*cursor % width, 0, "unaligned Merkle suffix subtree");
     *cursor = cursor.checked_add(width).expect("Merkle cursor overflow");
     loop {

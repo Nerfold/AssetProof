@@ -4608,7 +4608,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "sp1-init-merkle"
+name = "sp1-init"
 version = "0.1.0"
 dependencies = [
  "num",

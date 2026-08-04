@@ -32,8 +32,8 @@ format cannot drift away from the main process. Override the executable only whe
 export POA_SP1_NETWORK_WORKER=/absolute/path/to/sp1-network-worker
 ```
 
-Supported guests include `init-merkle`, `init-ownership`, `kzg-insert`, `smt-init`, `smt-update`,
-and `smt-insert`. Network mode does not require the local gnark Docker image, including for
+Supported guests include the unified NIZK `init`, `kzg-insert`, and the SMT-specific
+`init-ownership`, `smt-init`, `smt-update`, and `smt-insert`. Network mode does not require the local gnark Docker image, including for
 Groth16 and Plonk proof modes.
 
 Initialization ownership remains one protocol statement and one final proof. It is deliberately

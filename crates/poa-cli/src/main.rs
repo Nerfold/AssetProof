@@ -2017,6 +2017,8 @@ fn print_usage() {
     println!("  ./poa setup [max-degree]");
     println!("  ./poa import-srs <source.srs.bin> <ceremony-id> [destination.srs.bin]");
     println!("  ./poa mock-data [accounts reserves blocks txs-per-block seed]");
+    println!("  ./poa benchmark <n> <m> [cpu|cuda|network] [samples]");
+    println!("  ./poa benchmark-matrix [cpu|cuda|network]");
     println!("  ./poa eth-sync <transition.json> [deltas.csv sync-output.json]");
     println!("  ./poa prove-init <state-root> [reserves.csv]");
     println!("  ./poa prove-update <state.txt> <deltas.csv> <new-state-root>");

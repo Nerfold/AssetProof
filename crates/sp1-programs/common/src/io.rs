@@ -35,24 +35,53 @@ where
     hasher.finalize()
 }
 
-/// Binds the two split initialization guests to the exact same ordered
-/// `(address, balance)` witness vector.
+/// Binds the unified initialization witness to its exact ordered
+/// `(address, balance)` vector.
 pub fn init_reserve_commitment<'a, I>(reserve_count: usize, reserves: I) -> Hash
 where
     I: IntoIterator<Item = (&'a str, i128)>,
 {
-    let mut hasher = Keccak256Stream::new();
-    hasher.update(b"dynamic-poa-init-reserves-keccak-v2");
-    hasher.update(&(reserve_count as u64).to_le_bytes());
-    let mut encoded_count = 0usize;
+    let mut commitment = InitReserveCommitment::new(reserve_count);
     for (address, balance) in reserves {
-        hasher.update(&(address.len() as u64).to_le_bytes());
-        hasher.update(address.as_bytes());
-        hasher.update(&balance.to_le_bytes());
-        encoded_count += 1;
+        commitment.update(address, balance);
     }
-    assert_eq!(encoded_count, reserve_count, "reserve count mismatch");
-    hasher.finalize()
+    commitment.finalize()
+}
+
+/// Streaming form used by initialization guests to bind each reserve during
+/// the validation scan instead of traversing the full witness vector again.
+pub struct InitReserveCommitment {
+    hasher: Keccak256Stream,
+    expected_count: usize,
+    encoded_count: usize,
+}
+
+impl InitReserveCommitment {
+    pub fn new(reserve_count: usize) -> Self {
+        let mut hasher = Keccak256Stream::new();
+        hasher.update(b"dynamic-poa-init-reserves-keccak-v2");
+        hasher.update(&(reserve_count as u64).to_le_bytes());
+        Self {
+            hasher,
+            expected_count: reserve_count,
+            encoded_count: 0,
+        }
+    }
+
+    pub fn update(&mut self, address: &str, balance: i128) {
+        self.hasher.update(&(address.len() as u64).to_le_bytes());
+        self.hasher.update(address.as_bytes());
+        self.hasher.update(&balance.to_le_bytes());
+        self.encoded_count += 1;
+    }
+
+    pub fn finalize(self) -> Hash {
+        assert_eq!(
+            self.encoded_count, self.expected_count,
+            "reserve count mismatch"
+        );
+        self.hasher.finalize()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -177,6 +206,7 @@ pub struct Sp1InitReserveEntry {
     pub address: String,
     pub encoded_address_le: [u8; 32],
     pub balance: i128,
+    pub ownership: Sp1OwnershipWitness,
     pub chain_balance_proof: Sp1ChainBalanceProof,
 }
 
@@ -230,6 +260,7 @@ pub struct Sp1InitOwnershipPublicValues {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Sp1StaticInitReserveEntry {
     pub address: String,
+    pub address_bytes: [u8; 20],
     pub balance: i128,
     pub ownership: Sp1OwnershipWitness,
     pub chain_balance_proof: Sp1ChainBalanceProof,
@@ -388,4 +419,23 @@ pub struct Sp1KzgInsertPublicValues {
     pub uses_mock_inputs: bool,
     pub c_u: Sp1G1Affine,
     pub c_balance: Sp1G1Affine,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{init_reserve_commitment, InitReserveCommitment};
+
+    #[test]
+    fn streaming_reserve_commitment_matches_iterator_helper() {
+        let reserves = [
+            ("0x0000000000000000000000000000000000000001", 17i128),
+            ("0x0000000000000000000000000000000000000002", 29i128),
+        ];
+        let expected = init_reserve_commitment(reserves.len(), reserves.iter().copied());
+        let mut streaming = InitReserveCommitment::new(reserves.len());
+        for (address, balance) in reserves {
+            streaming.update(address, balance);
+        }
+        assert_eq!(streaming.finalize(), expected);
+    }
 }

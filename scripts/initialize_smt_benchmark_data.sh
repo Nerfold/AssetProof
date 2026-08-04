@@ -39,7 +39,7 @@ if [[ ! -f "$FIXTURE_DIR/preparation-manifest.txt" ]]; then
   echo "Run scripts/initialize_benchmark_data.sh first with matching MASTER_N/N_SIZES/M_SIZES." >&2
   exit 1
 fi
-if ! grep -Fxq "fixture_version=ethereum-keccak-merkle-prefix-v2-ecdsa" "$FIXTURE_DIR/preparation-manifest.txt" \
+if ! grep -Fxq "fixture_version=ethereum-keccak-fixed32-merkle-prefix-v3-ecdsa" "$FIXTURE_DIR/preparation-manifest.txt" \
   || ! grep -Fxq "master.max_n=$MASTER_N" "$FIXTURE_DIR/preparation-manifest.txt"; then
   echo "Prepared NIZK fixture version or MASTER_N does not match." >&2
   echo "Regenerate it with scripts/initialize_benchmark_data.sh." >&2
@@ -107,7 +107,7 @@ esac
 
 echo
 echo "Building the persisted SMT fixture tool..."
-cargo build --release -p poa-bench --bin poa-smt-fixture
+cargo build --release -p poa-bench --features smt-fixture --bin poa-smt-fixture
 
 echo
 exec ./target/release/poa-smt-fixture \

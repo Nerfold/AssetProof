@@ -13,8 +13,8 @@ use sp1_programs_common::bls12_381_scalar::{
 };
 use sp1_programs_common::chain_balance::{decode_hash, verify_chain_balance, verify_merkle_prefix};
 use sp1_programs_common::io::{
-    init_reserve_commitment, init_shape_commitment, Sp1ChainBalanceProof, Sp1G1Affine,
-    Sp1InitPublicValues, Sp1InitStdin,
+    init_shape_commitment, InitReserveCommitment, Sp1ChainBalanceProof, Sp1G1Affine,
+    Sp1InitPublicValues, Sp1InitStdin, Sp1OwnershipWitness,
 };
 use sp1_zkvm::entrypoint;
 
@@ -65,12 +65,22 @@ fn verify_init(input: Sp1InitStdin, profile: bool) -> Sp1InitPublicValues {
     let mut previous_x = None;
     let mut uses_mock_inputs = false;
     let expected_root = decode_hash(&input.state_root);
+    cycle_start!(profile, "ownership_context_hash");
+    let ownership_context = (input.chain_id != "mock-chain").then(|| {
+        sp1_programs_common::ethereum_eoa::ownership_context_hash(
+            sp1_programs_common::ethereum_eoa::OwnershipOperation::Initialization,
+            &input.chain_id,
+            &input.state_root,
+        )
+    });
+    cycle_end!(profile, "ownership_context_hash");
     if let Some(prefix_proof) = input.merkle_prefix_proof.as_ref() {
         cycle_start!(profile, "merkle_prefix_verify");
         verify_merkle_prefix(&expected_root, &input.reserves, prefix_proof);
         cycle_end!(profile, "merkle_prefix_verify");
     }
-    cycle_start!(profile, "reserve_scan_and_product");
+    let mut reserve_commitment = InitReserveCommitment::new(input.reserves.len());
+    cycle_start!(profile, "reserve_scan_product_ownership_and_commitment");
     for reserve in &input.reserves {
         assert!(reserve.balance >= 0, "negative reserve balance");
         uses_mock_inputs |= matches!(
@@ -86,6 +96,7 @@ fn verify_init(input: Sp1InitStdin, profile: bool) -> Sp1InitPublicValues {
             encode_address(&reserve.address),
             "reserve address encoding mismatch"
         );
+        let address_bytes = address_bytes_from_encoded(&reserve.encoded_address_le);
         if let Some(previous) = previous_x {
             assert!(
                 cmp_limbs(&previous, &x) < 0,
@@ -93,12 +104,41 @@ fn verify_init(input: Sp1InitStdin, profile: bool) -> Sp1InitPublicValues {
             );
         }
         previous_x = Some(x);
+        match &reserve.ownership {
+            Sp1OwnershipWitness::MockPrivateKey { private_key } => {
+                uses_mock_inputs = true;
+                assert_eq!(
+                    input.chain_id, "mock-chain",
+                    "mock ownership used outside mock chain"
+                );
+                assert_eq!(
+                    private_key,
+                    &alloc::format!("mock-private-key:{}", reserve.address),
+                    "mock private key does not bind reserve address"
+                );
+            }
+            Sp1OwnershipWitness::EthereumEoaSignature { r, s, recovery_id } => {
+                sp1_programs_common::ethereum_eoa::verify_ownership_signature_with_context_and_address(
+                    ownership_context
+                        .as_ref()
+                        .expect("missing Ethereum ownership context"),
+                    &address_bytes,
+                    r,
+                    s,
+                    *recovery_id,
+                );
+            }
+            Sp1OwnershipWitness::UnsupportedExternal { .. } => {
+                panic!("unsupported external ownership verifier")
+            }
+        }
         product = mul_mod(product, sub_mod(zeta, x));
         balance_total = balance_total
             .checked_add(reserve.balance)
             .expect("balance total overflow");
+        reserve_commitment.update(&reserve.address, reserve.balance);
     }
-    cycle_end!(profile, "reserve_scan_and_product");
+    cycle_end!(profile, "reserve_scan_product_ownership_and_commitment");
     assert_eq!(balance_total, input.balance_total, "balance total mismatch");
     assert_eq!(
         scalar_to_le_bytes(product),
@@ -114,13 +154,7 @@ fn verify_init(input: Sp1InitStdin, profile: bool) -> Sp1InitPublicValues {
     cycle_end!(profile, "private_commitment_openings");
 
     cycle_start!(profile, "public_values_build");
-    let reserve_commitment = init_reserve_commitment(
-        input.reserves.len(),
-        input
-            .reserves
-            .iter()
-            .map(|reserve| (reserve.address.as_str(), reserve.balance)),
-    );
+    let reserve_commitment = reserve_commitment.finalize();
     let public = Sp1InitPublicValues {
         chain_id: input.chain_id,
         state_root: input.state_root,
@@ -315,6 +349,14 @@ fn encode_address(address: &str) -> [u8; 32] {
     }
     out[..20].reverse();
     out
+}
+
+fn address_bytes_from_encoded(encoded_address_le: &[u8; 32]) -> [u8; 20] {
+    let mut address = [0u8; 20];
+    for (index, byte) in address.iter_mut().enumerate() {
+        *byte = encoded_address_le[19 - index];
+    }
+    address
 }
 
 fn hex_nibble(value: u8) -> u8 {

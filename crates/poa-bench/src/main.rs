@@ -152,21 +152,16 @@ fn run() -> Result<(), String> {
         println!("\n== preparing SP1 prover contexts outside sample timers ==");
     }
     if includes_operation(&config, BenchmarkOperation::Initialization) {
-        for (guest, elapsed) in sp1_host::init::prepare_provers()? {
-            println!("   {guest}: prepare={}", human_duration(elapsed));
-            loads.push(LoadRecord {
-                n: 0,
-                m: 0,
-                phase: match guest {
-                    "init-merkle" => "sp1_prover_prepare_init_merkle",
-                    "init-ownership" => "sp1_prover_prepare_init_ownership",
-                    _ => "sp1_prover_prepare_initialization_guest",
-                },
-                elapsed,
-                bytes: 0,
-                reused: false,
-            });
-        }
+        let elapsed = sp1_host::init::prepare_prover()?;
+        println!("   init: prepare={}", human_duration(elapsed));
+        loads.push(LoadRecord {
+            n: 0,
+            m: 0,
+            phase: "sp1_prover_prepare_init",
+            elapsed,
+            bytes: 0,
+            reused: false,
+        });
     }
     if includes_operation(&config, BenchmarkOperation::Insert) {
         let elapsed = sp1_host::kzg_insert::prepare_prover()?;
@@ -761,7 +756,7 @@ fn benchmark_init(
             verifier,
             proof_payload_bytes,
             artifact_bytes,
-            proof_encoding: "init-key-value-text-v3",
+            proof_encoding: "init-key-value-text-v5-unified-sp1",
         });
         prover_samples.push(prover);
         verifier_samples.push(verifier);
@@ -781,7 +776,7 @@ fn benchmark_init(
         &verifier_samples,
         &proof_payload_sizes,
         &artifact_sizes,
-        "init-key-value-text-v4-split-sp1",
+        "init-key-value-text-v5-unified-sp1",
     );
     Ok((result.state, summary))
 }
@@ -1316,8 +1311,8 @@ fn write_summary_markdown(
     body.push_str("- SP1 verification-key artifacts are prepared by the wrapper script. Runtime prover/VK contexts for every selected guest are preloaded before warmups and measured samples. With CUDA, this also starts one persistent worker and setups each guest ELF exactly once. These wall-clock preparation costs are reported in the preparation table and excluded from prover samples.\n");
     body.push_str("- CUDA prover samples are end-to-end host wall times after preload, so they include the local Unix-socket request/response and its transport encoding; this is intentionally retained as observable proving latency.\n");
     body.push_str("- KZG ceremony and power-sequence validation belong to setup/import. Runtime loading authenticates the fixed SRS artifact; proof verification does not scan SRS powers.\n");
-    body.push_str("- All n sizes use prefixes of one persisted max-n Ethereum account store and one fixed-height Keccak-Merkle tree under a shared root; the tree is not rebuilt per n.\n");
-    body.push_str("- Initialization uses valid secp256k1 EOA witnesses and one compact shared-prefix Merkle proof. Ownership and Merkle/polynomial checks run in separate SP1 guests and are joined by a common ordered reserve commitment.\n");
+    body.push_str("- All n sizes use prefixes of one persisted max-n Ethereum account store and one fixed-depth-32 Keccak-Merkle tree under a shared root; the tree is not rebuilt per n or allocated densely to its 2^32 capacity.\n");
+    body.push_str("- Initialization uses valid secp256k1 EOA witnesses and one compact shared-prefix Merkle proof. Ownership, Merkle, polynomial-identity and private commitment-opening checks run in one unified SP1 guest and produce one SP1 proof.\n");
     body.push_str("- Initialization verification uses a development policy because the benchmark SRS is deterministic.\n");
     body.push_str("- Insert authenticates an additional EOA against the same binary Merkle root with a self-contained path.\n");
     body.push_str("- Update verification uses the debug verifier and excludes canonical Sync/finality verification.\n");
@@ -1428,7 +1423,6 @@ fn init_proof_payload_bytes(proof: &StoredInitProof) -> Result<usize, String> {
     decoded_payload_bytes(&[
         &proof.kzg_opening_proof_hex,
         &proof.sp1_proof_hex,
-        &proof.ownership_sp1_proof_hex,
         &proof.transcript_hex,
     ])
 }

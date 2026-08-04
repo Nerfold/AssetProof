@@ -14,14 +14,17 @@ use k256::elliptic_curve::sec1::ToEncodedPoint;
 use k256::SecretKey;
 use rayon::prelude::*;
 use sha3::{Digest, Keccak256};
-use sp1_programs_common::ethereum_binary_merkle::{empty_leaf_hash, leaf_hash, node_hash};
+use sp1_programs_common::ethereum_binary_merkle::{
+    default_subtree_hashes, empty_leaf_hash, leaf_hash, node_hash,
+};
 use sp1_programs_common::ethereum_eoa::{
     ownership_context_hash, ownership_digest_from_context, OwnershipOperation,
 };
 
 pub const CHAIN_ID: &str = "0x1";
-const VERSION_NAME: &str = "ethereum-keccak-merkle-prefix-v2-ecdsa";
-const VERSION: u32 = 2;
+const VERSION_NAME: &str = "ethereum-keccak-fixed32-merkle-prefix-v3-ecdsa";
+const VERSION: u32 = 3;
+const MERKLE_DEPTH: usize = 32;
 const ACCOUNT_MAGIC: &[u8; 8] = b"DPMERK02";
 const PROOF_MAGIC: &[u8; 8] = b"DPPREF02";
 const ACCOUNT_HEADER_BYTES: u64 = 8 + 4 + 8 + 4 + 32;
@@ -83,6 +86,7 @@ impl From<AccountRecord> for LoadedAccount {
 
 struct BinaryMerkleTree {
     layers: Vec<Vec<Hash>>,
+    default_roots: Vec<Hash>,
 }
 
 impl BinaryMerkleTree {
@@ -90,6 +94,14 @@ impl BinaryMerkleTree {
         if accounts.is_empty() {
             return Err("Merkle tree requires at least one account".to_string());
         }
+        if accounts.len() as u64 > (1u64 << MERKLE_DEPTH) {
+            return Err(format!(
+                "Merkle account count exceeds fixed depth {MERKLE_DEPTH}"
+            ));
+        }
+        // Only materialize the smallest dense prefix containing the actual
+        // accounts. The remaining capacity up to 2^32 is represented by one
+        // canonical default subtree at each upper level.
         let capacity = accounts.len().next_power_of_two();
         let mut leaves = Vec::with_capacity(capacity);
         leaves.par_extend(
@@ -100,7 +112,7 @@ impl BinaryMerkleTree {
         leaves.par_extend(
             (accounts.len()..capacity)
                 .into_par_iter()
-                .map(empty_leaf_hash),
+                .map(|_| empty_leaf_hash()),
         );
         let mut layers = vec![leaves];
         let mut level = 0usize;
@@ -113,15 +125,26 @@ impl BinaryMerkleTree {
             layers.push(next);
             level += 1;
         }
-        Ok(Self { layers })
+        Ok(Self {
+            layers,
+            default_roots: default_subtree_hashes(MERKLE_DEPTH),
+        })
     }
 
     fn depth(&self) -> usize {
+        MERKLE_DEPTH
+    }
+
+    fn materialized_depth(&self) -> usize {
         self.layers.len() - 1
     }
 
     fn root(&self) -> Hash {
-        self.layers[self.depth()][0]
+        let mut current = self.layers[self.materialized_depth()][0];
+        for level in self.materialized_depth()..self.depth() {
+            current = node_hash(level, &current, &self.default_roots[level]);
+        }
+        current
     }
 
     fn proof(&self, leaf_index: usize) -> Result<Vec<Hash>, String> {
@@ -130,26 +153,34 @@ impl BinaryMerkleTree {
         }
         let mut index = leaf_index;
         let mut siblings = Vec::with_capacity(self.depth());
-        for level in 0..self.depth() {
+        for level in 0..self.materialized_depth() {
             siblings.push(self.layers[level][index ^ 1]);
             index >>= 1;
+        }
+        for level in self.materialized_depth()..self.depth() {
+            siblings.push(self.default_roots[level]);
         }
         Ok(siblings)
     }
 
     fn suffix_subtrees(&self, mut start: usize) -> Result<Vec<(u32, Hash)>, String> {
-        let capacity = self.layers[0].len();
-        if start > capacity {
+        let materialized_capacity = self.layers[0].len();
+        if start > materialized_capacity {
             return Err("Merkle prefix exceeds tree capacity".to_string());
         }
         let mut out = Vec::with_capacity(self.depth());
-        while start < capacity {
-            let remaining = capacity - start;
+        while start < materialized_capacity {
+            let remaining = materialized_capacity - start;
             let alignment_level = start.trailing_zeros() as usize;
             let remaining_level = (usize::BITS - 1 - remaining.leading_zeros()) as usize;
-            let level = alignment_level.min(remaining_level).min(self.depth());
+            let level = alignment_level
+                .min(remaining_level)
+                .min(self.materialized_depth());
             out.push((level as u32, self.layers[level][start >> level]));
             start += 1usize << level;
+        }
+        for level in self.materialized_depth()..self.depth() {
+            out.push((level as u32, self.default_roots[level]));
         }
         Ok(out)
     }
@@ -157,7 +188,7 @@ impl BinaryMerkleTree {
     fn set_account_balance(&mut self, index: usize, address: &[u8; 20], balance: i128) {
         self.layers[0][index] = leaf_hash(address, balance);
         let mut node_index = index;
-        for level in 0..self.depth() {
+        for level in 0..self.materialized_depth() {
             let parent = node_index >> 1;
             let left = self.layers[level][parent * 2];
             let right = self.layers[level][parent * 2 + 1];
@@ -361,12 +392,16 @@ pub fn load_reserve_entries(
         .map_err(io_error(&path, "read magic"))?;
     let version = read_u32(&mut reader, &path)?;
     let max_n = read_u64(&mut reader, &path)? as usize;
-    let _depth = read_u32(&mut reader, &path)?;
+    let depth = read_u32(&mut reader, &path)? as usize;
     let mut root = [0u8; 32];
     reader
         .read_exact(&mut root)
         .map_err(io_error(&path, "read root"))?;
-    if &magic != ACCOUNT_MAGIC || version != VERSION || max_n != expected_max_n {
+    if &magic != ACCOUNT_MAGIC
+        || version != VERSION
+        || max_n != expected_max_n
+        || depth != MERKLE_DEPTH
+    {
         return Err("unsupported master Merkle account store".to_string());
     }
 
@@ -521,9 +556,9 @@ fn read_master_account_prefix(
     }
     let max_n = read_u64(&mut reader, &path)? as usize;
     let depth = read_u32(&mut reader, &path)? as usize;
-    if max_n != expected_max_n {
+    if max_n != expected_max_n || depth != MERKLE_DEPTH {
         return Err(format!(
-            "master reserve count {max_n}, expected {expected_max_n}"
+            "master fixture has max_n={max_n}, depth={depth}; expected max_n={expected_max_n}, depth={MERKLE_DEPTH}"
         ));
     }
     let mut root = [0u8; 32];
@@ -869,12 +904,12 @@ fn verify_prefix_proof(
         depth,
         suffix_subtrees,
     } = proof;
-    if *depth >= usize::BITS as usize {
+    if *depth >= u64::BITS as usize {
         return Err("Merkle prefix depth is too large".to_string());
     }
-    let capacity = 1usize << depth;
+    let capacity = 1u64 << depth;
     let mut stack = vec![None; depth + 1];
-    let mut cursor = 0usize;
+    let mut cursor = 0u64;
     for (expected_index, witness) in witnesses.iter().enumerate() {
         let ChainBalanceProofInput::BinaryMerkleV1 {
             leaf_index,
@@ -884,7 +919,7 @@ fn verify_prefix_proof(
         else {
             return Err("Merkle prefix contains a non-binary member".to_string());
         };
-        if *leaf_index as usize != expected_index || !siblings.is_empty() {
+        if *leaf_index != expected_index as u64 || !siblings.is_empty() {
             return Err("Merkle prefix member repeated or reordered a path".to_string());
         }
         let address = decode_address(&witness.address)?;
@@ -909,14 +944,14 @@ fn verify_prefix_proof(
 
 fn append_subtree(
     stack: &mut [Option<Hash>],
-    cursor: &mut usize,
+    cursor: &mut u64,
     mut level: usize,
     mut current: Hash,
 ) -> Result<(), String> {
     if level >= stack.len() {
         return Err("Merkle suffix level exceeds depth".to_string());
     }
-    let width = 1usize << level;
+    let width = 1u64 << level;
     if *cursor % width != 0 {
         return Err("unaligned Merkle suffix subtree".to_string());
     }
@@ -1254,9 +1289,9 @@ mod tests {
             &witness.chain_balance_proof,
             ChainBalanceProofInput::BinaryMerkleV1 { siblings, .. } if siblings.is_empty()
         )));
-        assert!(fs::metadata(init_proof_path(&dir, 8)).unwrap().len() < 1024);
+        assert!(fs::metadata(init_proof_path(&dir, 8)).unwrap().len() < 2048);
         assert_eq!(fixture.insert.leaf_index, 8);
-        assert_eq!(fixture.insert.siblings.len(), 4);
+        assert_eq!(fixture.insert.siblings.len(), MERKLE_DEPTH);
         let (insert_root, insert) = load_insert_fixture(&dir, 8, FixtureValidation::Full).unwrap();
         assert_eq!(insert_root, fixture.state_root);
         assert_eq!(insert.address, fixture.insert.address);

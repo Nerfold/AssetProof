@@ -60,7 +60,15 @@ pub fn ownership_context_hash(
 }
 
 pub fn ownership_digest_from_context(context_hash: &[u8; 32], address: &str) -> [u8; 32] {
-    let statement_hash = ownership_statement_hash_from_context(context_hash, address);
+    let address = decode_fixed_hex::<20>(address, "Ethereum address");
+    ownership_digest_from_context_and_address(context_hash, &address)
+}
+
+pub fn ownership_digest_from_context_and_address(
+    context_hash: &[u8; 32],
+    address: &[u8; 20],
+) -> [u8; 32] {
+    let statement_hash = ownership_statement_hash_from_context_and_address(context_hash, address);
 
     let mut personal_sign_input = [0u8; PERSONAL_SIGN_32_PREFIX.len() + 32];
     personal_sign_input[..PERSONAL_SIGN_32_PREFIX.len()].copy_from_slice(PERSONAL_SIGN_32_PREFIX);
@@ -70,12 +78,18 @@ pub fn ownership_digest_from_context(context_hash: &[u8; 32], address: &str) -> 
 
 pub fn ownership_statement_hash_from_context(context_hash: &[u8; 32], address: &str) -> [u8; 32] {
     let address = decode_fixed_hex::<20>(address, "Ethereum address");
+    ownership_statement_hash_from_context_and_address(context_hash, &address)
+}
 
+pub fn ownership_statement_hash_from_context_and_address(
+    context_hash: &[u8; 32],
+    address: &[u8; 20],
+) -> [u8; 32] {
     // Hash a fixed-width statement so every account needs only two Keccak
     // permutations after the shared context has been constructed.
     let mut statement = [0u8; 64];
     statement[..32].copy_from_slice(context_hash);
-    statement[44..].copy_from_slice(&address);
+    statement[44..].copy_from_slice(address);
     keccak256(&statement)
 }
 
@@ -105,6 +119,23 @@ pub fn verify_ownership_signature_with_context(
     s: &[u8; 32],
     recovery_id: u8,
 ) {
+    let address_bytes = decode_fixed_hex::<20>(address, "Ethereum address");
+    verify_ownership_signature_with_context_and_address(
+        context_hash,
+        &address_bytes,
+        r,
+        s,
+        recovery_id,
+    );
+}
+
+pub fn verify_ownership_signature_with_context_and_address(
+    context_hash: &[u8; 32],
+    address: &[u8; 20],
+    r: &[u8; 32],
+    s: &[u8; 32],
+    recovery_id: u8,
+) {
     assert!(
         recovery_id <= 1,
         "Ethereum recovery id must be y parity 0 or 1"
@@ -115,7 +146,7 @@ pub fn verify_ownership_signature_with_context(
         "non-canonical high-s Ethereum signature"
     );
     let recovery_id = RecoveryId::from_byte(recovery_id).expect("invalid ECDSA recovery id");
-    let digest = ownership_digest_from_context(context_hash, address);
+    let digest = ownership_digest_from_context_and_address(context_hash, address);
     let verifying_key = VerifyingKey::recover_from_prehash(&digest, &signature, recovery_id)
         .expect("ECDSA public-key recovery failed");
     let public_key = verifying_key.to_encoded_point(false);
@@ -127,10 +158,9 @@ pub fn verify_ownership_signature_with_context(
     );
 
     let public_key_hash = keccak256(&encoded[1..]);
-    let expected = decode_fixed_hex::<20>(address, "Ethereum address");
     assert_eq!(
         &public_key_hash[12..],
-        expected.as_slice(),
+        address.as_slice(),
         "ECDSA signature does not own address"
     );
 }
@@ -296,8 +326,9 @@ fn hex_nibble(value: u8) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::{
-        keccak256, ownership_digest, verify_ownership_signature, Keccak256Stream,
-        OwnershipOperation,
+        decode_fixed_hex, keccak256, ownership_context_hash, ownership_digest,
+        ownership_digest_from_context_and_address, verify_ownership_signature,
+        verify_ownership_signature_with_context_and_address, Keccak256Stream, OwnershipOperation,
     };
     use k256::ecdsa::SigningKey;
 
@@ -322,6 +353,12 @@ mod tests {
         private_key[31] = 1;
         let signing_key = SigningKey::from_slice(&private_key).unwrap();
         let digest = ownership_digest(OwnershipOperation::Initialization, "1", STATE_ROOT, ADDRESS);
+        let context = ownership_context_hash(OwnershipOperation::Initialization, "1", STATE_ROOT);
+        let address = decode_fixed_hex::<20>(ADDRESS, "address");
+        assert_eq!(
+            digest,
+            ownership_digest_from_context_and_address(&context, &address)
+        );
         let (signature, recovery_id) = signing_key.sign_prehash_recoverable(&digest).unwrap();
         let bytes = signature.to_bytes();
         let r: [u8; 32] = bytes[..32].try_into().unwrap();
@@ -332,6 +369,13 @@ mod tests {
             "1",
             STATE_ROOT,
             ADDRESS,
+            &r,
+            &s,
+            recovery_id.to_byte(),
+        );
+        verify_ownership_signature_with_context_and_address(
+            &context,
+            &address,
             &r,
             &s,
             recovery_id.to_byte(),

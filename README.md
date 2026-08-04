@@ -394,7 +394,7 @@ finalize 阶段；初始化额外执行的 cycle diagnostic probe 会从 measure
 本次 CRS 升级与旧的 `hash_to_scalar * G` 基点不兼容。旧 state 中的 balance
 commitment、旧 initialization/update/insert proof 都必须从 initialization 开始重新生成；
 不能在旧 state 上继续 update。Merkle 分支的初始化 scheme 为
-`kzg-nizk-init-v8-zkopen-keccak-merkle-prefix-split`，insert scheme 为
+`kzg-nizk-init-v9-zkopen-keccak-merkle-unified`，insert scheme 为
 `kzg-strong-zkopen-insert-v1-sp1-committed-input`。修改过 SP1 guest 后也必须重新运行 `./poa sp1-setup`；
 loader 会比较 artifact 中记录的 ELF digest，旧 artifact 会 fail-closed 并提示重新 setup。
 本轮只修改代码、未重新生成 SP1 artifact，因此首次运行前必须执行一次该命令。
@@ -594,17 +594,49 @@ POA_TIMING=1 ./poa prove-update \
 `mock-bench` 的第三个参数是显式报告路径。benchmark 应始终通过 `./poa` 的 release
 模式运行，否则 debug 编译会严重扭曲密码学运算耗时。
 
+### 推荐：一条命令测试完整 NIZK
+
+日常测试推荐使用一条简化命令：
+
+```bash
+./poa benchmark 1000 100
+```
+
+这里两个数字分别是 `n` 和 `m`，默认使用 CPU、`compressed` 模式、1 次 warmup 和
+3 次正式采样。使用 CUDA 或修改采样数时：
+
+```bash
+./poa benchmark 1000 100 cuda
+./poa benchmark 1000 100 cuda 5
+```
+
+该入口自动生成或复用对应的 mock 数据和 SRS，然后依次测试 init、update、insert。
+终端只显示简短进度，以及三项操作的平均证明时间、平均验证时间和 proof size；完整日志、
+逐样本 CSV 和详细报告仍保存在输出目录。需要 Groth16、Plonk、多组 `n/m`、单独 operation
+或阶段 profile 时，再使用下面的高级脚本和环境变量。
+
+固定的 powers-of-two 实验矩阵可以一键运行：
+
+```bash
+./poa benchmark-matrix          # CPU
+./poa benchmark-matrix cuda     # CUDA
+```
+
+该脚本从 mock fixture/SRS 准备开始，测试 `n=1024,4096,16384` 和
+`m=256,512,1024`。Init 和 insert 对每个 `n` 各产生一行结果；update 对 9 个
+`(n,m)` 组合逐一测试。每行包含 1 次 warmup 和 5 次 measured samples。
+
 完整协议矩阵由 `scripts/benchmark_protocol.sh` 运行。其 initialization fixture 在
 SP1 外一次性生成 `10^6+1` 个确定性的有效 secp256k1 私钥、未压缩公钥、由 Keccak
 派生的 Ethereum 地址、ECDSA ownership signatures、随机化余额，以及一棵覆盖全部
 账户的固定高度二叉 Merkle tree。各规模使用同一 canonical account store 的前 `n` 个账户；
 最后一个账户只存在于同一个 Ethereum state 中，供所有 insert benchmark 使用。SP1
-内使用 patched `k256`/secp256k1 预编译恢复签名公钥、用 Keccak permutation syscall
-派生并核对地址；另一个 guest 使用同一 Keccak syscall 验证域分离的 leaf/node hash，不再使用
+内的统一 initialization guest 使用 patched `k256`/secp256k1 预编译恢复签名公钥、
+用 Keccak permutation syscall 派生并核对地址，同时验证域分离的 leaf/node hash、
+多项式随机点恒等式和私有 commitment opening，不再使用
 `mock-private-key:<address>` / `mock-balance-proof:<address>` 标签。fixture 生成、磁盘
-加载不计入 prover/verifier time。Initialization 的 ownership guest 与 Merkle/polynomial
-guest 分别产生 SP1 proof；两者公开相同的 chain/session、reserve count 和有序
-`(address,balance)` commitment，宿主和 verifier 只在这些字段完全相同时合并接受。
+加载不计入 prover/verifier time。Ownership 与 Merkle/polynomial 现在只生成一份 SP1
+proof，避免两次 stdin、两次递归压缩和两份 reserve commitment。
 
 Initialization 不再为每个账户保存一条固定深度路径。不同 `n` 复用同一棵主树、同一个
 state root 和相同高度，只持久化一个由后缀子树 frontier 组成的 shared-prefix proof；
@@ -639,12 +671,17 @@ MPT/Verkle 共识状态树；它用于隔离协议主体与 SP1 哈希路径性�
 因此后续只测部分规模时可以继续读取同一份百万账户数据，例如
 `MASTER_N=1000000 N_SIZES=10000,100000 ./scripts/benchmark_protocol.sh`。
 
+Mock chain 使用固定深度 32 的 Keccak 二叉 Merkle Tree。实现只物化覆盖
+`MASTER_N+1` 个真实账户的最小前缀，其余 `2^32` 容量由逐层预计算的 canonical
+empty-subtree roots 表示，因此不会分配完整的 `2^32` 叶子。单账户 proof 固定包含
+32 个 sibling；初始化的 shared-prefix proof 同样重建完整深度 32 的 state root。
+
 文件默认持久化在：
 
 ```text
 data/mock/bench/generated/
   preparation-manifest.txt
-  master_n_1000000/ethereum-keccak-merkle-prefix-v2-ecdsa/
+  master_n_1000000/ethereum-keccak-fixed32-merkle-prefix-v3-ecdsa/
     accounts.bin
     master-manifest.txt
     insert-merkle-proof.bin
@@ -671,7 +708,7 @@ BENCHMARK_OPERATIONS=update SAMPLES=3 WARMUP=1 \
   ./scripts/benchmark_protocol.sh
 ```
 
-update-only 模式会跳过 `poa sp1-setup`；initialization-only 只准备两个 initialization
+update-only 模式会跳过 `poa sp1-setup`；initialization-only 只准备统一 initialization
 guest，insert-only 只准备 insert guest。初始化后状态的加载和一致性校验记录在
 `loading.csv`，不计入 update prover/verifier time；MultiZKOpen、BP/IPA、range proof 和
 update verifier 仍完整运行。
@@ -722,7 +759,8 @@ OUTPUT_DIR=artifacts/benchmarks/static-cuda-n1000 \
 proof 计入 prover time。结果格式与 NIZK/SMT benchmark 对齐，包括 `raw.csv`、
 `summary.csv`、`summary.md`、`loading.csv` 和 `proof-samples/`。设置
 `POA_SP1_PROFILE=1` 后，`guest-metrics.csv` 会分别给出
-`merkle_prefix_verify`、`input_validation_and_ownership`、`reserve_commitment` 等 cycles。
+`ownership_context_hash`、`input_validation_merkle_ownership_and_commitment` 等 cycles。Merkle
+prefix 重建和 reserve commitment 已并入账户主扫描，不再额外遍历完整账户向量。
 
 ### SP1 Network
 
@@ -801,7 +839,7 @@ sample 的 prover time。worker 返回的 proof 在独立 verifier 阶段使用�
 ### SP1 阶段分析
 
 要分析 initialization 和 insert 的 guest 规模及每阶段耗时，使用独立的 profile 入口。
-它会为 `init-ownership`、`init-merkle` 和 `kzg-insert` 各额外执行一次 guest，采集
+它会为统一的 `init` 和 `kzg-insert` 各额外执行一次 guest，采集
 instructions、SP1 gas、内存地址数、precompile syscall 次数和 guest 内部阶段 cycles，
 随后照常生成真实 proof 并记录 host/SP1 wall time。额外 execution probe 会单独报告，
 并从普通 benchmark 的 prover time 中扣除：

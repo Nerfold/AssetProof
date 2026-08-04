@@ -2,9 +2,11 @@
 
 extern crate alloc;
 
-use sp1_programs_common::chain_balance::{decode_hash, verify_chain_balance, verify_merkle_prefix};
+use sp1_programs_common::chain_balance::{
+    decode_hash, verify_chain_balance, BinaryMerklePrefixVerifier,
+};
 use sp1_programs_common::io::{
-    init_reserve_commitment, Sp1ChainBalanceProof, Sp1OwnershipWitness, Sp1StaticInitPublicValues,
+    InitReserveCommitment, Sp1ChainBalanceProof, Sp1OwnershipWitness, Sp1StaticInitPublicValues,
     Sp1StaticInitStdin,
 };
 use sp1_zkvm::entrypoint;
@@ -46,12 +48,6 @@ fn verify_static_initialization(
     assert!(!input.reserves.is_empty(), "empty reserve set");
     let expected_root = decode_hash(&input.state_root);
 
-    if let Some(prefix_proof) = input.merkle_prefix_proof.as_ref() {
-        cycle_start!(profile, "merkle_prefix_verify");
-        verify_merkle_prefix(&expected_root, &input.reserves, prefix_proof);
-        cycle_end!(profile, "merkle_prefix_verify");
-    }
-
     cycle_start!(profile, "ownership_context_hash");
     let ownership_context = (input.chain_id != "mock-chain").then(|| {
         sp1_programs_common::ethereum_eoa::ownership_context_hash(
@@ -65,13 +61,14 @@ fn verify_static_initialization(
     let mut balance_total = 0i128;
     let mut previous_address: Option<&str> = None;
     let mut uses_mock_inputs = false;
-    cycle_start!(profile, "input_validation_and_ownership");
+    let mut reserve_commitment = InitReserveCommitment::new(input.reserves.len());
+    let mut prefix_verifier = input
+        .merkle_prefix_proof
+        .as_ref()
+        .map(|proof| BinaryMerklePrefixVerifier::new(&expected_root, proof));
+    cycle_start!(profile, "input_validation_merkle_ownership_and_commitment");
     for reserve in &input.reserves {
         assert!(reserve.balance >= 0, "negative reserve balance");
-        assert!(
-            is_canonical_address(&reserve.address),
-            "non-canonical Ethereum address"
-        );
         if let Some(previous) = previous_address {
             assert!(
                 previous < reserve.address.as_str(),
@@ -79,8 +76,15 @@ fn verify_static_initialization(
             );
         }
         previous_address = Some(&reserve.address);
+        assert_eq!(
+            reserve.address_bytes,
+            decode_canonical_address(&reserve.address),
+            "reserve address bytes mismatch"
+        );
 
-        if input.merkle_prefix_proof.is_none() {
+        if let Some(verifier) = prefix_verifier.as_mut() {
+            verifier.update(reserve);
+        } else {
             verify_chain_balance(&input.chain_id, &expected_root, reserve);
         }
         uses_mock_inputs |= matches!(
@@ -102,11 +106,11 @@ fn verify_static_initialization(
                 );
             }
             Sp1OwnershipWitness::EthereumEoaSignature { r, s, recovery_id } => {
-                sp1_programs_common::ethereum_eoa::verify_ownership_signature_with_context(
+                sp1_programs_common::ethereum_eoa::verify_ownership_signature_with_context_and_address(
                     ownership_context
                         .as_ref()
                         .expect("missing Ethereum ownership context"),
-                    &reserve.address,
+                    &reserve.address_bytes,
                     r,
                     s,
                     *recovery_id,
@@ -120,18 +124,13 @@ fn verify_static_initialization(
         balance_total = balance_total
             .checked_add(reserve.balance)
             .expect("balance total overflow");
+        reserve_commitment.update(&reserve.address, reserve.balance);
     }
-    cycle_end!(profile, "input_validation_and_ownership");
-
-    cycle_start!(profile, "reserve_commitment");
-    let reserve_commitment = init_reserve_commitment(
-        input.reserves.len(),
-        input
-            .reserves
-            .iter()
-            .map(|reserve| (reserve.address.as_str(), reserve.balance)),
-    );
-    cycle_end!(profile, "reserve_commitment");
+    if let Some(verifier) = prefix_verifier {
+        verifier.finalize();
+    }
+    let reserve_commitment = reserve_commitment.finalize();
+    cycle_end!(profile, "input_validation_merkle_ownership_and_commitment");
 
     Sp1StaticInitPublicValues {
         chain_id: input.chain_id,
@@ -144,12 +143,23 @@ fn verify_static_initialization(
     }
 }
 
-fn is_canonical_address(address: &str) -> bool {
-    let Some(raw) = address.strip_prefix("0x") else {
-        return false;
-    };
-    raw.len() == 40
-        && raw
-            .bytes()
-            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+fn decode_canonical_address(address: &str) -> [u8; 20] {
+    let raw = address
+        .strip_prefix("0x")
+        .expect("canonical address must start with 0x");
+    assert_eq!(raw.len(), 40, "canonical address must contain 20 bytes");
+    let mut out = [0u8; 20];
+    for (index, byte) in out.iter_mut().enumerate() {
+        *byte = (hex_nibble(raw.as_bytes()[index * 2]) << 4)
+            | hex_nibble(raw.as_bytes()[index * 2 + 1]);
+    }
+    out
+}
+
+fn hex_nibble(value: u8) -> u8 {
+    match value {
+        b'0'..=b'9' => value - b'0',
+        b'a'..=b'f' => value - b'a' + 10,
+        _ => panic!("invalid canonical address hex"),
+    }
 }

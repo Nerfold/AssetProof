@@ -18,6 +18,14 @@ case "${1:-}" in
         shift
         exec "$ROOT_DIR/scripts/profile_sp1_phases.sh" "$@"
         ;;
+    benchmark|bench)
+        shift
+        exec "$ROOT_DIR/scripts/benchmark_simple.sh" "$@"
+        ;;
+    benchmark-matrix|bench-matrix)
+        shift
+        exec "$ROOT_DIR/scripts/benchmark_matrix.sh" "$@"
+        ;;
     sp1-setup)
         shift
         exec cargo run --quiet --release -p sp1-host --bin poa-protocol-sp1-setup -- "$@"

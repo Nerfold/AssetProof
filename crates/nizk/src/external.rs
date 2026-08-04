@@ -240,9 +240,9 @@ impl ExternalProofAdapter for Sp1NativeProofAdapter {
         _ctx: &InitProvingContext,
         witness: &InitReserveWitness,
     ) -> Result<(), String> {
-        // The native ownership and chain witnesses are consumed and bound by
-        // the two SP1 proofs themselves. Avoid building two unused host-side
-        // digest strings per account in the initialization hot path.
+        // The native ownership and chain witnesses are consumed together by
+        // the unified SP1 initialization proof. Avoid building unused
+        // host-side digest strings per account in the initialization hot path.
         validate_sp1_native_init_types(witness)
     }
 

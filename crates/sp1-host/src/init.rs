@@ -6,9 +6,10 @@ use ark_bls12_381::{Fr, G1Projective};
 use ark_ff::{BigInteger, PrimeField};
 use common::crypto::{hex_decode, hex_encode};
 use common::types::{InitChainBatchProofInput, InitReserveWitness, StoredInitProof};
+use sp1_programs_common::io::{Sp1BinaryMerklePrefixProof, Sp1G1Affine, Sp1MerkleSubtree};
+#[cfg(feature = "smt-sp1")]
 use sp1_programs_common::io::{
-    Sp1BinaryMerklePrefixProof, Sp1G1Affine, Sp1InitOwnershipEntry, Sp1InitOwnershipPublicValues,
-    Sp1InitOwnershipStdin, Sp1MerkleSubtree,
+    Sp1InitOwnershipEntry, Sp1InitOwnershipPublicValues, Sp1InitOwnershipStdin,
 };
 use sp1_programs_common::io::{Sp1InitPublicValues, Sp1InitReserveEntry, Sp1InitStdin};
 use sp1_sdk::blocking::Prover as BlockingProver;
@@ -17,13 +18,15 @@ use sp1_sdk::{ProvingKey, SP1ProofWithPublicValues, SP1Stdin};
 
 use crate::proof_mode::{configured_proof_mode, ensure_trusted_vk};
 use crate::prover_backend::{shared_cpu_prover, ProofGenerator};
+#[cfg(feature = "smt-sp1")]
+use crate::setup::load_init_ownership_vk;
 use crate::setup::{
-    default_setup_dir, ensure_protocol_setup_components, ensure_protocol_setups,
-    load_init_ownership_vk, load_init_vk,
+    default_setup_dir, ensure_protocol_setup_components, ensure_protocol_setups, load_init_vk,
 };
 use crate::witness::{convert_chain_proof, convert_ownership};
 
-const INIT_ELF: sp1_sdk::Elf = include_elf!("sp1-init-merkle");
+const INIT_ELF: sp1_sdk::Elf = include_elf!("sp1-init");
+#[cfg(feature = "smt-sp1")]
 const INIT_OWNERSHIP_ELF: sp1_sdk::Elf = include_elf!("sp1-init-ownership");
 const KZG_INSERT_ELF: sp1_sdk::Elf = include_elf!("sp1-kzg-insert");
 
@@ -35,20 +38,22 @@ struct Sp1InitContext {
 }
 
 static SP1_INIT_CONTEXT: OnceLock<Mutex<Option<Sp1InitContext>>> = OnceLock::new();
+#[cfg(feature = "smt-sp1")]
 static SP1_INIT_OWNERSHIP_CONTEXT: OnceLock<Mutex<Option<Sp1InitContext>>> = OnceLock::new();
 
-pub struct ProvedInitMerkle {
+pub struct ProvedInit {
     pub proof_hex: String,
     pub public: Sp1InitPublicValues,
 }
 
+#[cfg(feature = "smt-sp1")]
 pub struct ProvedInitOwnership {
     pub proof_hex: String,
     pub public: Sp1InitOwnershipPublicValues,
 }
 
 pub fn ensure_sp1_setup(setup_dir: &Path) -> Result<(), String> {
-    ensure_protocol_setups(setup_dir, INIT_ELF, INIT_OWNERSHIP_ELF, KZG_INSERT_ELF)
+    ensure_protocol_setups(setup_dir, INIT_ELF, KZG_INSERT_ELF)
 }
 
 pub fn ensure_sp1_setup_components(
@@ -59,27 +64,19 @@ pub fn ensure_sp1_setup_components(
     ensure_protocol_setup_components(
         setup_dir,
         include_init.then_some(INIT_ELF),
-        include_init.then_some(INIT_OWNERSHIP_ELF),
         include_insert.then_some(KZG_INSERT_ELF),
     )
 }
 
-/// Preloads the two initialization guests into the selected prover backend.
+/// Preloads the unified initialization guest into the selected prover backend.
 ///
 /// Durations include runtime context/VK loading. For CUDA they additionally
 /// include persistent worker startup and the one-time guest ELF setup.
-pub fn prepare_provers() -> Result<Vec<(&'static str, Duration)>, String> {
-    let merkle_started = Instant::now();
-    let merkle = sp1_context()?;
-    merkle.generator.prepare(&merkle.pk, "init-merkle")?;
-    let merkle_elapsed = merkle_started.elapsed();
-
-    let ownership_elapsed = prepare_ownership_prover()?;
-
-    Ok(vec![
-        ("init-merkle", merkle_elapsed),
-        ("init-ownership", ownership_elapsed),
-    ])
+pub fn prepare_prover() -> Result<Duration, String> {
+    let started = Instant::now();
+    let init = sp1_context()?;
+    init.generator.prepare(&init.pk, "init")?;
+    Ok(started.elapsed())
 }
 
 /// Preloads only the shared ECDSA ownership guest.
@@ -88,6 +85,7 @@ pub fn prepare_provers() -> Result<Vec<(&'static str, Duration)>, String> {
 /// KZG/Merkle initialization guest. Keeping this hook separate lets benchmark
 /// runners move process startup, VK loading, and CUDA ELF setup outside sample
 /// timers without changing the proof path.
+#[cfg(feature = "smt-sp1")]
 pub fn prepare_ownership_prover() -> Result<Duration, String> {
     let started = Instant::now();
     let ownership = sp1_ownership_context()?;
@@ -97,6 +95,7 @@ pub fn prepare_ownership_prover() -> Result<Duration, String> {
     Ok(started.elapsed())
 }
 
+#[cfg(feature = "smt-sp1")]
 pub fn prove_init_ownership(
     ownership_stdin: Sp1InitOwnershipStdin,
 ) -> Result<ProvedInitOwnership, String> {
@@ -113,69 +112,42 @@ pub fn prove_init_ownership(
     })
 }
 
-pub fn prove_init_merkle(merkle_stdin: Sp1InitStdin) -> Result<ProvedInitMerkle, String> {
-    let merkle_ctx = sp1_context()?;
-    let merkle_bundle = run_sp1_proof(&merkle_ctx, INIT_ELF, merkle_stdin, "init-merkle")?;
-    Ok(ProvedInitMerkle {
-        proof_hex: serialize_sp1_proof(&merkle_bundle)?,
-        public: decode_public_values(&merkle_bundle),
+pub fn prove_init(init_stdin: Sp1InitStdin) -> Result<ProvedInit, String> {
+    let init_ctx = sp1_context()?;
+    let init_bundle = run_sp1_proof(&init_ctx, INIT_ELF, init_stdin, "init")?;
+    Ok(ProvedInit {
+        proof_hex: serialize_sp1_proof(&init_bundle)?,
+        public: decode_public_values(&init_bundle),
     })
 }
 
-pub fn verify_init_proof(
-    proof: &StoredInitProof,
-) -> Result<(Sp1InitPublicValues, Sp1InitOwnershipPublicValues), String> {
-    if proof.sp1_proof_hex.is_empty() || proof.ownership_sp1_proof_hex.is_empty() {
-        return Err("missing serialized SP1 init proof artifacts".to_string());
+pub fn verify_init_proof(proof: &StoredInitProof) -> Result<Sp1InitPublicValues, String> {
+    if proof.sp1_proof_hex.is_empty() {
+        return Err("missing serialized unified SP1 init proof artifact".to_string());
     }
-    let merkle_ctx = sp1_context()?;
-    let ownership_ctx = sp1_ownership_context()?;
-    let merkle_bundle = deserialize_sp1_proof(&proof.sp1_proof_hex)?;
-    let ownership_bundle = deserialize_sp1_proof(&proof.ownership_sp1_proof_hex)?;
+    let init_ctx = sp1_context()?;
+    let init_bundle = deserialize_sp1_proof(&proof.sp1_proof_hex)?;
     if !proof.sp1_public_values_hex.is_empty()
-        && proof.sp1_public_values_hex != hex_encode(merkle_bundle.public_values.as_slice())
+        && proof.sp1_public_values_hex != hex_encode(init_bundle.public_values.as_slice())
     {
-        return Err("stored SP1 init Merkle public values do not match proof bundle".to_string());
-    }
-    if !proof.ownership_sp1_public_values_hex.is_empty()
-        && proof.ownership_sp1_public_values_hex
-            != hex_encode(ownership_bundle.public_values.as_slice())
-    {
-        return Err(
-            "stored SP1 init ownership public values do not match proof bundle".to_string(),
-        );
+        return Err("stored SP1 init public values do not match proof bundle".to_string());
     }
     if !proof.sp1_vk_hex.is_empty() {
         ensure_trusted_vk(
             &proof.sp1_vk_hex,
-            merkle_ctx.pk.verifying_key(),
+            init_ctx.pk.verifying_key(),
             hex_decode,
-            "init Merkle",
+            "unified init",
         )?;
     }
-    if !proof.ownership_sp1_vk_hex.is_empty() {
-        ensure_trusted_vk(
-            &proof.ownership_sp1_vk_hex,
-            ownership_ctx.pk.verifying_key(),
-            hex_decode,
-            "init ownership",
-        )?;
-    }
-    merkle_ctx
+    init_ctx
         .prover
-        .verify(&merkle_bundle, merkle_ctx.pk.verifying_key(), None)
-        .map_err(|err| format!("sp1 init Merkle verify failed: {err}"))?;
-    ownership_ctx
-        .prover
-        .verify(&ownership_bundle, ownership_ctx.pk.verifying_key(), None)
-        .map_err(|err| format!("sp1 init ownership verify failed: {err}"))?;
-    Ok((
-        decode_public_values(&merkle_bundle),
-        decode_ownership_public_values(&ownership_bundle),
-    ))
+        .verify(&init_bundle, init_ctx.pk.verifying_key(), None)
+        .map_err(|err| format!("SP1 unified initialization verify failed: {err}"))?;
+    Ok(decode_public_values(&init_bundle))
 }
 
-pub fn build_init_merkle_stdin(
+pub fn build_init_stdin(
     chain_id: &str,
     state_root: &str,
     session_id: &str,
@@ -216,6 +188,7 @@ pub fn build_init_merkle_stdin(
                 address: address.clone(),
                 encoded_address_le: fr_to_le_bytes(*encoded),
                 balance: *balance,
+                ownership: convert_ownership(&witness.ownership)?,
                 chain_balance_proof: convert_chain_proof(&witness.chain_balance_proof)?,
             })
         })
@@ -266,6 +239,7 @@ pub fn build_init_merkle_stdin(
     })
 }
 
+#[cfg(feature = "smt-sp1")]
 pub fn build_init_ownership_stdin(
     chain_id: &str,
     state_root: &str,
@@ -345,10 +319,11 @@ fn sp1_context() -> Result<Sp1InitContext, String> {
         pk: Arc::new(pk),
     };
     *guard = Some(ctx.clone());
-    common::profiling::record_phase("sp1-context", "init-merkle", start.elapsed());
+    common::profiling::record_phase("sp1-context", "init", start.elapsed());
     Ok(ctx)
 }
 
+#[cfg(feature = "smt-sp1")]
 fn sp1_ownership_context() -> Result<Sp1InitContext, String> {
     let slot = SP1_INIT_OWNERSHIP_CONTEXT.get_or_init(|| Mutex::new(None));
     let mut guard = slot
@@ -413,6 +388,7 @@ fn decode_public_values(bundle: &SP1ProofWithPublicValues) -> Sp1InitPublicValue
     public_values.read::<Sp1InitPublicValues>()
 }
 
+#[cfg(feature = "smt-sp1")]
 fn decode_ownership_public_values(
     bundle: &SP1ProofWithPublicValues,
 ) -> Sp1InitOwnershipPublicValues {

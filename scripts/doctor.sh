@@ -117,7 +117,7 @@ case "$MODE" in
     ;;
 esac
 
-for artifact in init.bin init-ownership.bin kzg-insert.bin; do
+for artifact in init.bin kzg-insert.bin; do
   [[ -s "params/sp1/$artifact" ]] && ok "protocol setup: params/sp1/$artifact" \
     || bad "protocol setup: params/sp1/$artifact (run ./poa sp1-setup)"
 done

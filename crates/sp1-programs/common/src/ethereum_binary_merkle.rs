@@ -1,4 +1,5 @@
 use crate::ethereum_eoa::keccak256;
+use alloc::vec::Vec;
 
 pub type Hash = [u8; 32];
 
@@ -23,9 +24,21 @@ pub fn node_hash(level: usize, left: &Hash, right: &Hash) -> Hash {
     keccak256(&input)
 }
 
-pub fn empty_leaf_hash(index: usize) -> Hash {
-    let mut input = [0u8; 40];
+pub fn empty_leaf_hash() -> Hash {
+    let mut input = [0u8; 32];
     input[..EMPTY_DOMAIN.len()].copy_from_slice(EMPTY_DOMAIN);
-    input[32..].copy_from_slice(&(index as u64).to_le_bytes());
     keccak256(&input)
+}
+
+/// Returns the canonical roots of completely empty subtrees. Entry `level`
+/// commits to `2^level` empty leaves. Keeping these roots independent of the
+/// leaf index lets a fixed-depth sparse tree represent a 2^32 capacity without
+/// allocating that many leaves.
+pub fn default_subtree_hashes(depth: usize) -> Vec<Hash> {
+    let mut roots = Vec::with_capacity(depth + 1);
+    roots.push(empty_leaf_hash());
+    for level in 0..depth {
+        roots.push(node_hash(level, &roots[level], &roots[level]));
+    }
+    roots
 }

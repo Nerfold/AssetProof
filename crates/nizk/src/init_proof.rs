@@ -372,28 +372,8 @@ fn initialize_core(
     let eval_value_base = derive_generator("eval-v", 0);
     let eval_blind_base = derive_generator("eval-h", 0);
     transcript_timer.finish();
-    // Prove ownership first and release its linear-size stdin before building
-    // the Merkle/protocol stdin. This keeps the two SP1 executions genuinely
-    // sequential instead of retaining both witness encodings at peak memory.
-    let ownership_stdin_timer =
-        common::profiling::PhaseTimer::start("init-host", "ownership_stdin_encode");
-    let ownership_stdin = sp1_host::init::build_init_ownership_stdin(
-        &ctx.chain_id,
-        &ctx.state_root,
-        &ctx.session_id,
-        &reserve_addresses,
-        &reserve_balances,
-        &canonical_witnesses,
-    )?;
-    ownership_stdin_timer.finish();
-    let ownership_prove_timer =
-        common::profiling::PhaseTimer::start("init-host", "ownership_sp1_with_profile_probe");
-    let ownership_sp1 = sp1_host::init::prove_init_ownership(ownership_stdin)?;
-    ownership_prove_timer.finish();
-
-    let merkle_stdin_timer =
-        common::profiling::PhaseTimer::start("init-host", "merkle_stdin_encode");
-    let merkle_stdin = sp1_host::init::build_init_merkle_stdin(
+    let init_stdin_timer = common::profiling::PhaseTimer::start("init-host", "init_stdin_encode");
+    let init_stdin = sp1_host::init::build_init_stdin(
         &ctx.chain_id,
         &ctx.state_root,
         &ctx.session_id,
@@ -418,26 +398,16 @@ fn initialize_core(
         &canonical_witnesses,
         ctx.chain_batch_proof.as_ref(),
     )?;
-    merkle_stdin_timer.finish();
-    let merkle_prove_timer =
-        common::profiling::PhaseTimer::start("init-host", "merkle_sp1_with_profile_probe");
-    let merkle_sp1 = sp1_host::init::prove_init_merkle(merkle_stdin)?;
-    merkle_prove_timer.finish();
-    if merkle_sp1.public.chain_id != ownership_sp1.public.chain_id
-        || merkle_sp1.public.state_root != ownership_sp1.public.state_root
-        || merkle_sp1.public.session_id != ownership_sp1.public.session_id
-        || merkle_sp1.public.reserve_count != ownership_sp1.public.reserve_count
-        || merkle_sp1.public.reserve_commitment != ownership_sp1.public.reserve_commitment
-    {
-        return Err(
-            "split initialization SP1 proofs are not bound to the same reserves".to_string(),
-        );
-    }
+    init_stdin_timer.finish();
+    let init_prove_timer =
+        common::profiling::PhaseTimer::start("init-host", "unified_sp1_with_profile_probe");
+    let init_sp1 = sp1_host::init::prove_init(init_stdin)?;
+    init_prove_timer.finish();
 
     let assembly_timer =
         common::profiling::PhaseTimer::start("init-host", "proof_and_state_assembly");
     let proof = StoredInitProof {
-        scheme: "kzg-nizk-init-v8-zkopen-keccak-merkle-prefix-split".to_string(),
+        scheme: "kzg-nizk-init-v9-zkopen-keccak-merkle-unified".to_string(),
         mode: "sp1".to_string(),
         chain_id: ctx.chain_id.clone(),
         state_root: ctx.state_root.clone(),
@@ -449,12 +419,9 @@ fn initialize_core(
         reserve_count: reserve_entries.len(),
         zeta,
         kzg_opening_proof_hex,
-        sp1_proof_hex: merkle_sp1.proof_hex,
+        sp1_proof_hex: init_sp1.proof_hex,
         sp1_vk_hex: String::new(),
         sp1_public_values_hex: String::new(),
-        ownership_sp1_proof_hex: ownership_sp1.proof_hex,
-        ownership_sp1_vk_hex: String::new(),
-        ownership_sp1_public_values_hex: String::new(),
         transcript_hex,
         srs_hash_hex,
     };
@@ -575,16 +542,13 @@ pub(crate) fn verify_init_public_proof(
     if proof.srs_hash_hex != point_hash_srs(srs)? {
         return Err("SRS hash mismatch".to_string());
     }
-    if proof.scheme != "kzg-nizk-init-v8-zkopen-keccak-merkle-prefix-split" {
+    if proof.scheme != "kzg-nizk-init-v9-zkopen-keccak-merkle-unified" {
         return Err("init proof is not a production ZK proof; use verify_init_debug only for transparent local tests".to_string());
     }
     if proof.mode != "sp1" {
         return Err("init proof mode is not sp1".to_string());
     }
-    if proof.kzg_opening_proof_hex.is_empty()
-        || proof.sp1_proof_hex.is_empty()
-        || proof.ownership_sp1_proof_hex.is_empty()
-    {
+    if proof.kzg_opening_proof_hex.is_empty() || proof.sp1_proof_hex.is_empty() {
         return Err("missing init proof-system artifact".to_string());
     }
     let accumulator = point_g1_from_hex(&proof.accumulator_hex)?;
@@ -612,7 +576,7 @@ pub(crate) fn verify_init_public_proof(
         "dynamic-poa-init-eval-zkopen",
     )?;
 
-    let (sp1_public, ownership_public) = sp1_host::init::verify_init_proof(proof)?;
+    let sp1_public = sp1_host::init::verify_init_proof(proof)?;
     let balance_value_base = derive_generator("balance-v", 0);
     let balance_blind_base = derive_generator("balance-h", 0);
     let eval_value_base = derive_generator("eval-v", 0);
@@ -632,11 +596,6 @@ pub(crate) fn verify_init_public_proof(
         || sp1_public.shape_commitment != c_shape
         || !sp1_host::kzg_insert::point_matches(&sp1_public.eval_commitment, &c_y)
         || sp1_public.commitment_params_digest_hex != expected_params_digest
-        || ownership_public.chain_id != proof.chain_id
-        || ownership_public.state_root != proof.state_root
-        || ownership_public.session_id != proof.session_id
-        || ownership_public.reserve_count != proof.reserve_count
-        || ownership_public.reserve_commitment != sp1_public.reserve_commitment
     {
         return Err("init SP1 public values mismatch".to_string());
     }
@@ -655,7 +614,7 @@ pub(crate) fn verify_init_public_proof(
     if expected_transcript != proof.transcript_hex {
         return Err("init transcript mismatch".to_string());
     }
-    Ok(sp1_public.uses_mock_inputs || ownership_public.uses_mock_inputs)
+    Ok(sp1_public.uses_mock_inputs)
 }
 
 fn commit_eval(value: Fr, blind: Fr) -> ark_bls12_381::G1Projective {

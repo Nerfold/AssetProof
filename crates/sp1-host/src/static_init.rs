@@ -135,8 +135,17 @@ fn build_stdin(
     let reserves = ordered
         .iter()
         .map(|witness| {
+            let address_bytes: [u8; 20] = hex_decode(
+                witness
+                    .address
+                    .strip_prefix("0x")
+                    .unwrap_or(&witness.address),
+            )?
+            .try_into()
+            .map_err(|_| "static initialization address must contain 20 bytes".to_string())?;
             Ok(Sp1StaticInitReserveEntry {
                 address: witness.address.clone(),
+                address_bytes,
                 balance: witness.balance,
                 ownership: convert_ownership(&witness.ownership)?,
                 chain_balance_proof: convert_chain_proof(&witness.chain_balance_proof)?,

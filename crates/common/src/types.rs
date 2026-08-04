@@ -194,22 +194,17 @@ pub struct StoredInitProof {
     pub session_id: String,
     pub accumulator_hex: String,
     pub balance_commitment_hex: String,
-    /// A 32-byte salted BLAKE3 commitment to `(alpha, ordered address roots)`.
+    /// A 32-byte salted Keccak commitment to `(alpha, ordered address roots)`.
     /// The private salt and preimage are checked inside the SP1 initialization proof.
     pub c_shape_hex: String,
     pub c_y_hex: String,
     pub reserve_count: usize,
     pub zeta: Fr,
     pub kzg_opening_proof_hex: String,
-    /// Merkle-balance/polynomial SP1 proof.
+    /// Unified ownership/Merkle/balance/polynomial SP1 proof.
     pub sp1_proof_hex: String,
     pub sp1_vk_hex: String,
     pub sp1_public_values_hex: String,
-    /// Separate ECDSA ownership SP1 proof, bound to the Merkle guest by the
-    /// same ordered reserve commitment.
-    pub ownership_sp1_proof_hex: String,
-    pub ownership_sp1_vk_hex: String,
-    pub ownership_sp1_public_values_hex: String,
     pub transcript_hex: String,
     pub srs_hash_hex: String,
 }

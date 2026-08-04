@@ -105,7 +105,7 @@ if [[ ! -f "$FIXTURE_DIR/preparation-manifest.txt" ]]; then
   echo "Run scripts/initialize_benchmark_data.sh first." >&2
   exit 1
 fi
-if ! grep -Fxq "fixture_version=ethereum-keccak-merkle-prefix-v2-ecdsa" "$FIXTURE_DIR/preparation-manifest.txt" \
+if ! grep -Fxq "fixture_version=ethereum-keccak-fixed32-merkle-prefix-v3-ecdsa" "$FIXTURE_DIR/preparation-manifest.txt" \
   || ! grep -Fxq "master.max_n=$MASTER_N" "$FIXTURE_DIR/preparation-manifest.txt"; then
   echo >&2
   echo "Prepared fixtures do not match Keccak-Merkle prefix fixture / MASTER_N=$MASTER_N." >&2

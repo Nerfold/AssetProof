@@ -25,7 +25,7 @@ echo "  SRS threads: $SRS_THREADS"
 echo "  manifest:   $OUTPUT_DIR/preparation-manifest.txt"
 echo
 echo "This stage can require substantial RAM, disk space, and time for n=1000000."
-echo "It builds one master_n+1 account store and one shared fixed-height binary Merkle tree."
+echo "It builds one master_n+1 account store and one shared fixed-depth-32 binary Merkle tree."
 echo "Each n reuses that tree/root and stores one compact shared-prefix proof."
 echo "It does not run SP1 proving."
 echo "One shared SRS is generated: full G1 through master_n+1,"

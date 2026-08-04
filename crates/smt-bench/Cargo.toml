@@ -5,6 +5,6 @@ edition = "2021"
 
 [dependencies]
 common = { path = "../common" }
-poa-bench = { path = "../poa-bench" }
+poa-bench = { path = "../poa-bench", default-features = false }
 smt = { path = "../smt" }
 sp1-host = { path = "../sp1-host", features = ["smt-sp1"] }

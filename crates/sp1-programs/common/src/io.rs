@@ -224,6 +224,37 @@ pub struct Sp1InitOwnershipPublicValues {
     pub uses_mock_inputs: bool,
 }
 
+/// One private reserve entry for the traditional static PoA baseline.
+/// Unlike the dynamic initialization input, this contains no polynomial,
+/// KZG, Pedersen, or update-state witness.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Sp1StaticInitReserveEntry {
+    pub address: String,
+    pub balance: i128,
+    pub ownership: Sp1OwnershipWitness,
+    pub chain_balance_proof: Sp1ChainBalanceProof,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Sp1StaticInitStdin {
+    pub chain_id: String,
+    pub state_root: String,
+    pub session_id: String,
+    pub reserves: Vec<Sp1StaticInitReserveEntry>,
+    pub merkle_prefix_proof: Option<Sp1BinaryMerklePrefixProof>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Sp1StaticInitPublicValues {
+    pub chain_id: String,
+    pub state_root: String,
+    pub session_id: String,
+    pub reserve_count: usize,
+    pub reserve_commitment: Hash,
+    pub balance_total: i128,
+    pub uses_mock_inputs: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Sp1OwnershipWitness {
     MockPrivateKey {

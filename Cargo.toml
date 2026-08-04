@@ -9,6 +9,7 @@ members = [
     "crates/sp1-programs/common",
     "crates/sp1-programs/init-merkle",
     "crates/sp1-programs/init-ownership",
+    "crates/sp1-programs/static-init",
     "crates/sp1-programs/smt-init",
     "crates/sp1-programs/smt-update",
     "crates/sp1-programs/smt-insert",
@@ -16,6 +17,7 @@ members = [
     "crates/sp1-host",
     "crates/poa-cli",
     "crates/poa-bench",
+    "crates/static-bench",
     "tools/kzg-msm-bench",
 ]
 resolver = "2"

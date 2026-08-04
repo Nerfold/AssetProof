@@ -1,0 +1,23 @@
+[package]
+name = "static-bench"
+version = "0.1.0"
+edition = "2021"
+autobins = false
+
+[features]
+default = ["benchmark"]
+benchmark = ["dep:sp1-host"]
+
+[dependencies]
+common = { path = "../common" }
+poa-bench = { path = "../poa-bench", default-features = false }
+sp1-host = { path = "../sp1-host", default-features = false, features = ["static-baseline"], optional = true }
+
+[[bin]]
+name = "static-bench"
+path = "src/main.rs"
+required-features = ["benchmark"]
+
+[[bin]]
+name = "static_fixture"
+path = "src/bin/static_fixture.rs"

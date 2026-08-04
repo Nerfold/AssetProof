@@ -266,7 +266,7 @@ fn build_smt_init_stdin(
             Ok(Sp1SmtInitReserveEntry {
                 address: witness.address.clone(),
                 balance: witness.balance,
-                chain_balance_proof: crate::init::convert_chain_proof(
+                chain_balance_proof: crate::witness::convert_chain_proof(
                     &witness.chain_balance_proof,
                 )?,
             })
@@ -318,7 +318,7 @@ fn build_ownership_stdin(
             Ok(sp1_programs_common::io::Sp1InitOwnershipEntry {
                 address: witness.address.clone(),
                 balance: witness.balance,
-                ownership: crate::init::convert_ownership(&witness.ownership)?,
+                ownership: crate::witness::convert_ownership(&witness.ownership)?,
             })
         })
         .collect::<Result<Vec<_>, String>>()?;

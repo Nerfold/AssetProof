@@ -22,6 +22,7 @@ pub(crate) fn configured_proof_mode() -> Result<ConfiguredProofMode, String> {
     }
 }
 
+#[cfg(feature = "protocol-sp1")]
 pub(crate) fn ensure_trusted_vk<T: serde::Serialize>(
     stored_vk_hex: &str,
     trusted_vk: &T,

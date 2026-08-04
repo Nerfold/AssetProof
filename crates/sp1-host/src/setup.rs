@@ -16,6 +16,7 @@ const SMT_INIT_ELF_NAME: &str = "smt-init";
 const INIT_ELF_NAME: &str = "init";
 const INIT_OWNERSHIP_ELF_NAME: &str = "init-ownership";
 const KZG_INSERT_ELF_NAME: &str = "kzg-insert";
+const STATIC_INIT_ELF_NAME: &str = "static-init";
 
 #[derive(Clone, Serialize, Deserialize)]
 struct StoredSp1Setup {
@@ -116,6 +117,14 @@ pub fn load_init_ownership_vk(
     load_setup_file(setup_dir, INIT_OWNERSHIP_ELF_NAME, init_ownership_elf)
 }
 
+pub fn ensure_static_init_setup(setup_dir: &Path, elf: Elf) -> Result<(), String> {
+    ensure_setup_file(setup_dir, STATIC_INIT_ELF_NAME, elf)
+}
+
+pub fn load_static_init_vk(setup_dir: &Path, elf: Elf) -> Result<SP1VerifyingKey, String> {
+    load_setup_file(setup_dir, STATIC_INIT_ELF_NAME, elf)
+}
+
 fn ensure_setup_file(setup_dir: &Path, elf_name: &str, elf: Elf) -> Result<(), String> {
     fs::create_dir_all(setup_dir)
         .map_err(|err| format!("create setup dir {}: {err}", setup_dir.display()))?;
@@ -149,26 +158,28 @@ fn ensure_setup_file(setup_dir: &Path, elf_name: &str, elf: Elf) -> Result<(), S
 
 fn load_setup_file(setup_dir: &Path, elf_name: &str, elf: Elf) -> Result<SP1VerifyingKey, String> {
     let path = setup_file_path(setup_dir, elf_name);
-    let setup_command = if matches!(
+    let setup_command = if elf_name == STATIC_INIT_ELF_NAME {
+        "./scripts/benchmark_static_baseline.sh"
+    } else if matches!(
         elf_name,
         SMT_INIT_ELF_NAME | UPDATE_ELF_NAME | INSERT_ELF_NAME
     ) {
-        "sp1-smt-setup"
+        "./poa sp1-smt-setup"
     } else {
-        "sp1-setup"
+        "./poa sp1-setup"
     };
     if !path.exists() {
         return Err(format!(
-            "missing SP1 setup artifact {}. Run `./poa {setup_command} {}` first.",
+            "missing SP1 setup artifact {}. Run `{setup_command}` first (setup dir: {}).",
             path.display(),
-            setup_dir.display()
+            setup_dir.display(),
         ));
     }
     let stored = read_setup_file(&path)?;
     let digest = elf_digest(&elf);
     if stored.elf_digest != digest {
         return Err(format!(
-            "stale SP1 setup artifact {} for {}. Re-run `./poa {setup_command} {}`.",
+            "stale SP1 setup artifact {} for {}. Re-run `{setup_command}` (setup dir: {}).",
             path.display(),
             elf_name,
             setup_dir.display()

@@ -12,10 +12,10 @@ use sp1_sdk::blocking::Prover as BlockingProver;
 use sp1_sdk::include_elf;
 use sp1_sdk::{ProvingKey, SP1ProofWithPublicValues, SP1Stdin};
 
-use crate::init::{convert_chain_proof, convert_ownership};
 use crate::proof_mode::{configured_proof_mode, ensure_trusted_vk};
 use crate::prover_backend::{shared_cpu_prover, ProofGenerator};
 use crate::setup::{default_setup_dir, load_kzg_insert_vk};
+use crate::witness::{convert_chain_proof, convert_ownership};
 
 const KZG_INSERT_ELF: sp1_sdk::Elf = include_elf!("sp1-kzg-insert");
 

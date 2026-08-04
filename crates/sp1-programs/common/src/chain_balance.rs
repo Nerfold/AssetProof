@@ -3,7 +3,7 @@ use alloc::vec;
 use crate::ethereum_binary_merkle::{leaf_hash, node_hash};
 use crate::io::{
     Hash, Sp1BinaryMerklePrefixProof, Sp1ChainBalanceProof, Sp1InitReserveEntry,
-    Sp1SmtInitReserveEntry,
+    Sp1SmtInitReserveEntry, Sp1StaticInitReserveEntry,
 };
 
 pub trait ChainReserveEntry {
@@ -27,6 +27,20 @@ impl ChainReserveEntry for Sp1InitReserveEntry {
 }
 
 impl ChainReserveEntry for Sp1SmtInitReserveEntry {
+    fn address(&self) -> &str {
+        &self.address
+    }
+
+    fn balance(&self) -> i128 {
+        self.balance
+    }
+
+    fn proof(&self) -> &Sp1ChainBalanceProof {
+        &self.chain_balance_proof
+    }
+}
+
+impl ChainReserveEntry for Sp1StaticInitReserveEntry {
     fn address(&self) -> &str {
         &self.address
     }

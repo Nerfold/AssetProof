@@ -2,20 +2,37 @@
 name = "poa-bench"
 version = "0.1.0"
 edition = "2021"
+autobins = false
+
+[features]
+default = ["protocol"]
+protocol = [
+    "dep:nizk-fixed-set",
+    "dep:smt",
+    "dep:sp1-host",
+    "dep:tracing-appender",
+    "dep:tracing-subscriber",
+]
 
 [dependencies]
 blake3 = "1.8"
 common = { path = "../common" }
 k256 = { version = "0.13", features = ["arithmetic"] }
-nizk-fixed-set = { path = "../nizk" }
+nizk-fixed-set = { path = "../nizk", optional = true }
 rayon = "1.11"
 sha3 = "0.10"
-smt = { path = "../smt" }
-sp1-host = { path = "../sp1-host", features = ["smt-sp1"] }
+smt = { path = "../smt", optional = true }
+sp1-host = { path = "../sp1-host", features = ["smt-sp1"], optional = true }
 sp1-programs-common = { path = "../sp1-programs/common" }
-tracing-appender = "0.2"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-appender = { version = "0.2", optional = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"], optional = true }
+
+[[bin]]
+name = "poa-bench"
+path = "src/main.rs"
+required-features = ["protocol"]
 
 [[bin]]
 name = "poa-smt-fixture"
 path = "src/bin/smt_fixture.rs"
+required-features = ["protocol"]

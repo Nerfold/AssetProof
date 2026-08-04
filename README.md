@@ -151,6 +151,10 @@ state 含余额和 blinding，应按敏感数据处理。
 SMT host 入口是一套独立实验实现。高级 CLI 的 SMT 命令仍在使用它们，因此暂时保留，
 但 initialization/insert/update 的 KZG protocol benchmark 不会调用它们。
 
+`crates/static-bench/` 与 `crates/sp1-programs/static-init/` 是传统静态 PoA baseline。
+它只验证账户输入、ECDSA ownership 和链状态 Merkle membership，不依赖 SRS，也不会
+构造地址多项式、KZG accumulator/digest、opening 或可更新本地状态。
+
 ## Mock 数据
 
 仓库自带小规模 fixture：
@@ -680,6 +684,45 @@ delta fixture 都会立即退出，不会在 benchmark 过程中自动生成。�
 SAMPLES=5 WARMUP=1 POA_SP1_PROOF_MODE=groth16 \
   ./scripts/benchmark_protocol.sh
 ```
+
+### 传统静态 PoA baseline
+
+静态 baseline 使用单个 SP1 guest 验证每个私有账户的规范 Ethereum 地址、非负余额、
+ECDSA ownership signature 以及共享 Merkle prefix membership proof，并公开绑定
+chain/state root、账户数量、有序账户 commitment 和总余额。它刻意不执行以下动态协议工作：
+
+- 地址根多项式构造和随机点恒等测试；
+- KZG accumulator/digest、KZG opening 或 ZKOpen；
+- evaluation/balance Pedersen commitment opening；
+- update/insert 所需的可更新 prover state。
+
+它使用独立的静态 fixture 入口；不需要 SRS，也不需要
+`initialize_benchmark_data.sh` 或 `initialize_smt_benchmark_data.sh`。先生成一次地址、
+ECDSA、余额和 Merkle 数据：
+
+```bash
+MASTER_N=1000 N_SIZES=1000 \
+FIXTURE_DIR=data/mock/bench/generated-static-n1000 \
+./scripts/initialize_static_baseline_data.sh
+```
+
+然后使用 CUDA 正式测试：
+
+```bash
+MASTER_N=1000 N_SIZES=1000 \
+FIXTURE_DIR=data/mock/bench/generated-static-n1000 \
+SP1_PROVER=cuda POA_SP1_CUDA_DEVICE=0 POA_SP1_PROOF_MODE=compressed \
+SAMPLES=3 WARMUP=1 \
+OUTPUT_DIR=artifacts/benchmarks/static-cuda-n1000 \
+./scripts/benchmark_static_baseline.sh
+```
+
+脚本只产生 initialization baseline。Cargo build、fixture 加载、VK setup、CUDA worker
+启动和 guest upload 写入 `loading.csv`，不进入 sample；stdin 构造、传输和完整单 guest
+proof 计入 prover time。结果格式与 NIZK/SMT benchmark 对齐，包括 `raw.csv`、
+`summary.csv`、`summary.md`、`loading.csv` 和 `proof-samples/`。设置
+`POA_SP1_PROFILE=1` 后，`guest-metrics.csv` 会分别给出
+`merkle_prefix_verify`、`input_validation_and_ownership`、`reserve_commitment` 等 cycles。
 
 ### SP1 Network
 

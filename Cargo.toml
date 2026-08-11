@@ -18,6 +18,8 @@ members = [
     "crates/poa-cli",
     "crates/poa-bench",
     "crates/static-bench",
+    "crates/ethereum-mpt-bench",
+    "crates/ethereum-mpt-bench/program",
     "tools/kzg-msm-bench",
 ]
 resolver = "2"

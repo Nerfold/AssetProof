@@ -629,6 +629,32 @@ POA_TIMING=1 ./poa prove-update \
 fixture。每行包含 1 次 warmup 和 3 次 measured samples。CUDA 模式由 SDK 启动并持有
 唯一的 `sp1-gpu-server`，等待其 Unix socket 就绪后再进入证明阶段，退出时自动回收。
 
+### 独立 Ethereum MPT/SP1 benchmark
+
+只测试 Ethereum state-trie account proof 的 RLP/MPT 验证时，使用独立 guest：
+
+```bash
+# 只测 SP1 execute 时间、cycles 和 syscalls，不生成证明；最后一个参数是 proof 数量
+MPT_PROVE=0 ./poa benchmark-mpt cpu 3 1,16,256
+
+# CUDA compressed proof，每种 proof 数量正式采样 3 次
+./poa sp1-cuda-build
+./poa benchmark-mpt cuda 3 1,16,256
+
+# CUDA 批量矩阵：同一棵 8192 账户 MPT 的 1024、2048、4096、8192 条 proof
+./poa benchmark-mpt-cuda-matrix
+```
+
+fixture 构建一棵真实结构的十六叉 Patricia trie，使用 Keccak key、hex-prefix compact
+path、规范 extension/branch/leaf、RLP account 和 hashed/inline child reference；所有 proof
+共享同一个 state root，不经过二叉 mock tree。测试不包含 ownership、KZG、Pedersen、SMT
+或协议状态更新。`summary.csv`/`summary.md` 分开记录 MPT proof bytes、execute/cycles、
+MPT 验证本体 cycles、prover、verifier 与 SP1 proof size；fixture 生成、独立 phase
+profile 和 prover setup 排除在样本计时之外。
+批量脚本只构建一次 8192 账户 MPT 并导出 proof，再按降序原地截断，避免重复 mock 和
+复制大 witness。
+更详细的边界见 `crates/ethereum-mpt-bench/README.md`。
+
 完整协议矩阵由 `scripts/benchmark_protocol.sh` 运行。其 initialization fixture 在
 SP1 外一次性生成 `10^6+1` 个确定性的有效 secp256k1 私钥、未压缩公钥、由 Keccak
 派生的 Ethereum 地址、ECDSA ownership signatures、随机化余额，以及一棵覆盖全部

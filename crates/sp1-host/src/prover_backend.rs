@@ -25,7 +25,9 @@ pub(crate) enum ProofGenerator {
     Cuda {
         client: Arc<Mutex<CudaWorkerClient>>,
     },
-    Network { worker: PathBuf },
+    Network {
+        worker: PathBuf,
+    },
 }
 
 impl ProofGenerator {
@@ -77,11 +79,7 @@ impl ProofGenerator {
     /// The returned wall-clock duration is intended to be recorded as setup
     /// overhead outside benchmark sample timers. Repeated calls for the same
     /// guest return zero.
-    pub(crate) fn prepare(
-        &self,
-        pk: &SP1ProvingKey,
-        guest: &str,
-    ) -> Result<Duration, String> {
+    pub(crate) fn prepare(&self, pk: &SP1ProvingKey, guest: &str) -> Result<Duration, String> {
         match self {
             Self::Cuda { client } => client
                 .lock()

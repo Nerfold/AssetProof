@@ -286,6 +286,31 @@ pub struct Sp1StaticInitPublicValues {
     pub uses_mock_inputs: bool,
 }
 
+/// Private input for the isolated Ethereum MPT account-proof benchmark.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Sp1EthereumMptInput {
+    pub state_root: Hash,
+    pub address: [u8; 20],
+    pub expected_balance: i128,
+    pub proof_nodes: Vec<Vec<u8>>,
+}
+
+/// Private batch input for the isolated Ethereum MPT benchmark.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Sp1EthereumMptBatchInput {
+    pub proofs: Vec<Sp1EthereumMptInput>,
+}
+
+/// Public output binding every accepted account statement in a batch without
+/// committing the much larger MPT witness itself.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Sp1EthereumMptBatchPublicValues {
+    pub statement_digest: Hash,
+    pub proof_count: usize,
+    pub proof_node_count: usize,
+    pub proof_bytes: usize,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Sp1OwnershipWitness {
     MockPrivateKey {

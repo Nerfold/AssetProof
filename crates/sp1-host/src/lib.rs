@@ -1,7 +1,19 @@
+#[cfg(any(
+    feature = "protocol-sp1",
+    feature = "smt-sp1",
+    feature = "static-baseline"
+))]
 mod profiling;
 mod proof_mode;
 mod prover_backend;
+#[cfg(any(
+    feature = "protocol-sp1",
+    feature = "smt-sp1",
+    feature = "static-baseline"
+))]
 mod witness;
+
+pub mod standalone;
 
 #[cfg(feature = "protocol-sp1")]
 pub mod init;

@@ -1,6 +1,6 @@
-use alloc::vec::Vec;
 #[cfg(target_os = "zkvm")]
 use alloc::vec;
+use alloc::vec::Vec;
 
 use crate::ethereum_binary_merkle::{leaf_hash, node_hash};
 use crate::io::{

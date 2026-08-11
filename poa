@@ -26,6 +26,14 @@ case "${1:-}" in
         shift
         exec "$ROOT_DIR/scripts/benchmark_matrix.sh" "$@"
         ;;
+    benchmark-mpt|bench-mpt)
+        shift
+        exec "$ROOT_DIR/scripts/benchmark_ethereum_mpt.sh" "$@"
+        ;;
+    benchmark-mpt-cuda-matrix|bench-mpt-cuda-matrix)
+        shift
+        exec "$ROOT_DIR/scripts/benchmark_ethereum_mpt_batch_cuda.sh" "$@"
+        ;;
     sp1-setup)
         shift
         exec cargo run --quiet --release -p sp1-host --bin poa-protocol-sp1-setup -- "$@"

@@ -1,5 +1,23 @@
-use crate::ethereum_eoa::keccak256;
+use crate::ethereum_eoa::{keccak256, Keccak256Stream};
+use crate::io::Sp1EthereumMptInput;
 use alloc::vec::Vec;
+
+const MPT_BATCH_DOMAIN: &[u8] = b"DPOA_ETHEREUM_MPT_BATCH_V1";
+
+/// Commits the public account statements accepted by a batch. Proof nodes are
+/// excluded because each statement's state root already binds its MPT witness.
+/// On SP1 this streaming hash uses the Keccak permutation precompile.
+pub fn account_batch_statement_digest(proofs: &[Sp1EthereumMptInput]) -> [u8; 32] {
+    let mut digest = Keccak256Stream::new();
+    digest.update(MPT_BATCH_DOMAIN);
+    digest.update(&(proofs.len() as u64).to_be_bytes());
+    for proof in proofs {
+        digest.update(&proof.state_root);
+        digest.update(&proof.address);
+        digest.update(&proof.expected_balance.to_be_bytes());
+    }
+    digest.finalize()
+}
 
 #[derive(Clone, Copy)]
 struct RlpItem<'a> {
@@ -36,36 +54,39 @@ pub fn verify_account_balance(
         if !node.is_list {
             return Err("Ethereum trie node is not an RLP list");
         }
-        let children = parse_list(node.payload)?;
-        match children.len() {
+        let mut children = [None; 17];
+        let child_count = parse_list_into(node.payload, &mut children)?;
+        match child_count {
             17 => {
                 if path_offset == nibbles.len() {
                     ensure_proof_consumed(proof_index, proof_nodes.len())?;
-                    return verify_account_value(children[16], expected_balance);
+                    return verify_account_value(
+                        children[16].ok_or("missing Ethereum branch value")?,
+                        expected_balance,
+                    );
                 }
-                let child = children[nibbles[path_offset] as usize];
+                let child = children[nibbles[path_offset] as usize]
+                    .ok_or("missing Ethereum branch child")?;
                 path_offset += 1;
                 node_bytes = resolve_child(child, proof_nodes, &mut proof_index)?;
             }
             2 => {
-                if children[0].is_list {
+                let path = children[0].ok_or("missing compact Ethereum trie path")?;
+                let child = children[1].ok_or("missing compact Ethereum trie child")?;
+                if path.is_list {
                     return Err("invalid compact Ethereum trie path");
                 }
-                let (is_leaf, compact) = decode_compact_path(children[0].payload)?;
-                if path_offset + compact.len() > nibbles.len()
-                    || nibbles[path_offset..path_offset + compact.len()] != compact[..]
-                {
-                    return Err("Ethereum trie path mismatch");
-                }
-                path_offset += compact.len();
+                let (is_leaf, compact_len) =
+                    match_compact_path(path.payload, &nibbles[path_offset..])?;
+                path_offset += compact_len;
                 if is_leaf {
                     if path_offset != nibbles.len() {
                         return Err("Ethereum leaf ended before account key");
                     }
                     ensure_proof_consumed(proof_index, proof_nodes.len())?;
-                    return verify_account_value(children[1], expected_balance);
+                    return verify_account_value(child, expected_balance);
                 }
-                node_bytes = resolve_child(children[1], proof_nodes, &mut proof_index)?;
+                node_bytes = resolve_child(child, proof_nodes, &mut proof_index)?;
             }
             _ => return Err("invalid Ethereum trie node arity"),
         }
@@ -121,21 +142,33 @@ fn verify_account_value(value: RlpItem<'_>, expected_balance: i128) -> Result<()
     if !account.is_list {
         return Err("Ethereum account is not an RLP list");
     }
-    let fields = parse_list(account.payload)?;
-    if fields.len() != 4 || fields.iter().any(|field| field.is_list) {
+    let mut fields = [None; 4];
+    if parse_list_into(account.payload, &mut fields)? != 4 {
         return Err("invalid Ethereum account RLP");
     }
-    if fields[2].payload.len() != 32 || fields[3].payload.len() != 32 {
+    let [Some(nonce), Some(balance), Some(storage_root), Some(code_hash)] = fields else {
+        return Err("invalid Ethereum account RLP");
+    };
+    if nonce.is_list || balance.is_list || storage_root.is_list || code_hash.is_list {
+        return Err("invalid Ethereum account RLP");
+    }
+    if storage_root.payload.len() != 32 || code_hash.payload.len() != 32 {
         return Err("invalid Ethereum account roots");
     }
-    let balance = decode_u128(fields[1].payload)?;
-    if balance != expected_balance as u128 {
+    if decode_u128(nonce.payload)? > u64::MAX as u128 {
+        return Err("Ethereum account nonce exceeds u64 range");
+    }
+    let decoded_balance = decode_u128(balance.payload)?;
+    if decoded_balance != expected_balance as u128 {
         return Err("Ethereum account balance mismatch");
     }
     Ok(())
 }
 
-fn decode_compact_path(encoded: &[u8]) -> Result<(bool, Vec<u8>), &'static str> {
+/// Checks a hex-prefix compact path directly against the remaining account
+/// key. This avoids allocating a temporary nibble vector for every extension
+/// or leaf node in the zkVM.
+fn match_compact_path(encoded: &[u8], expected: &[u8]) -> Result<(bool, usize), &'static str> {
     if encoded.is_empty() {
         return Err("empty compact Ethereum trie path");
     }
@@ -147,15 +180,32 @@ fn decode_compact_path(encoded: &[u8]) -> Result<(bool, Vec<u8>), &'static str> 
     if !odd && encoded[0] & 0x0f != 0 {
         return Err("non-canonical compact Ethereum trie path");
     }
-    let mut out = Vec::new();
+    let nibble_len = encoded
+        .len()
+        .checked_mul(2)
+        .and_then(|value| value.checked_sub(if odd { 1 } else { 2 }))
+        .ok_or("compact Ethereum trie path length overflow")?;
+    let is_leaf = flag & 2 == 2;
+    if !is_leaf && nibble_len == 0 {
+        return Err("empty Ethereum extension path");
+    }
+    if nibble_len > expected.len() {
+        return Err("Ethereum trie path mismatch");
+    }
+    let mut matched = 0usize;
     if odd {
-        out.push(encoded[0] & 0x0f);
+        if encoded[0] & 0x0f != expected[matched] {
+            return Err("Ethereum trie path mismatch");
+        }
+        matched += 1;
     }
     for byte in &encoded[1..] {
-        out.push(byte >> 4);
-        out.push(byte & 0x0f);
+        if byte >> 4 != expected[matched] || byte & 0x0f != expected[matched + 1] {
+            return Err("Ethereum trie path mismatch");
+        }
+        matched += 2;
     }
-    Ok((flag & 2 == 2, out))
+    Ok((is_leaf, nibble_len))
 }
 
 fn decode_u128(bytes: &[u8]) -> Result<u128, &'static str> {
@@ -172,14 +222,24 @@ fn decode_u128(bytes: &[u8]) -> Result<u128, &'static str> {
     Ok(out)
 }
 
-fn parse_list(mut payload: &[u8]) -> Result<Vec<RlpItem<'_>>, &'static str> {
-    let mut out = Vec::new();
+/// Parses an RLP list into caller-owned stack storage. Ethereum trie nodes have
+/// at most 17 fields and account values have exactly 4, so heap allocation in
+/// the hot path is unnecessary.
+fn parse_list_into<'a, const N: usize>(
+    mut payload: &'a [u8],
+    out: &mut [Option<RlpItem<'a>>; N],
+) -> Result<usize, &'static str> {
+    let mut count = 0usize;
     while !payload.is_empty() {
+        if count == N {
+            return Err("Ethereum RLP list exceeds expected arity");
+        }
         let (item, consumed) = parse_one(payload)?;
-        out.push(item);
+        out[count] = Some(item);
+        count += 1;
         payload = &payload[consumed..];
     }
-    Ok(out)
+    Ok(count)
 }
 
 fn parse_exact(input: &[u8]) -> Result<RlpItem<'_>, &'static str> {
@@ -290,6 +350,17 @@ mod tests {
         let root: [u8; 32] = Keccak256::digest(&branch).into();
 
         verify_account_balance(&root, &address, balance as i128, &[branch, leaf]).unwrap();
+    }
+
+    #[test]
+    fn compact_paths_are_checked_without_allocation() {
+        assert_eq!(match_compact_path(&[0x20], &[]).unwrap(), (true, 0));
+        assert_eq!(
+            match_compact_path(&[0x31, 0x23], &[1, 2, 3]).unwrap(),
+            (true, 3)
+        );
+        assert!(match_compact_path(&[0x00], &[]).is_err());
+        assert!(match_compact_path(&[0x31, 0x24], &[1, 2, 3]).is_err());
     }
 
     fn account_leaf(address: &[u8; 20], balance: u128) -> Vec<u8> {
